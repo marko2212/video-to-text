@@ -1,0 +1,37 @@
+[tool.ruff]
+# Select the rule codes to enable. See Ruff documentation for details.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes (e.g., unused imports/variables, undefined names)
+    "I",   # isort (import sorting)
+    "B",   # flake8-bugbear (potential bugs)
+    "UP",  # pyupgrade (upgrade syntax to newer Python versions)
+    "A",   # flake8-builtins (detect shadowing of builtins)
+    "SIM", # flake8-simplify (suggest code simplifications)
+    "C4",  # flake8-comprehensions (encourage comprehensions)
+    "ANN", # flake8-annotations (check for missing type annotations)
+    # Consider enabling these too:
+    # "D",  # pydocstyle (if you want docstring checks)
+    # "S",  # flake8-bandit (for security checks)
+]
+
+# Optional: Ignore specific rules if they annoy you
+# ignore = ["E501"]  # Example: Ignore line too long error
+
+# Optional: Set your preferred line length (Ruff defaults to 88)
+line-length = 88
+
+# Optional: Specify directories Ruff should ignore
+exclude = [
+    ".venv",
+    "venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "archive",
+]
+
+[tool.ruff.format]
+# You can add formatting-specific settings here if you don't want the defaults
+# E.g., quote-style = "double"
