@@ -96,7 +96,7 @@ A simple Streamlit web application to extract audio from video files (specifical
         # Create the virtual environment (named .venv by default)
         uv venv
         # Activate the environment
-        # Windows: .\.venv\Scripts\Activate
+        # Windows: .venv\Scripts\Activate
         # macOS/Linux: source .venv/bin/activate
         ```
 
@@ -106,7 +106,7 @@ A simple Streamlit web application to extract audio from video files (specifical
         # Create the virtual environment
         python -m venv .venv
         # Activate the environment
-        # Windows: .\.venv\Scripts\Activate
+        # Windows: .venv\Scripts\Activate
         # macOS/Linux: source .venv/bin/activate
         ```
 
