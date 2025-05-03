@@ -15,17 +15,17 @@ requires-python = ">=3.8" # Specify the Python version you use/require
 
 keywords = ["video", "audio", "transcription", "openai", "whisper", "ffmpeg", "streamlit"]
 
-# List all packages your project depends on here.
-# These were taken from your requirements.txt file.
-dependencies = [
-    "streamlit==1.40.0",
-    "python-dotenv==1.0.0",
-    "ffmpeg-python==0.2.0",
-    "pydub==0.25.1",
-    "openai==1.75.0",
-    "tqdm==4.67.1",
-    "jiter==0.9.0",
-]
+# # List all packages your project depends on here.
+# # These were taken from your requirements.txt file.
+# dependencies = [
+#     "streamlit==1.40.0",
+#     "python-dotenv==1.0.0",
+#     "ffmpeg-python==0.2.0",
+#     "pydub==0.25.1",
+#     "openai==1.75.0",
+#     "tqdm==4.66.4",
+#     "jiter==0.9.0",
+# ]
 
 classifiers = [
     "Programming Language :: Python :: 3",
