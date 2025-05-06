@@ -133,17 +133,10 @@ A simple Streamlit web application to extract audio from video files (specifical
 1. Make sure your virtual environment (`videototext` or `.venv`) is **activated**.
 2. Ensure the `.env` file with your API key is present in the project root.
 3. Run the Streamlit application from your terminal:
-    * If using `uv` and your environment is *not* active (optional way):
 
-        ```bash
-        uv run streamlit run app.py
-        ```
-
-    * Standard way (with environment active):
-
-        ```bash
-        streamlit run app.py
-        ```
+    ```bash
+    streamlit run app.py
+    ```
 
 4. Streamlit will provide local and network URLs (usually `http://localhost:8501` or similar). Open one of these URLs in your web browser.
 
