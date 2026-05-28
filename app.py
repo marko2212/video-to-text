@@ -47,6 +47,11 @@ AUDIO_FORMATS = [
     "amr",
 ]
 
+# Transcription models offered in the UI (first is the default).
+TRANSCRIPTION_MODELS = ["gpt-4o-transcribe", "whisper-1"]
+# Models that can return per-segment timestamps for subtitle (SRT) export.
+TIMESTAMP_MODELS = {"whisper-1"}
+
 # Create necessary directories
 for dir in [TEMP_DIR, UPLOAD_DIR]:
     os.makedirs(dir, exist_ok=True)
@@ -108,6 +113,8 @@ def main():
         st.session_state.audio_path = None
     if "transcript_path" not in st.session_state:
         st.session_state.transcript_path = None
+    if "srt_path" not in st.session_state:
+        st.session_state.srt_path = None
     if "original_filename" not in st.session_state:
         st.session_state.original_filename = None
     if "progress" not in st.session_state:
@@ -155,6 +162,7 @@ def main():
         if st.session_state.original_filename != uploaded_file.name:
             st.session_state.audio_path = None
             st.session_state.transcript_path = None
+            st.session_state.srt_path = None
         st.session_state.original_filename = uploaded_file.name
 
         # Determine whether the upload is an audio or a video file
@@ -200,41 +208,89 @@ def main():
         if st.session_state.audio_path:
             st.subheader("2️⃣ Transcription")
 
+            # Model selection
+            model = st.selectbox(
+                "Transcription model",
+                options=TRANSCRIPTION_MODELS,
+                index=0,
+                help=(
+                    "**gpt-4o-transcribe** — newer, more accurate.\n\n"
+                    "**whisper-1** — supports timestamps & subtitle (.srt) export."
+                ),
+            )
+
+            # Timestamp/subtitle option (only for models that support it)
+            if model in TIMESTAMP_MODELS:
+                with_timestamps = st.checkbox(
+                    "Include timestamps & generate subtitles (.srt)",
+                    value=False,
+                )
+            else:
+                with_timestamps = False
+                st.caption(
+                    "ℹ️ Timestamps & subtitles are available only with the "
+                    "whisper-1 model."
+                )
+
             if st.button("Start Transcription"):
                 with st.spinner(
                     "Transcription in progress... This may take several minutes."
                 ):
                     try:
-                        # Original filename for transcript
-                        transcript_filename = f"transcript_{os.path.splitext(st.session_state.original_filename)[0]}.txt"
-                        transcript_path = os.path.join(TEMP_DIR, transcript_filename)
+                        # Output file names based on the original filename
+                        base_name = os.path.splitext(
+                            st.session_state.original_filename
+                        )[0]
+                        transcript_path = os.path.join(
+                            TEMP_DIR, f"transcript_{base_name}.txt"
+                        )
+                        srt_path = os.path.join(TEMP_DIR, f"transcript_{base_name}.srt")
 
                         # Start transcription with progress callback
                         process_audio(
                             st.session_state.audio_path,
                             transcript_path,
                             API_KEY,
+                            model=model,
+                            with_timestamps=with_timestamps,
+                            srt_output_file=srt_path if with_timestamps else None,
                             progress_callback=update_progress,
                         )
 
                         st.session_state.transcript_path = transcript_path
-
-                        # Display and download transcript
-                        with open(transcript_path, encoding="utf-8") as file:
-                            transcript_text = file.read()
-                            st.text_area(
-                                "Transcript preview:", transcript_text, height=200
-                            )
-
-                        with open(transcript_path, "rb") as file:
-                            st.download_button(
-                                label="📥 Download Transcript",
-                                data=file,
-                                file_name=transcript_filename,
-                                mime="text/plain",
-                            )
+                        st.session_state.srt_path = (
+                            srt_path
+                            if with_timestamps and os.path.exists(srt_path)
+                            else None
+                        )
                     except Exception as e:
                         st.error(f"Transcription error: {str(e)}")
+
+            # Show results/downloads outside the button handler so they persist
+            # across reruns (e.g. clicking one download won't hide the other).
+            transcript_path = st.session_state.transcript_path
+            if transcript_path and os.path.exists(transcript_path):
+                with open(transcript_path, encoding="utf-8") as file:
+                    transcript_text = file.read()
+                st.text_area("Transcript preview:", transcript_text, height=200)
+
+                with open(transcript_path, "rb") as file:
+                    st.download_button(
+                        label="📥 Download Transcript",
+                        data=file,
+                        file_name=os.path.basename(transcript_path),
+                        mime="text/plain",
+                    )
+
+                srt_path = st.session_state.srt_path
+                if srt_path and os.path.exists(srt_path):
+                    with open(srt_path, "rb") as file:
+                        st.download_button(
+                            label="📥 Download Subtitles (.srt)",
+                            data=file,
+                            file_name=os.path.basename(srt_path),
+                            mime="text/plain",
+                        )
 
     # Clean old files
     if st.button("🧹 Clean temporary files"):
@@ -249,6 +305,7 @@ def main():
                         st.error(f"Error deleting {file}: {str(e)}")
             st.session_state.audio_path = None
             st.session_state.transcript_path = None
+            st.session_state.srt_path = None
             st.session_state.original_filename = None
             st.session_state.progress = 0
             if "progress_container" in st.session_state:

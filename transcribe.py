@@ -10,6 +10,30 @@ from pydub import AudioSegment
 # Load environment variables
 load_dotenv()
 
+# Default transcription model and the set of models that can return
+# per-segment timestamps (verbose_json) used to build subtitles.
+DEFAULT_MODEL = "gpt-4o-transcribe"
+TIMESTAMP_CAPABLE_MODELS = {"whisper-1"}
+
+
+def _format_srt_timestamp(seconds):
+    """Formats a number of seconds as an SRT timestamp: HH:MM:SS,mmm."""
+    millis = max(0, int(round(seconds * 1000)))
+    hours, millis = divmod(millis, 3_600_000)
+    minutes, millis = divmod(millis, 60_000)
+    secs, millis = divmod(millis, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def build_srt(entries):
+    """Builds SRT subtitle text from a list of {start, end, text} dicts."""
+    blocks = []
+    for index, entry in enumerate(entries, start=1):
+        start = _format_srt_timestamp(entry["start"])
+        end = _format_srt_timestamp(entry["end"])
+        blocks.append(f"{index}\n{start} --> {end}\n{entry['text']}\n")
+    return "\n".join(blocks)
+
 
 def ensure_temp_folder(temp_folder):
     if not os.path.exists(temp_folder):
@@ -125,8 +149,19 @@ def split_audio(file_path, temp_folder, segment_duration):
             os.remove(temp_wav)
 
 
-def transcribe_segment(file_path, client, retry_count=3, min_duration_seconds=5):
-    """Transcribes one segment with retry mechanism and checks"""
+def transcribe_segment(
+    file_path,
+    client,
+    model=DEFAULT_MODEL,
+    with_timestamps=False,
+    retry_count=3,
+    min_duration_seconds=5,
+):
+    """Transcribes one segment with retry mechanism and checks.
+
+    Returns the transcript text, or — when ``with_timestamps`` is set — the
+    full verbose response object (exposing ``.text`` and ``.segments``).
+    """
     for attempt in range(retry_count):
         try:
             if not os.path.exists(file_path):
@@ -150,8 +185,15 @@ def transcribe_segment(file_path, client, retry_count=3, min_duration_seconds=5)
 
             print(f"\nSending segment for transcription (attempt {attempt + 1})...")
             with open(file_path, "rb") as audio_file:
+                if with_timestamps:
+                    # verbose_json returns per-segment start/end times
+                    return client.audio.transcriptions.create(
+                        model=model,
+                        file=audio_file,
+                        response_format="verbose_json",
+                    )
                 transcription = client.audio.transcriptions.create(
-                    model="whisper-1", file=audio_file
+                    model=model, file=audio_file
                 )
             return transcription.text
         except Exception as e:
@@ -165,6 +207,9 @@ def process_audio(
     input_file,
     output_file,
     api_key,
+    model=DEFAULT_MODEL,
+    with_timestamps=False,
+    srt_output_file=None,
     segment_duration_minutes=10,
     progress_callback=None,
 ):
@@ -172,6 +217,10 @@ def process_audio(
     temp_folder = "temp_audio_segments"
     segment_duration = segment_duration_minutes * 60 * 1000
     client = OpenAI(api_key=api_key)
+
+    # Timestamps/subtitles require a model that returns verbose_json
+    if with_timestamps and model not in TIMESTAMP_CAPABLE_MODELS:
+        with_timestamps = False
 
     try:
         ensure_temp_folder(temp_folder)
@@ -203,6 +252,8 @@ def process_audio(
 
         # Process each segment
         all_transcriptions = []
+        srt_entries = []
+        offset_seconds = 0.0
         total_segments = len(segments)
         for i, segment in enumerate(segments):
             if progress_callback:
@@ -216,7 +267,25 @@ def process_audio(
 
             temp_path = save_segment(segment, i, temp_folder)
             try:
-                transcription = transcribe_segment(temp_path, client)
+                result = transcribe_segment(
+                    temp_path, client, model=model, with_timestamps=with_timestamps
+                )
+
+                if with_timestamps:
+                    transcription = result.text
+                    # Offset each chunk's timestamps by its position in the
+                    # original audio so the subtitle timeline stays correct.
+                    for seg in getattr(result, "segments", None) or []:
+                        srt_entries.append(
+                            {
+                                "start": seg.start + offset_seconds,
+                                "end": seg.end + offset_seconds,
+                                "text": seg.text.strip(),
+                            }
+                        )
+                else:
+                    transcription = result
+
                 all_transcriptions.append(transcription)
 
                 # Save progress
@@ -226,6 +295,13 @@ def process_audio(
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
+
+            offset_seconds += len(segment) / 1000.0
+
+        # Write subtitle file if timestamps were collected
+        if with_timestamps and srt_output_file and srt_entries:
+            with open(srt_output_file, "w", encoding="utf-8") as f:
+                f.write(build_srt(srt_entries))
 
         # Save complete transcription
         completion_time = datetime.now()
