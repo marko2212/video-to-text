@@ -5,14 +5,16 @@ A simple Streamlit web application to transcribe speech into text using the Open
 ## Features ✨
 
 * Upload **video** files in MKV, MP4, MOV, AVI, WebM, M4V, WMV, FLV, MPEG/MPG, 3GP, TS/MTS/M2TS, OGV, or VOB format.
-* Upload **audio** files directly in MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, or AMR format (audio is sent straight to transcription — no extraction step).
-* Extract audio from a video and save it as a WAV file (with an option to download it).
-* Transcribe the extracted audio using OpenAI's Whisper model.
+* Upload **audio** files directly in MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, or AMR format.
+* **Automatic preparation:** audio from a video is extracted automatically on upload (no manual step); audio files are used as-is.
+* **Built-in audio player** to listen to the uploaded/extracted audio before transcribing.
+* **Choose the transcription model** — `gpt-4o-transcribe` (default, more accurate) or `whisper-1`.
+* **Optional timestamps & subtitle export** (`.srt`) when using `whisper-1`.
 * Handles large audio files by splitting them into smaller segments for transcription.
-* Displays the transcription progress in the interface.
-* Shows a preview of the final transcript.
-* Option to download the full transcript as a TXT file.
-* Button to clean up temporary files generated during the process.
+* Displays the transcription progress and a preview of the final transcript.
+* Download the transcript as a TXT file (and subtitles as SRT).
+* **Persistent history** of past transcriptions stored in a local SQLite database (survives the "Clean temporary files" action).
+* Button to clean up temporary working files (`temp/`, `uploads/`).
 
 ## Requirements 🛠️
 
@@ -106,13 +108,15 @@ A simple Streamlit web application to transcribe speech into text using the Open
 
 ## Usage 🖱️
 
-1. **Upload File:** Use the file uploader to select a video file (MKV, MP4, etc.) or an audio file (MP3, WAV, etc.).
-2. **Extract Audio (video only):** For a video upload, click the "Extract Audio" button. Wait for the process to complete. You'll see a success message and an option to download the `.wav` audio file. *Audio uploads skip this step — they are ready for transcription immediately.*
-3. **Start Transcription:** Once the audio is ready, click the "Start Transcription" button.
-    * The application will show progress information (processing segments). This might take several minutes depending on the audio length.
-    * You might see status updates like "Info", "Start", "Progress", "Complete", or "Error".
-4. **View & Download Transcript:** After successful transcription, a preview of the text will appear in a text area, and a "Download Transcript" button will become available for the `.txt` file.
-5. **Clean Up:** Click the "Clean temporary files" button to remove files from the `temp` and `uploads` directories.
+Work in the **Transcribe** tab:
+
+1. **Upload File:** Use the file uploader to select a video file (MKV, MP4, etc.) or an audio file (MP3, WAV, etc.). The audio is prepared automatically — a video's audio track is extracted on upload, and audio files are used directly. An audio player appears so you can listen first. (For video, you can also download the extracted `.wav`.)
+2. **Pick options:** Choose the transcription **model** (`gpt-4o-transcribe` by default, or `whisper-1`). With `whisper-1` you can tick **"Include timestamps & generate subtitles (.srt)"**.
+3. **Start Transcription:** Click "Start Transcription". Progress is shown while segments are processed (this may take several minutes for long audio).
+4. **View & Download:** The transcript preview appears on the right with a "Download Transcript" button (and "Download Subtitles (.srt)" when timestamps were enabled).
+5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`. Your transcription **history is kept** (see below).
+
+In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts.
 
 ## Configuration 🔑
 

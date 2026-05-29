@@ -126,6 +126,10 @@ archive/
 *.mp3
 *.mkv
 
+# SQLite transcription history (incl. WAL/SHM side files)
+data/transcriptions.db
+data/transcriptions.db-*
+
 
 
 
