@@ -1,32 +1,70 @@
-import os
-import subprocess
-import time
-from datetime import datetime
+"""Transcription pipeline.
 
-from dotenv import load_dotenv
+Splits an audio file into chunks, transcribes each chunk with the OpenAI audio
+API, and writes a plain-text transcript plus an optional SRT subtitle file. This
+module is UI-agnostic: progress is reported through an optional callback.
+"""
+
+import math
+import shutil
+import time
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 from openai import OpenAI
 from pydub import AudioSegment
 
-# Load environment variables
-load_dotenv()
+from audio import to_wav
+from config import (
+    DEFAULT_MODEL,
+    MAX_SEGMENT_SIZE_MB,
+    TARGET_CHANNELS,
+    TARGET_SAMPLE_RATE,
+    TIMESTAMP_MODELS,
+    get_settings,
+)
+from exceptions import TranscriptionError
+from logger import get_logger
 
-# Default transcription model and the set of models that can return
-# per-segment timestamps (verbose_json) used to build subtitles.
-DEFAULT_MODEL = "gpt-4o-transcribe"
-TIMESTAMP_CAPABLE_MODELS = {"whisper-1"}
+logger = get_logger(__name__)
+
+# Tuning constants (previously magic numbers scattered through the module).
+_SEGMENT_BITRATE = "192k"
+_MIN_SEGMENT_SIZE_MB = 0.1
+_MIN_TINY_SEGMENT_SIZE_MB = 0.01
+_MIN_DURATION_SECONDS = 5
+_MAX_RETRIES = 3
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
-def _format_srt_timestamp(seconds):
-    """Formats a number of seconds as an SRT timestamp: HH:MM:SS,mmm."""
-    millis = max(0, int(round(seconds * 1000)))
+def _format_srt_timestamp(seconds: float) -> str:
+    """Format a number of seconds as an SRT timestamp (``HH:MM:SS,mmm``).
+
+    Args:
+        seconds: Time offset in seconds.
+
+    Returns:
+        The SRT-formatted timestamp string.
+    """
+    millis = max(0, round(seconds * 1000))
     hours, millis = divmod(millis, 3_600_000)
     minutes, millis = divmod(millis, 60_000)
     secs, millis = divmod(millis, 1_000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def build_srt(entries):
-    """Builds SRT subtitle text from a list of {start, end, text} dicts."""
+def build_srt(entries: list[dict[str, Any]]) -> str:
+    """Build SRT subtitle text from timed entries.
+
+    Args:
+        entries: List of dicts with ``start`` and ``end`` (seconds) and ``text``.
+
+    Returns:
+        The full SRT document as a string.
+    """
     blocks = []
     for index, entry in enumerate(entries, start=1):
         start = _format_srt_timestamp(entry["start"])
@@ -35,326 +73,315 @@ def build_srt(entries):
     return "\n".join(blocks)
 
 
-def ensure_temp_folder(temp_folder):
-    if not os.path.exists(temp_folder):
-        os.makedirs(temp_folder)
+def get_audio_info(file_path: Path, segment_duration_ms: int) -> dict[str, Any]:
+    """Return basic information about an audio file.
 
+    Args:
+        file_path: Path to the audio file.
+        segment_duration_ms: Chunk length in milliseconds (for the segment count).
 
-def convert_to_wav_ffmpeg(input_file, output_file):
-    """Converts audio to WAV format using FFmpeg directly"""
-    command = [
-        "ffmpeg",
-        "-i",
-        input_file,
-        "-acodec",
-        "pcm_s16le",  # 16-bit PCM
-        "-ac",
-        "1",  # mono
-        "-ar",
-        "16000",  # 16kHz sample rate
-        output_file,
-    ]
-    try:
-        subprocess.run(command, check=True, capture_output=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr.decode()}")
-        return False
-
-
-def get_audio_info(file_path, segment_duration):
-    """Returns information about the audio file"""
+    Returns:
+        Dict with ``duration_minutes``, ``size_mb`` and ``total_segments``.
+    """
     audio = AudioSegment.from_file(file_path)
-    duration_minutes = len(audio) / 1000 / 60
-    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    duration_ms = len(audio)
     return {
-        "duration_minutes": duration_minutes,
-        "size_mb": size_mb,
-        "total_segments": len(audio) // segment_duration + 1,
+        "duration_minutes": duration_ms / 1000 / 60,
+        "size_mb": file_path.stat().st_size / (1024 * 1024),
+        "total_segments": max(1, math.ceil(duration_ms / segment_duration_ms)),
     }
 
 
-def save_segment(segment, index, temp_folder):
-    """Saves segment as WAV then converts to MP3"""
-    temp_wav = os.path.join(temp_folder, f"segment_{index}_temp.wav")
-    temp_mp3 = os.path.join(temp_folder, f"segment_{index}.mp3")
+def _save_segment(segment: AudioSegment, index: int, temp_folder: Path) -> Path:
+    """Export one chunk straight to a mono 16 kHz MP3 ready for the API.
 
+    Args:
+        segment: The pydub audio chunk.
+        index: Zero-based chunk index (used for the file name).
+        temp_folder: Directory to write the MP3 into.
+
+    Returns:
+        Path to the exported MP3.
+
+    Raises:
+        TranscriptionError: If the exported chunk is implausibly small.
+    """
+    mp3_path = temp_folder / f"segment_{index}.mp3"
+    logger.info("Saving segment %d", index + 1)
+    segment.export(
+        mp3_path,
+        format="mp3",
+        bitrate=_SEGMENT_BITRATE,
+        parameters=["-ac", str(TARGET_CHANNELS), "-ar", str(TARGET_SAMPLE_RATE)],
+    )
+
+    size_mb = mp3_path.stat().st_size / (1024 * 1024)
+    is_long_enough = len(segment) >= segment.frame_rate * _MIN_DURATION_SECONDS
+    if is_long_enough and size_mb < _MIN_SEGMENT_SIZE_MB:
+        raise TranscriptionError(f"Generated segment is too small: {size_mb:.2f} MB")
+    return mp3_path
+
+
+def _split_audio(
+    input_file: Path, temp_folder: Path, segment_duration_ms: int
+) -> list[AudioSegment]:
+    """Normalise the input to WAV and slice it into fixed-length chunks.
+
+    Args:
+        input_file: Source audio/video file.
+        temp_folder: Scratch directory for the intermediate WAV.
+        segment_duration_ms: Chunk length in milliseconds.
+
+    Returns:
+        List of pydub audio chunks.
+    """
+    temp_wav = temp_folder / "temp_full.wav"
     try:
-        print(f"\nSaving segment {index + 1}...")
-
-        # Save as WAV
-        segment.export(temp_wav, format="wav", parameters=["-ac", "1", "-ar", "16000"])
-
-        # Convert to MP3 using FFmpeg
-        command = [
-            "ffmpeg",
-            "-i",
-            temp_wav,
-            "-acodec",
-            "libmp3lame",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-b:a",
-            "192k",
-            temp_mp3,
-        ]
-        subprocess.run(command, check=True, capture_output=True)
-
-        # Check file size
-        size_mb = os.path.getsize(temp_mp3) / (1024 * 1024)
-        print(f"Segment {index + 1} size: {size_mb:.2f} MB")
-
-        # Only check minimum size if segment duration is close to full length
-        if (
-            len(segment) >= segment.frame_rate * 5 and size_mb < 0.1
-        ):  # If segment is longer than 5 seconds
-            raise Exception(f"Generated segment is too small: {size_mb:.2f} MB")
-
-        return temp_mp3
-
-    except Exception as e:
-        print(f"Error saving segment {index}: {str(e)}")
-        raise
-    finally:
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
-
-
-def split_audio(file_path, temp_folder, segment_duration):
-    print("Loading audio file...")
-    temp_wav = os.path.join(temp_folder, "temp_full.wav")
-    try:
-        if not convert_to_wav_ffmpeg(file_path, temp_wav):
-            raise Exception("Error converting to WAV format")
-
-        print("Loading converted WAV file...")
+        to_wav(input_file, temp_wav)
         audio = AudioSegment.from_wav(temp_wav)
-
-        print("Checking audio parameters:")
-        print(f"Channels: {audio.channels}")
-        print(f"Sample width: {audio.sample_width}")
-        print(f"Frame rate: {audio.frame_rate}")
-        print(f"Duration: {len(audio) / 1000} seconds")
-
-        segments = []
-        for i in range(0, len(audio), segment_duration):
-            segment = audio[i : i + segment_duration]
-            segments.append(segment)
-
-        return segments
+        logger.info(
+            "Loaded audio: %d ch, %d Hz, %.1f s",
+            audio.channels,
+            audio.frame_rate,
+            len(audio) / 1000,
+        )
+        return [
+            audio[start : start + segment_duration_ms]
+            for start in range(0, len(audio), segment_duration_ms)
+        ]
     finally:
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
+        temp_wav.unlink(missing_ok=True)
 
 
-def transcribe_segment(
-    file_path,
-    client,
-    model=DEFAULT_MODEL,
-    with_timestamps=False,
-    retry_count=3,
-    min_duration_seconds=5,
-):
-    """Transcribes one segment with retry mechanism and checks.
+def _transcribe_segment(
+    file_path: Path,
+    client: OpenAI,
+    model: str = DEFAULT_MODEL,
+    with_timestamps: bool = False,
+    retry_count: int = _MAX_RETRIES,
+) -> Any:
+    """Transcribe a single chunk, retrying transient failures.
 
-    Returns the transcript text, or — when ``with_timestamps`` is set — the
-    full verbose response object (exposing ``.text`` and ``.segments``).
+    Args:
+        file_path: Path to the chunk MP3.
+        client: Configured OpenAI client.
+        model: Transcription model name.
+        with_timestamps: If True, request ``verbose_json`` (per-segment times).
+        retry_count: Number of attempts before giving up.
+
+    Returns:
+        The transcript text, or — when ``with_timestamps`` is set — the full
+        verbose response object (exposing ``.text`` and ``.segments``).
+
+    Raises:
+        TranscriptionError: If the file is missing or exceeds the size limit.
     """
     for attempt in range(retry_count):
         try:
-            if not os.path.exists(file_path):
-                raise Exception(f"File does not exist: {file_path}")
+            if not file_path.exists():
+                raise TranscriptionError(f"File does not exist: {file_path}")
 
-            # Get audio duration using pydub
             audio = AudioSegment.from_file(file_path)
             duration_seconds = len(audio) / 1000
-
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if size_mb > 25:
-                raise Exception(
-                    f"File is too large ({size_mb:.2f} MB). Maximum is 25 MB"
+            size_mb = file_path.stat().st_size / (1024 * 1024)
+            if size_mb > MAX_SEGMENT_SIZE_MB:
+                raise TranscriptionError(
+                    f"File is too large ({size_mb:.2f} MB). "
+                    f"Maximum is {MAX_SEGMENT_SIZE_MB:.0f} MB"
                 )
-            elif duration_seconds >= min_duration_seconds and size_mb < 0.1:
-                # Only apply minimum size check for segments longer than min_duration_seconds
-                raise Exception(f"File is too small ({size_mb:.2f} MB)")
-            elif duration_seconds < min_duration_seconds and size_mb < 0.01:
-                # For very short segments, still have a minimum threshold
-                raise Exception(f"File is too small ({size_mb:.2f} MB)")
+            too_small = (
+                duration_seconds >= _MIN_DURATION_SECONDS
+                and size_mb < _MIN_SEGMENT_SIZE_MB
+            ) or (
+                duration_seconds < _MIN_DURATION_SECONDS
+                and size_mb < _MIN_TINY_SEGMENT_SIZE_MB
+            )
+            if too_small:
+                raise TranscriptionError(f"File is too small ({size_mb:.2f} MB)")
 
-            print(f"\nSending segment for transcription (attempt {attempt + 1})...")
-            with open(file_path, "rb") as audio_file:
+            logger.info("Transcribing segment (attempt %d)", attempt + 1)
+            with file_path.open("rb") as audio_file:
                 if with_timestamps:
-                    # verbose_json returns per-segment start/end times
                     return client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,
                         response_format="verbose_json",
                     )
-                transcription = client.audio.transcriptions.create(
+                return client.audio.transcriptions.create(
                     model=model, file=audio_file
-                )
-            return transcription.text
-        except Exception as e:
-            print(f"Transcription error (attempt {attempt + 1}): {str(e)}")
+                ).text
+        except Exception as exc:  # retried below; re-raised on the final attempt
+            logger.warning("Transcription attempt %d failed: %s", attempt + 1, exc)
             if attempt == retry_count - 1:
-                raise
+                raise TranscriptionError(str(exc)) from exc
             time.sleep(2**attempt)
+    # Unreachable: the loop either returns or raises.
+    raise TranscriptionError("Transcription failed unexpectedly")
+
+
+def _report(progress_callback: ProgressCallback | None, **payload: Any) -> None:
+    """Invoke the progress callback if one was provided.
+
+    Args:
+        progress_callback: Optional callback receiving a status payload.
+        **payload: Status fields (e.g. ``status``, ``message``, ``progress``).
+    """
+    if progress_callback:
+        progress_callback(payload)
+
+
+def _transcribe_all(
+    segments: list[AudioSegment],
+    client: OpenAI,
+    model: str,
+    with_timestamps: bool,
+    temp_folder: Path,
+    output_file: Path,
+    progress_callback: ProgressCallback | None,
+) -> list[dict[str, Any]]:
+    """Transcribe every chunk, appending text to the output and timing the SRT.
+
+    Args:
+        segments: Audio chunks to transcribe.
+        client: Configured OpenAI client.
+        model: Transcription model name.
+        with_timestamps: Whether per-segment timestamps were requested.
+        temp_folder: Scratch directory for chunk MP3s.
+        output_file: Transcript file to append each chunk's text to.
+        progress_callback: Optional progress callback.
+
+    Returns:
+        SRT entries (``start``/``end``/``text``) with timeline offsets applied.
+    """
+    srt_entries: list[dict[str, Any]] = []
+    offset_seconds = 0.0
+    total = len(segments)
+
+    for index, segment in enumerate(segments):
+        _report(
+            progress_callback,
+            status="progress",
+            message=f"Processing segment {index + 1}/{total}",
+            progress=(index + 1) / total,
+        )
+        segment_path = _save_segment(segment, index, temp_folder)
+        try:
+            result = _transcribe_segment(
+                segment_path, client, model=model, with_timestamps=with_timestamps
+            )
+            if with_timestamps:
+                text = result.text
+                for seg in getattr(result, "segments", None) or []:
+                    srt_entries.append(
+                        {
+                            "start": seg.start + offset_seconds,
+                            "end": seg.end + offset_seconds,
+                            "text": seg.text.strip(),
+                        }
+                    )
+            else:
+                text = result
+
+            with output_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n--- Segment {index + 1} ---\n{text}\n")
+        finally:
+            segment_path.unlink(missing_ok=True)
+
+        offset_seconds += len(segment) / 1000.0
+
+    return srt_entries
 
 
 def process_audio(
-    input_file,
-    output_file,
-    api_key,
-    model=DEFAULT_MODEL,
-    with_timestamps=False,
-    srt_output_file=None,
-    segment_duration_minutes=10,
-    progress_callback=None,
-):
-    """Main method for processing audio file"""
-    temp_folder = "temp_audio_segments"
-    segment_duration = segment_duration_minutes * 60 * 1000
+    input_file: str | Path,
+    output_file: str | Path,
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+    with_timestamps: bool = False,
+    srt_output_file: str | Path | None = None,
+    segment_duration_minutes: int = 10,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
+    """Transcribe an audio/video file to text (and optionally subtitles).
+
+    Args:
+        input_file: Source audio or video file.
+        output_file: Destination ``.txt`` transcript path.
+        api_key: OpenAI API key.
+        model: Transcription model name.
+        with_timestamps: Request per-segment timestamps (only for capable models).
+        srt_output_file: Destination ``.srt`` path; written only with timestamps.
+        segment_duration_minutes: Length of each audio chunk in minutes.
+        progress_callback: Optional callback receiving status payloads.
+
+    Raises:
+        TranscriptionError: If transcription fails at any stage.
+    """
+    input_file = Path(input_file)
+    output_file = Path(output_file)
+    segment_duration_ms = segment_duration_minutes * 60 * 1000
+    temp_folder = get_settings().temp_dir / "segments"
     client = OpenAI(api_key=api_key)
 
-    # Timestamps/subtitles require a model that returns verbose_json
-    if with_timestamps and model not in TIMESTAMP_CAPABLE_MODELS:
+    # Timestamps/subtitles require a model that returns verbose_json.
+    if with_timestamps and model not in TIMESTAMP_MODELS:
         with_timestamps = False
 
     try:
-        ensure_temp_folder(temp_folder)
+        temp_folder.mkdir(parents=True, exist_ok=True)
 
-        # Get file information
-        info = get_audio_info(input_file, segment_duration)
-        if progress_callback:
-            progress_callback(
-                {
-                    "status": "info",
-                    "message": f"Audio information:\nDuration: {info['duration_minutes']:.2f} minutes\nSize: {info['size_mb']:.2f} MB\nNumber of segments: {info['total_segments']}",
-                }
-            )
-
-        # Split audio into segments
-        segments = split_audio(input_file, temp_folder, segment_duration)
-
-        # Prepare file for results
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(f"Transcription started: {datetime.now()}\n\n")
-
-        if progress_callback:
-            progress_callback(
-                {
-                    "status": "start",
-                    "message": f"Transcription started at {datetime.now()}",
-                }
-            )
-
-        # Process each segment
-        all_transcriptions = []
-        srt_entries = []
-        offset_seconds = 0.0
-        total_segments = len(segments)
-        for i, segment in enumerate(segments):
-            if progress_callback:
-                progress_callback(
-                    {
-                        "status": "progress",
-                        "message": f"Processing segment {i + 1}/{total_segments}",
-                        "progress": (i + 1) / total_segments,
-                    }
-                )
-
-            temp_path = save_segment(segment, i, temp_folder)
-            try:
-                result = transcribe_segment(
-                    temp_path, client, model=model, with_timestamps=with_timestamps
-                )
-
-                if with_timestamps:
-                    transcription = result.text
-                    # Offset each chunk's timestamps by its position in the
-                    # original audio so the subtitle timeline stays correct.
-                    for seg in getattr(result, "segments", None) or []:
-                        srt_entries.append(
-                            {
-                                "start": seg.start + offset_seconds,
-                                "end": seg.end + offset_seconds,
-                                "text": seg.text.strip(),
-                            }
-                        )
-                else:
-                    transcription = result
-
-                all_transcriptions.append(transcription)
-
-                # Save progress
-                with open(output_file, "a", encoding="utf-8") as f:
-                    f.write(f"\n--- Segment {i + 1} ---\n")
-                    f.write(transcription + "\n")
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-            offset_seconds += len(segment) / 1000.0
-
-        # Write subtitle file if timestamps were collected
-        if with_timestamps and srt_output_file and srt_entries:
-            with open(srt_output_file, "w", encoding="utf-8") as f:
-                f.write(build_srt(srt_entries))
-
-        # Save complete transcription
-        completion_time = datetime.now()
-        with open(output_file, "a", encoding="utf-8") as f:
-            f.write(f"\n\nTranscription completed: {completion_time}")
-
-        if progress_callback:
-            progress_callback(
-                {
-                    "status": "complete",
-                    "message": f"Transcription completed at {completion_time}",
-                }
-            )
-
-        print(
-            f"\nTranscription has been successfully completed and saved to: {output_file}"
+        info = get_audio_info(input_file, segment_duration_ms)
+        _report(
+            progress_callback,
+            status="info",
+            message=(
+                f"Audio information:\n"
+                f"Duration: {info['duration_minutes']:.2f} minutes\n"
+                f"Size: {info['size_mb']:.2f} MB\n"
+                f"Number of segments: {info['total_segments']}"
+            ),
         )
 
-    except Exception as e:
-        if progress_callback:
-            progress_callback(
-                {"status": "error", "message": f"An error occurred: {str(e)}"}
-            )
-        print(f"\nAn error occurred: {str(e)}")
-        raise
+        segments = _split_audio(input_file, temp_folder, segment_duration_ms)
+
+        output_file.write_text(
+            f"Transcription started: {datetime.now()}\n\n", encoding="utf-8"
+        )
+        _report(
+            progress_callback,
+            status="start",
+            message=f"Transcription started at {datetime.now()}",
+        )
+
+        srt_entries = _transcribe_all(
+            segments,
+            client,
+            model,
+            with_timestamps,
+            temp_folder,
+            output_file,
+            progress_callback,
+        )
+
+        if with_timestamps and srt_output_file and srt_entries:
+            Path(srt_output_file).write_text(build_srt(srt_entries), encoding="utf-8")
+
+        completion_time = datetime.now()
+        with output_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n\nTranscription completed: {completion_time}")
+
+        _report(
+            progress_callback,
+            status="complete",
+            message=f"Transcription completed at {completion_time}",
+        )
+        logger.info("Transcription saved to %s", output_file)
+
+    except Exception as exc:
+        _report(progress_callback, status="error", message=f"An error occurred: {exc}")
+        logger.exception("Transcription failed")
+        if isinstance(exc, TranscriptionError):
+            raise
+        raise TranscriptionError(str(exc)) from exc
     finally:
-        # Clean up temporary folder
-        try:
-            if os.path.exists(temp_folder):
-                for file in os.listdir(temp_folder):
-                    try:
-                        os.remove(os.path.join(temp_folder, file))
-                    except Exception as e:
-                        print(f"Error deleting temp file: {str(e)}")
-                os.rmdir(temp_folder)
-        except Exception as e:
-            print(f"Error cleaning up temp folder: {str(e)}")
-
-
-if __name__ == "__main__":
-    try:
-        # Get API key from environment variable
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment variables")
-
-        # Configuration
-        INPUT_FILE = "audio.wav"  # Change this to your input file path
-        OUTPUT_FILE = "transcript.txt"  # Change this to your desired output file path
-        SEGMENT_DURATION = 10  # minutes
-
-        # Processing
-        process_audio(INPUT_FILE, OUTPUT_FILE, api_key, SEGMENT_DURATION)
-
-    except Exception as e:
-        print(f"\nProgram terminated due to error: {str(e)}")
+        shutil.rmtree(temp_folder, ignore_errors=True)

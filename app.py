@@ -1,201 +1,199 @@
-import os
+"""Streamlit UI for the video & audio transcription app.
 
-import ffmpeg
+This module is presentation-only: audio preparation lives in :mod:`audio`, the
+transcription pipeline in :mod:`transcribe`, configuration in :mod:`config`, and
+history persistence in :mod:`db`.
+"""
+
+from pathlib import Path
+from typing import Any
+
 import streamlit as st
-from dotenv import load_dotenv
+from pydantic import ValidationError
 
+import audio
 import db
-from transcribe import process_audio  # importing function from previous code
+import transcribe
+from config import (
+    AUDIO_FORMATS,
+    TIMESTAMP_MODELS,
+    TRANSCRIPTION_MODELS,
+    VIDEO_FORMATS,
+    get_settings,
+)
+from exceptions import AppError
+from logger import get_logger
 
-# Load environment variables
-load_dotenv()
-
-# Configuration
-TEMP_DIR = "temp"
-UPLOAD_DIR = "uploads"
-API_KEY = os.getenv("OPENAI_API_KEY")
-
-VIDEO_FORMATS = [
-    "mkv",
-    "mp4",
-    "mov",
-    "avi",
-    "webm",
-    "m4v",
-    "wmv",
-    "flv",
-    "mpeg",
-    "mpg",
-    "3gp",
-    "ts",
-    "mts",
-    "m2ts",
-    "ogv",
-    "vob",
-]
-
-AUDIO_FORMATS = [
-    "mp3",
-    "wav",
-    "m4a",
-    "aac",
-    "flac",
-    "ogg",
-    "opus",
-    "wma",
-    "aiff",
-    "aif",
-    "amr",
-]
-
-# Transcription models offered in the UI (first is the default).
-TRANSCRIPTION_MODELS = ["gpt-4o-transcribe", "whisper-1"]
-# Models that can return per-segment timestamps for subtitle (SRT) export.
-TIMESTAMP_MODELS = {"whisper-1"}
-
-# Create necessary directories
-for dir in [TEMP_DIR, UPLOAD_DIR]:
-    os.makedirs(dir, exist_ok=True)
+logger = get_logger(__name__)
 
 
-def extract_audio(input_path, output_path=None):
-    """Extracts audio from a video file (MKV, MP4, etc.) to WAV."""
-    try:
-        if output_path is None:
-            output_path = os.path.splitext(input_path)[0] + ".wav"
+def update_progress(progress_info: dict[str, Any]) -> None:
+    """Render transcription progress updates in the UI.
 
-        stream = ffmpeg.input(input_path)
-        stream = ffmpeg.output(stream, output_path, acodec="pcm_s16le")
-        ffmpeg.run(stream, overwrite_output=True, capture_stderr=True)
-
-        return output_path
-    except Exception as e:
-        st.error(f"Error extracting audio: {str(e)}")
-        return None
-
-
-def save_uploaded_file(uploaded_file):
-    """Saves uploaded file to uploads directory."""
-    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return file_path
-
-
-def update_progress(progress_info):
-    """Updates progress information in Streamlit interface."""
-    # Create a container for progress information if it doesn't exist
+    Args:
+        progress_info: Status payload with ``status`` and ``message`` keys
+            (and ``progress`` for the ``"progress"`` status).
+    """
     if "progress_container" not in st.session_state:
         st.session_state.progress_container = st.empty()
 
-    # Create a new container with the latest information
     with st.session_state.progress_container:
         st.empty()  # Clear previous content
-        if progress_info["status"] == "info" or progress_info["status"] == "start":
+        status = progress_info["status"]
+        if status in ("info", "start"):
             st.info(progress_info["message"])
-        elif progress_info["status"] == "progress":
+        elif status == "progress":
             col1, col2 = st.columns([1, 2])
             with col1:
                 st.progress(progress_info["progress"])
             with col2:
                 st.info(progress_info["message"])
-        elif progress_info["status"] == "complete":
+        elif status == "complete":
             st.success(progress_info["message"])
-        elif progress_info["status"] == "error":
+        elif status == "error":
             st.error(progress_info["message"])
 
 
-def save_to_history(source_type, model, with_timestamps):
-    """Persists the just-finished transcription into the SQLite history."""
-    transcript_path = st.session_state.transcript_path
-    if not transcript_path or not os.path.exists(transcript_path):
+def save_to_history(source_type: str, model: str, with_timestamps: bool) -> None:
+    """Persist the just-finished transcription into the SQLite history.
+
+    Args:
+        source_type: Either ``"audio"`` or ``"video"``.
+        model: Transcription model used.
+        with_timestamps: Whether subtitles were generated.
+    """
+    transcript_path: Path | None = st.session_state.transcript_path
+    if not transcript_path or not transcript_path.exists():
         return
 
-    with open(transcript_path, encoding="utf-8") as file:
-        transcript_text = file.read()
+    srt_path: Path | None = st.session_state.srt_path
+    srt_text = srt_path.read_text(encoding="utf-8") if srt_path else None
 
-    srt_text = None
-    srt_path = st.session_state.srt_path
-    if srt_path and os.path.exists(srt_path):
-        with open(srt_path, encoding="utf-8") as file:
-            srt_text = file.read()
-
-    audio_path = st.session_state.audio_path
+    audio_path: Path | None = st.session_state.audio_path
     file_size_mb = None
-    if audio_path and os.path.exists(audio_path):
-        file_size_mb = round(os.path.getsize(audio_path) / (1024 * 1024), 2)
+    if audio_path and audio_path.exists():
+        file_size_mb = round(audio_path.stat().st_size / (1024 * 1024), 2)
 
     db.add_transcription(
         filename=st.session_state.original_filename,
         source_type=source_type,
         model=model,
         with_timestamps=with_timestamps,
-        transcript=transcript_text,
+        transcript=transcript_path.read_text(encoding="utf-8"),
         srt=srt_text,
-        audio_path=audio_path,
+        audio_path=str(audio_path) if audio_path else None,
         file_size_mb=file_size_mb,
     )
 
 
-def clean_temp_files():
-    """Removes working files from temp/ and uploads/ (history DB is untouched)."""
+def clean_temp_files() -> None:
+    """Remove working files from temp/ and uploads/ (history DB is untouched)."""
+    settings = get_settings()
     try:
-        for dir_path in [TEMP_DIR, UPLOAD_DIR]:
-            for file in os.listdir(dir_path):
-                file_path = os.path.join(dir_path, file)
-                try:
-                    if os.path.isfile(file_path):
-                        os.unlink(file_path)
-                except Exception as e:
-                    st.error(f"Error deleting {file}: {str(e)}")
-        st.session_state.audio_path = None
-        st.session_state.transcript_path = None
-        st.session_state.srt_path = None
-        st.session_state.original_filename = None
-        st.session_state.progress = 0
+        for directory in (settings.temp_dir, settings.upload_dir):
+            for path in directory.iterdir():
+                if path.is_file():
+                    path.unlink()
+        for key in ("audio_path", "transcript_path", "srt_path", "original_filename"):
+            st.session_state[key] = None
         if "progress_container" in st.session_state:
             st.session_state.progress_container.empty()
             del st.session_state.progress_container
         st.success("Temporary files cleaned!")
-    except Exception as e:
-        st.error(f"Error during cleanup: {str(e)}")
+    except OSError as exc:
+        logger.warning("Cleanup failed: %s", exc)
+        st.error(f"Error during cleanup: {exc}")
 
 
-def render_results():
-    """Renders the transcript preview and download buttons from session state."""
+def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
+    """Make the uploaded media ready for transcription (run once per file).
+
+    Audio uploads are stored as-is; videos have their audio track extracted.
+    The resulting path is stored in ``st.session_state.audio_path``.
+
+    Args:
+        uploaded_file: The Streamlit uploaded file.
+        is_audio: True if the upload is an audio file.
+    """
+    if st.session_state.audio_path is not None:
+        return
+    try:
+        if is_audio:
+            st.session_state.audio_path = audio.save_uploaded_file(uploaded_file)
+        else:
+            with st.spinner("Extracting audio from video..."):
+                source = audio.save_uploaded_file(uploaded_file)
+                wav_name = f"{Path(uploaded_file.name).stem}.wav"
+                st.session_state.audio_path = audio.to_wav(
+                    source, get_settings().temp_dir / wav_name
+                )
+    except AppError as exc:
+        st.error(f"Error preparing audio: {exc}")
+
+
+def run_transcription(model: str, with_timestamps: bool, source_type: str) -> None:
+    """Run the pipeline for the prepared audio and store result paths.
+
+    Args:
+        model: Selected transcription model.
+        with_timestamps: Whether to generate timestamps/subtitles.
+        source_type: Either ``"audio"`` or ``"video"``.
+    """
+    settings = get_settings()
+    base_name = Path(st.session_state.original_filename).stem
+    transcript_path = settings.temp_dir / f"transcript_{base_name}.txt"
+    srt_path = settings.temp_dir / f"transcript_{base_name}.srt"
+
+    with st.spinner("Transcription in progress... This may take several minutes."):
+        try:
+            transcribe.process_audio(
+                st.session_state.audio_path,
+                transcript_path,
+                settings.openai_api_key,
+                model=model,
+                with_timestamps=with_timestamps,
+                srt_output_file=srt_path if with_timestamps else None,
+                progress_callback=update_progress,
+            )
+            st.session_state.transcript_path = transcript_path
+            st.session_state.srt_path = (
+                srt_path if with_timestamps and srt_path.exists() else None
+            )
+            save_to_history(source_type, model, with_timestamps)
+        except AppError as exc:
+            st.error(f"Transcription error: {exc}")
+
+
+def render_results() -> None:
+    """Render the transcript preview and download buttons from session state."""
     st.subheader("📄 Result")
-    transcript_path = st.session_state.transcript_path
-    if not transcript_path or not os.path.exists(transcript_path):
+    transcript_path: Path | None = st.session_state.transcript_path
+    if not transcript_path or not transcript_path.exists():
         st.info("The transcript will appear here after you run a transcription.")
         return
 
-    with open(transcript_path, encoding="utf-8") as file:
-        transcript_text = file.read()
-    st.text_area("Transcript preview:", transcript_text, height=420)
+    st.text_area(
+        "Transcript preview:", transcript_path.read_text(encoding="utf-8"), height=420
+    )
+    st.download_button(
+        label="📥 Download Transcript",
+        data=transcript_path.read_bytes(),
+        file_name=transcript_path.name,
+        mime="text/plain",
+    )
 
-    with open(transcript_path, "rb") as file:
+    srt_path: Path | None = st.session_state.srt_path
+    if srt_path and srt_path.exists():
         st.download_button(
-            label="📥 Download Transcript",
-            data=file,
-            file_name=os.path.basename(transcript_path),
+            label="📥 Download Subtitles (.srt)",
+            data=srt_path.read_bytes(),
+            file_name=srt_path.name,
             mime="text/plain",
         )
 
-    srt_path = st.session_state.srt_path
-    if srt_path and os.path.exists(srt_path):
-        with open(srt_path, "rb") as file:
-            st.download_button(
-                label="📥 Download Subtitles (.srt)",
-                data=file,
-                file_name=os.path.basename(srt_path),
-                mime="text/plain",
-            )
 
-
-def render_transcribe_tab():
-    """The main transcription workflow: upload, prepare, transcribe."""
-    # Hide Streamlit's auto-generated long format list under the uploader
-    # and replace it with a clean short label. Full list lives in `help` tooltip.
+def _uploader_label_css() -> None:
+    """Replace the uploader's long auto-generated format list with a short label."""
     st.markdown(
         """
         <style>
@@ -216,6 +214,10 @@ def render_transcribe_tab():
         unsafe_allow_html=True,
     )
 
+
+def render_transcribe_tab() -> None:
+    """Render the main transcription workflow: upload, prepare, transcribe."""
+    _uploader_label_css()
     left, right = st.columns([2, 3])
 
     with left:
@@ -235,49 +237,32 @@ def render_transcribe_tab():
         )
 
         if uploaded_file:
-            # Reset previous results when a different file is uploaded
+            # Reset previous results when a different file is uploaded.
             if st.session_state.original_filename != uploaded_file.name:
-                st.session_state.audio_path = None
-                st.session_state.transcript_path = None
-                st.session_state.srt_path = None
+                for key in ("audio_path", "transcript_path", "srt_path"):
+                    st.session_state[key] = None
             st.session_state.original_filename = uploaded_file.name
 
-            extension = os.path.splitext(uploaded_file.name)[1].lower().lstrip(".")
+            extension = Path(uploaded_file.name).suffix.lower().lstrip(".")
             is_audio = extension in AUDIO_FORMATS
             source_type = "audio" if is_audio else "video"
 
-            # 1) Prepare audio automatically (guarded so it runs once per file).
-            #    Audio is used as-is; video has its audio track extracted.
             st.subheader("1️⃣ Audio")
-            if st.session_state.audio_path is None:
-                if is_audio:
-                    st.session_state.audio_path = save_uploaded_file(uploaded_file)
-                else:
-                    with st.spinner("Extracting audio from video..."):
-                        video_path = save_uploaded_file(uploaded_file)
-                        base_name = os.path.splitext(uploaded_file.name)[0]
-                        wav_path = os.path.join(TEMP_DIR, f"{base_name}.wav")
-                        if extract_audio(video_path, wav_path):
-                            st.session_state.audio_path = wav_path
-                        else:
-                            st.error("Error extracting audio.")
+            prepare_audio(uploaded_file, is_audio)
 
-            audio_path = st.session_state.audio_path
-            if audio_path and os.path.exists(audio_path):
-                st.audio(audio_path)
+            audio_path: Path | None = st.session_state.audio_path
+            if audio_path and audio_path.exists():
+                st.audio(str(audio_path))
                 if not is_audio:
-                    with open(audio_path, "rb") as audio_file:
-                        st.download_button(
-                            label="📥 Download extracted audio (WAV)",
-                            data=audio_file,
-                            file_name=os.path.basename(audio_path),
-                            mime="audio/wav",
-                        )
+                    st.download_button(
+                        label="📥 Download extracted audio (WAV)",
+                        data=audio_path.read_bytes(),
+                        file_name=audio_path.name,
+                        mime="audio/wav",
+                    )
 
-            # 2) Transcription controls
             if st.session_state.audio_path:
                 st.subheader("2️⃣ Transcription")
-
                 model = st.selectbox(
                     "Transcription model",
                     options=TRANSCRIPTION_MODELS,
@@ -287,11 +272,9 @@ def render_transcribe_tab():
                         "**whisper-1** — supports timestamps & subtitle (.srt) export."
                     ),
                 )
-
                 if model in TIMESTAMP_MODELS:
                     with_timestamps = st.checkbox(
-                        "Include timestamps & generate subtitles (.srt)",
-                        value=False,
+                        "Include timestamps & generate subtitles (.srt)", value=False
                     )
                 else:
                     with_timestamps = False
@@ -301,39 +284,7 @@ def render_transcribe_tab():
                     )
 
                 if st.button("Start Transcription"):
-                    with st.spinner(
-                        "Transcription in progress... This may take several minutes."
-                    ):
-                        try:
-                            base_name = os.path.splitext(
-                                st.session_state.original_filename
-                            )[0]
-                            transcript_path = os.path.join(
-                                TEMP_DIR, f"transcript_{base_name}.txt"
-                            )
-                            srt_path = os.path.join(
-                                TEMP_DIR, f"transcript_{base_name}.srt"
-                            )
-
-                            process_audio(
-                                st.session_state.audio_path,
-                                transcript_path,
-                                API_KEY,
-                                model=model,
-                                with_timestamps=with_timestamps,
-                                srt_output_file=srt_path if with_timestamps else None,
-                                progress_callback=update_progress,
-                            )
-
-                            st.session_state.transcript_path = transcript_path
-                            st.session_state.srt_path = (
-                                srt_path
-                                if with_timestamps and os.path.exists(srt_path)
-                                else None
-                            )
-                            save_to_history(source_type, model, with_timestamps)
-                        except Exception as e:
-                            st.error(f"Transcription error: {str(e)}")
+                    run_transcription(model, with_timestamps, source_type)
 
         st.divider()
         if st.button("🧹 Clean temporary files"):
@@ -343,8 +294,8 @@ def render_transcribe_tab():
         render_results()
 
 
-def render_history_tab():
-    """Lists past transcriptions stored in SQLite, with download/delete."""
+def render_history_tab() -> None:
+    """List past transcriptions stored in SQLite, with download/delete."""
     st.subheader("📚 Transcription history")
     records = db.list_transcriptions()
     if not records:
@@ -354,8 +305,7 @@ def render_history_tab():
     for record in records:
         flag = "⏱️ " if record["with_timestamps"] else ""
         label = (
-            f"{flag}{record['filename']} · "
-            f"{record['model']} · {record['created_at']}"
+            f"{flag}{record['filename']} · {record['model']} · {record['created_at']}"
         )
         with st.expander(label):
             meta = record["source_type"]
@@ -364,7 +314,7 @@ def render_history_tab():
             st.caption(meta)
 
             full = db.get_transcription(record["id"])
-            base_name = os.path.splitext(full["filename"])[0]
+            base_name = Path(full["filename"]).stem
 
             st.text_area(
                 "Transcript",
@@ -392,33 +342,43 @@ def render_history_tab():
                 st.rerun()
 
 
-def main():
+def init_session_state() -> None:
+    """Initialise the session-state keys used across reruns."""
+    for key in ("audio_path", "transcript_path", "srt_path", "original_filename"):
+        if key not in st.session_state:
+            st.session_state[key] = None
+
+
+def main() -> None:
+    """Application entry point."""
     st.set_page_config(
         page_title="Video & Audio Transcription",
         page_icon="📝",
         layout="wide",
     )
+
+    # Validate configuration up front so a missing API key fails clearly.
+    try:
+        get_settings()
+    except ValidationError:
+        st.error(
+            "Configuration error: `OPENAI_API_KEY` is not set. "
+            "Add it to your `.env` file and restart."
+        )
+        st.stop()
+
     db.init_db()
+    init_session_state()
 
     st.title("📝 Video & Audio Transcription")
     st.write("Transcribe audio from video or audio files using OpenAI Whisper")
 
-    # Initialize session state variables
-    for key in ("audio_path", "transcript_path", "srt_path", "original_filename"):
-        if key not in st.session_state:
-            st.session_state[key] = None
-    if "progress" not in st.session_state:
-        st.session_state.progress = 0
-
     tab_transcribe, tab_history = st.tabs(["🎙️ Transcribe", "📚 History"])
-
     with tab_transcribe:
         render_transcribe_tab()
-
     with tab_history:
         render_history_tab()
 
-    # Footer
     st.markdown("---")
     st.markdown("Made with ❤️ by Marko A")
 

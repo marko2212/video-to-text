@@ -7,7 +7,7 @@ authors = [
   { name="Marko Avramović", email="marko2212@gmail.com" },
 ]
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 keywords = ["video", "audio", "transcription", "openai", "whisper", "ffmpeg", "streamlit"]
 
@@ -17,8 +17,8 @@ dependencies = [
     "ffmpeg-python==0.2.0",
     "pydub==0.25.1",
     "openai==1.75.0",
-    "tqdm==4.66.4",
-    "jiter==0.9.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
     # pydub imports the stdlib `audioop` module, which was removed in Python 3.13
     # (PEP 594). audioop-lts is the official backport that pydub picks up via the
     # `pyaudioop` shim. Only needed on 3.13+.
@@ -47,32 +47,10 @@ Issues = "https://github.com/marko2212/video-to-text/issues" # Optional issue tr
 [tool.uv]
 package = false
 
-# Your existing ruff configuration goes below this
 [tool.ruff]
-# Select the rule codes to enable. See Ruff documentation for details.
-select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # Pyflakes (e.g., unused imports/variables, undefined names)
-    "I",   # isort (import sorting)
-    "B",   # flake8-bugbear (potential bugs)
-    "UP",  # pyupgrade (upgrade syntax to newer Python versions)
-    "A",   # flake8-builtins (detect shadowing of builtins)
-    "SIM", # flake8-simplify (suggest code simplifications)
-    "C4",  # flake8-comprehensions (encourage comprehensions)
-    "ANN", # flake8-annotations (check for missing type annotations)
-    # Consider enabling these too:
-    # "D",  # pydocstyle (if you want docstring checks)
-    # "S",  # flake8-bandit (for security checks)
-]
-
-# Optional: Ignore specific rules if they annoy you
-# ignore = ["E501"]  # Example: Ignore line too long error
-
-# Optional: Set your preferred line length (Ruff defaults to 88)
+# Target the minimum supported interpreter so pyupgrade (UP) rewrites safely.
+target-version = "py312"
 line-length = 88
-
-# Optional: Specify directories Ruff should ignore
 exclude = [
     ".venv",
     "venv",
@@ -82,6 +60,36 @@ exclude = [
     "archive",
 ]
 
+[tool.ruff.lint]
+# See https://docs.astral.sh/ruff/rules/ for the full list.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes (unused imports/variables, undefined names)
+    "I",   # isort (import sorting)
+    "B",   # flake8-bugbear (potential bugs)
+    "UP",  # pyupgrade (modern syntax, e.g. PEP 585/604 type hints)
+    "A",   # flake8-builtins (shadowing builtins)
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+    "ANN", # flake8-annotations (require type hints)
+    "D",   # pydocstyle (Google-style docstrings)
+    "RUF", # ruff-specific good practices
+    "PTH", # flake8-use-pathlib (prefer pathlib over os.path)
+    "T20", # flake8-print (forbid print(); use logging)
+    "S",   # flake8-bandit (basic security checks)
+]
+ignore = [
+    "S603",   # subprocess call: ffmpeg is invoked with a fixed arg list, no shell
+    "S607",   # partial executable path: ffmpeg is expected on the system PATH
+    "ANN401", # `Any` is needed for duck-typed uploads, Pydantic context, **kwargs
+    "RUF001", # ambiguous unicode in strings is intentional (UI: •, ℹ️, ·)
+    "RUF002", # ambiguous unicode in docstrings is intentional
+    "RUF003", # ambiguous unicode in comments is intentional
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
 [tool.ruff.format]
-# You can add formatting-specific settings here if you don't want the defaults
-# E.g., quote-style = "double"
+# Defaults are fine (double quotes, 4-space indent).
