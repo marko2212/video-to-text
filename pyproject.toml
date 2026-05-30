@@ -1,0 +1,87 @@
+[project]
+name = "video-to-text"
+version = "0.1.0"
+description = "A simple app to convert video to text" # Optional
+readme = "README.md" # Specifies the README file as the long description
+authors = [
+  { name="Marko Avramović", email="marko2212@gmail.com" },
+]
+license = "MIT"
+requires-python = ">=3.10"
+
+keywords = ["video", "audio", "transcription", "openai", "whisper", "ffmpeg", "streamlit"]
+
+dependencies = [
+    "streamlit==1.56.0",
+    "python-dotenv==1.0.0",
+    "ffmpeg-python==0.2.0",
+    "pydub==0.25.1",
+    "openai==1.75.0",
+    "tqdm==4.66.4",
+    "jiter==0.9.0",
+    # pydub imports the stdlib `audioop` module, which was removed in Python 3.13
+    # (PEP 594). audioop-lts is the official backport that pydub picks up via the
+    # `pyaudioop` shim. Only needed on 3.13+.
+    "audioop-lts>=0.2.1; python_version >= '3.13'",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Development Status :: 3 - Alpha"
+]
+
+[project.urls]
+Homepage = "https://github.com/marko2212/video-to-text"
+Repository = "https://github.com/marko2212/video-to-text"
+Issues = "https://github.com/marko2212/video-to-text/issues" # Optional issue tracker link
+
+# ==============================
+# Tool Configuration
+# ==============================
+
+# This project is a Streamlit application, not an installable library,
+# so tell uv to skip building/installing the project itself into the venv.
+# uv will still resolve and install the declared dependencies.
+[tool.uv]
+package = false
+
+# Your existing ruff configuration goes below this
+[tool.ruff]
+# Select the rule codes to enable. See Ruff documentation for details.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes (e.g., unused imports/variables, undefined names)
+    "I",   # isort (import sorting)
+    "B",   # flake8-bugbear (potential bugs)
+    "UP",  # pyupgrade (upgrade syntax to newer Python versions)
+    "A",   # flake8-builtins (detect shadowing of builtins)
+    "SIM", # flake8-simplify (suggest code simplifications)
+    "C4",  # flake8-comprehensions (encourage comprehensions)
+    "ANN", # flake8-annotations (check for missing type annotations)
+    # Consider enabling these too:
+    # "D",  # pydocstyle (if you want docstring checks)
+    # "S",  # flake8-bandit (for security checks)
+]
+
+# Optional: Ignore specific rules if they annoy you
+# ignore = ["E501"]  # Example: Ignore line too long error
+
+# Optional: Set your preferred line length (Ruff defaults to 88)
+line-length = 88
+
+# Optional: Specify directories Ruff should ignore
+exclude = [
+    ".venv",
+    "venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "archive",
+]
+
+[tool.ruff.format]
+# You can add formatting-specific settings here if you don't want the defaults
+# E.g., quote-style = "double"
