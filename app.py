@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
-from pydantic import ValidationError
 
 import audio
 import db
@@ -25,6 +24,34 @@ from exceptions import AppError
 from logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def resolve_openai_key() -> str | None:
+    """Return the OpenAI key from settings (.env) or the sidebar field, if any.
+
+    Returns:
+        The API key string, or ``None`` if none has been provided.
+    """
+    return get_settings().openai_api_key or st.session_state.get("openai_api_key_ui")
+
+
+def render_sidebar() -> None:
+    """Render the sidebar; offer an API key field when none is set via the env."""
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        if get_settings().openai_api_key:
+            st.success("OpenAI API key loaded from environment.")
+        else:
+            st.text_input(
+                "OpenAI API key",
+                type="password",
+                key="openai_api_key_ui",
+                placeholder="sk-...",
+                help=(
+                    "Needed only for the OpenAI API provider. Stored only for "
+                    "this session — never written to disk."
+                ),
+            )
 
 
 def update_progress(progress_info: dict[str, Any]) -> None:
@@ -139,6 +166,11 @@ def run_transcription(model: str, with_timestamps: bool, source_type: str) -> No
         with_timestamps: Whether to generate timestamps/subtitles.
         source_type: Either ``"audio"`` or ``"video"``.
     """
+    api_key = resolve_openai_key()
+    if not api_key:
+        st.error("Enter your OpenAI API key in the sidebar to use the API.")
+        return
+
     settings = get_settings()
     base_name = Path(st.session_state.original_filename).stem
     transcript_path = settings.temp_dir / f"transcript_{base_name}.txt"
@@ -149,7 +181,7 @@ def run_transcription(model: str, with_timestamps: bool, source_type: str) -> No
             transcribe.process_audio(
                 st.session_state.audio_path,
                 transcript_path,
-                settings.openai_api_key,
+                api_key,
                 model=model,
                 with_timestamps=with_timestamps,
                 srt_output_file=srt_path if with_timestamps else None,
@@ -357,18 +389,10 @@ def main() -> None:
         layout="wide",
     )
 
-    # Validate configuration up front so a missing API key fails clearly.
-    try:
-        get_settings()
-    except ValidationError:
-        st.error(
-            "Configuration error: `OPENAI_API_KEY` is not set. "
-            "Add it to your `.env` file and restart."
-        )
-        st.stop()
-
+    get_settings()  # load settings and create working dirs (API key is optional)
     db.init_db()
     init_session_state()
+    render_sidebar()
 
     st.title("📝 Video & Audio Transcription")
     st.write("Transcribe audio from video or audio files using OpenAI Whisper")

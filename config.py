@@ -77,7 +77,10 @@ class Settings(BaseSettings):
         segment_duration_minutes: Length of each audio chunk in minutes.
     """
 
-    openai_api_key: str = Field(..., description="OpenAI API key for transcription.")
+    openai_api_key: str | None = Field(
+        default=None,
+        description="OpenAI API key (optional; can also be entered in the UI).",
+    )
     temp_dir: Path = Field(default=BASE_DIR / "temp")
     upload_dir: Path = Field(default=BASE_DIR / "uploads")
     data_dir: Path = Field(default=BASE_DIR / "data")
@@ -101,8 +104,7 @@ def get_settings() -> Settings:
     """Return a cached :class:`Settings` instance (singleton).
 
     Returns:
-        The validated settings. Accessing this the first time will raise a
-        ``pydantic.ValidationError`` if required variables (e.g.
-        ``OPENAI_API_KEY``) are missing.
+        The validated settings. The OpenAI key is optional, so this does not
+        raise when it is missing — the UI lets the user provide it at runtime.
     """
     return Settings()
