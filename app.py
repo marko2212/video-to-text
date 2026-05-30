@@ -155,6 +155,10 @@ def render_sidebar() -> None:
                     "this session — never written to disk."
                 ),
             )
+            st.caption(
+                "Tip: set `OPENAI_API_KEY` in a `.env` file to load it "
+                "automatically every run."
+            )
 
 
 def update_progress(progress_info: dict[str, Any]) -> None:
@@ -301,7 +305,11 @@ def run_transcription(
         else:
             api_key = resolve_openai_key()
             if not api_key:
-                st.error("Enter your OpenAI API key in the sidebar to use the API.")
+                st.error(
+                    "Add your OpenAI API key in the sidebar, or set "
+                    "`OPENAI_API_KEY` in a `.env` file. (The Local engine "
+                    "needs no key.)"
+                )
                 return
             with st.spinner("Transcribing with the OpenAI API…"):
                 transcribe.transcribe_openai(
