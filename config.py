@@ -79,6 +79,15 @@ LOCAL_MODELS: dict[str, str] = {
     "large-v3-turbo": "~1.5 GB · accurate, 2–5× faster than large-v3",
 }
 DEFAULT_LOCAL_MODEL: str = "base"
+# Approximate download sizes (MB), used to drive the download progress bar.
+LOCAL_MODEL_SIZES_MB: dict[str, float] = {
+    "tiny": 75,
+    "base": 145,
+    "small": 480,
+    "medium": 1530,
+    "large-v3": 3090,
+    "large-v3-turbo": 1620,
+}
 
 
 class Settings(BaseSettings):
