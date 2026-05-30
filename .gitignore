@@ -130,6 +130,9 @@ archive/
 data/transcriptions.db
 data/transcriptions.db-*
 
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
 
 
 
