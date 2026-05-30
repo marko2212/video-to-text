@@ -32,6 +32,13 @@ classifiers = [
     "Development Status :: 3 - Alpha"
 ]
 
+# Optional offline backend. Install with: uv sync --extra local
+# Heavy (ctranslate2), so it is not part of the default install.
+[project.optional-dependencies]
+local = [
+    "faster-whisper>=1.1",
+]
+
 [project.urls]
 Homepage = "https://github.com/marko2212/video-to-text"
 Repository = "https://github.com/marko2212/video-to-text"

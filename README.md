@@ -8,8 +8,10 @@ A simple Streamlit web application to transcribe speech into text using the Open
 * Upload **audio** files directly in MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, or AMR format.
 * **Automatic preparation:** audio from a video is extracted automatically on upload (no manual step); audio files are used as-is.
 * **Built-in audio player** to listen to the uploaded/extracted audio before transcribing.
-* **Choose the transcription model** — `gpt-4o-transcribe` (default, more accurate) or `whisper-1`.
-* **Optional timestamps & subtitle export** (`.srt`) when using `whisper-1`.
+* **Two engines:** the **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or a **local, offline Whisper** model (`faster-whisper`) that runs on your machine — free, private, no API key.
+* **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`); it downloads on first use.
+* **Optional timestamps & subtitle export** (`.srt`) — with `whisper-1` and with any local model.
+* **Flexible API key:** read from `.env` if present, otherwise entered in the sidebar (kept only for the session).
 * Handles large audio files by splitting them into smaller segments for transcription.
 * Displays the transcription progress and a preview of the final transcript.
 * Download the transcript as a TXT file (and subtitles as SRT).
@@ -118,9 +120,20 @@ Work in the **Transcribe** tab:
 
 In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts.
 
+## Offline mode (no API key) 🔒
+
+You can transcribe entirely on your machine with a local Whisper model — free, private, and offline. Install the optional backend once:
+
+```bash
+uv sync --extra local
+```
+
+Then in the app choose the **Local (offline)** engine and a model size (`base` is a good default). The model downloads from Hugging Face on first use into `models/` and is cached afterwards. Local transcription runs on the **CPU** by default; if you have a working CUDA setup, set `LOCAL_DEVICE=cuda` in `.env`.
+
 ## Configuration 🔑
 
-* **OpenAI API Key:** Must be set in the `.env` file as `OPENAI_API_KEY`. The application uses `python-dotenv` to load this key.
+* **OpenAI API Key (only for the OpenAI engine):** set it in the `.env` file as `OPENAI_API_KEY`, **or** type it into the sidebar at runtime (kept only for the session, never written to disk). The local offline engine needs no key.
+* **Optional `.env` overrides:** `LOCAL_DEVICE` (`cpu`/`cuda`), `WHISPER_MODEL_DIR` (model cache location).
 
 ## Troubleshooting ⚠️
 

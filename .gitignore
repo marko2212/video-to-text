@@ -122,6 +122,7 @@ temp/
 uploads/
 temp_audio_segments/
 archive/
+models/
 *.wav
 *.mp3
 *.mkv

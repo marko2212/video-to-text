@@ -292,7 +292,7 @@ def _transcribe_all(
     return srt_entries
 
 
-def process_audio(
+def transcribe_openai(
     input_file: str | Path,
     output_file: str | Path,
     api_key: str,
@@ -302,7 +302,7 @@ def process_audio(
     segment_duration_minutes: int = 10,
     progress_callback: ProgressCallback | None = None,
 ) -> None:
-    """Transcribe an audio/video file to text (and optionally subtitles).
+    """Transcribe an audio/video file with the OpenAI API (segmented upload).
 
     Args:
         input_file: Source audio or video file.
@@ -385,3 +385,84 @@ def process_audio(
         raise TranscriptionError(str(exc)) from exc
     finally:
         shutil.rmtree(temp_folder, ignore_errors=True)
+
+
+def transcribe_local(
+    input_file: str | Path,
+    output_file: str | Path,
+    whisper_model: Any,
+    with_timestamps: bool = False,
+    srt_output_file: str | Path | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
+    """Transcribe an audio/video file with a local faster-whisper model.
+
+    Runs fully offline and needs no API key. Unlike the OpenAI path there is no
+    25 MB limit, so the whole file is transcribed at once and per-segment
+    timestamps come back natively (available for every local model).
+
+    Args:
+        input_file: Source audio or video file (ffmpeg-readable).
+        output_file: Destination ``.txt`` transcript path.
+        whisper_model: A loaded ``faster_whisper.WhisperModel`` instance.
+        with_timestamps: Whether to also write an SRT subtitle file.
+        srt_output_file: Destination ``.srt`` path; written only with timestamps.
+        progress_callback: Optional callback receiving status payloads.
+
+    Raises:
+        TranscriptionError: If transcription fails.
+    """
+    input_file = Path(input_file)
+    output_file = Path(output_file)
+    try:
+        _report(
+            progress_callback,
+            status="start",
+            message=f"Local transcription started at {datetime.now()}",
+        )
+        # transcribe() returns a lazy generator; iterating it does the work.
+        segments, info = whisper_model.transcribe(str(input_file), vad_filter=True)
+
+        output_file.write_text(
+            f"Transcription started: {datetime.now()}\n\n", encoding="utf-8"
+        )
+        srt_entries: list[dict[str, Any]] = []
+        texts: list[str] = []
+        duration = getattr(info, "duration", 0) or 0
+        for segment in segments:
+            texts.append(segment.text)
+            if with_timestamps:
+                srt_entries.append(
+                    {
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text.strip(),
+                    }
+                )
+            if progress_callback and duration:
+                _report(
+                    progress_callback,
+                    status="progress",
+                    message=f"Transcribing… {segment.end:.0f}/{duration:.0f}s",
+                    progress=min(1.0, segment.end / duration),
+                )
+
+        with output_file.open("a", encoding="utf-8") as handle:
+            handle.write("".join(texts).strip() + "\n")
+
+        if with_timestamps and srt_output_file and srt_entries:
+            Path(srt_output_file).write_text(build_srt(srt_entries), encoding="utf-8")
+
+        with output_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n\nTranscription completed: {datetime.now()}")
+
+        _report(
+            progress_callback,
+            status="complete",
+            message=f"Transcription completed at {datetime.now()}",
+        )
+        logger.info("Local transcription saved to %s", output_file)
+    except Exception as exc:
+        _report(progress_callback, status="error", message=f"An error occurred: {exc}")
+        logger.exception("Local transcription failed")
+        raise TranscriptionError(str(exc)) from exc

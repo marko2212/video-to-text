@@ -64,6 +64,22 @@ DEFAULT_SEGMENT_DURATION_MINUTES: int = 10
 TARGET_CHANNELS: int = 1
 TARGET_SAMPLE_RATE: int = 16000
 
+# Transcription providers (engine choice shown in the UI).
+PROVIDER_OPENAI: str = "OpenAI API"
+PROVIDER_LOCAL: str = "Local (offline)"
+PROVIDERS: list[str] = [PROVIDER_OPENAI, PROVIDER_LOCAL]
+
+# Local faster-whisper models with a short size/speed hint for the UI dropdown.
+LOCAL_MODELS: dict[str, str] = {
+    "tiny": "~75 MB · fastest, lowest quality",
+    "base": "~145 MB · fast, decent quality",
+    "small": "~480 MB · balanced",
+    "medium": "~1.5 GB · slower, more accurate",
+    "large-v3": "~3 GB · slowest, best accuracy",
+    "large-v3-turbo": "~1.5 GB · accurate, 2–5× faster than large-v3",
+}
+DEFAULT_LOCAL_MODEL: str = "base"
+
 
 class Settings(BaseSettings):
     """Runtime settings loaded from the environment / ``.env`` file.
@@ -73,8 +89,11 @@ class Settings(BaseSettings):
         temp_dir: Directory for transient working files (segments, outputs).
         upload_dir: Directory where uploaded source files are stored.
         data_dir: Directory holding the SQLite history database.
+        whisper_model_dir: Download cache for local faster-whisper models.
         default_model: Transcription model used unless overridden in the UI.
         segment_duration_minutes: Length of each audio chunk in minutes.
+        local_device: Device for local Whisper ("auto", "cpu" or "cuda").
+        local_compute_type: Quantization for local Whisper (e.g. "int8").
     """
 
     openai_api_key: str | None = Field(
@@ -84,8 +103,12 @@ class Settings(BaseSettings):
     temp_dir: Path = Field(default=BASE_DIR / "temp")
     upload_dir: Path = Field(default=BASE_DIR / "uploads")
     data_dir: Path = Field(default=BASE_DIR / "data")
+    whisper_model_dir: Path = Field(default=BASE_DIR / "models")
     default_model: str = Field(default=DEFAULT_MODEL)
     segment_duration_minutes: int = Field(default=DEFAULT_SEGMENT_DURATION_MINUTES)
+    # CPU works everywhere; set LOCAL_DEVICE=cuda only with a working CUDA setup.
+    local_device: str = Field(default="cpu")
+    local_compute_type: str = Field(default="int8")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -95,7 +118,12 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         """Create the working directories as soon as settings are loaded."""
-        for directory in (self.temp_dir, self.upload_dir, self.data_dir):
+        for directory in (
+            self.temp_dir,
+            self.upload_dir,
+            self.data_dir,
+            self.whisper_model_dir,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
 
 

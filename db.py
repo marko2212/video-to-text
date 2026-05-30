@@ -46,6 +46,7 @@ def init_db() -> None:
                 filename         TEXT NOT NULL,
                 source_type      TEXT NOT NULL,
                 model            TEXT NOT NULL,
+                provider         TEXT,
                 with_timestamps  INTEGER NOT NULL,
                 transcript       TEXT NOT NULL,
                 srt              TEXT,
@@ -56,6 +57,10 @@ def init_db() -> None:
             )
             """
         )
+        # Migrate older databases created before the `provider` column existed.
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(transcriptions)")}
+        if "provider" not in columns:
+            conn.execute("ALTER TABLE transcriptions ADD COLUMN provider TEXT")
 
 
 def add_transcription(
@@ -68,6 +73,7 @@ def add_transcription(
     audio_path: str | None = None,
     file_size_mb: float | None = None,
     duration_minutes: float | None = None,
+    provider: str | None = None,
 ) -> int:
     """Insert a transcription record.
 
@@ -81,6 +87,7 @@ def add_transcription(
         audio_path: Optional best-effort path to the source audio.
         file_size_mb: Optional audio size in megabytes.
         duration_minutes: Optional audio duration in minutes.
+        provider: Engine used ("OpenAI API" or "Local (offline)").
 
     Returns:
         The id of the newly inserted row.
@@ -89,14 +96,15 @@ def add_transcription(
         cursor = conn.execute(
             """
             INSERT INTO transcriptions (
-                filename, source_type, model, with_timestamps,
+                filename, source_type, model, provider, with_timestamps,
                 transcript, srt, audio_path, file_size_mb, duration_minutes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 filename,
                 source_type,
                 model,
+                provider,
                 int(with_timestamps),
                 transcript,
                 srt,
@@ -117,7 +125,7 @@ def list_transcriptions() -> list[sqlite3.Row]:
     with closing(_connect()) as conn:
         return conn.execute(
             """
-            SELECT id, filename, source_type, model, with_timestamps,
+            SELECT id, filename, source_type, model, provider, with_timestamps,
                    file_size_mb, duration_minutes, created_at
             FROM transcriptions
             ORDER BY created_at DESC, id DESC

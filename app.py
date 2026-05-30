@@ -5,6 +5,7 @@ transcription pipeline in :mod:`transcribe`, configuration in :mod:`config`, and
 history persistence in :mod:`db`.
 """
 
+import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,11 @@ import db
 import transcribe
 from config import (
     AUDIO_FORMATS,
+    DEFAULT_LOCAL_MODEL,
+    LOCAL_MODELS,
+    PROVIDER_LOCAL,
+    PROVIDER_OPENAI,
+    PROVIDERS,
     TIMESTAMP_MODELS,
     TRANSCRIPTION_MODELS,
     VIDEO_FORMATS,
@@ -24,6 +30,31 @@ from exceptions import AppError
 from logger import get_logger
 
 logger = get_logger(__name__)
+
+# faster-whisper is an optional dependency (install via `uv sync --extra local`).
+LOCAL_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
+
+
+@st.cache_resource(show_spinner=False)
+def load_whisper_model(model_name: str, device: str, compute_type: str) -> Any:
+    """Load and cache a local faster-whisper model (downloads on first use).
+
+    Args:
+        model_name: Model size (e.g. ``"base"``).
+        device: Compute device ("auto", "cpu" or "cuda").
+        compute_type: Quantization (e.g. ``"int8"``).
+
+    Returns:
+        A loaded ``faster_whisper.WhisperModel`` instance.
+    """
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        download_root=str(get_settings().whisper_model_dir),
+    )
 
 
 def resolve_openai_key() -> str | None:
@@ -81,11 +112,14 @@ def update_progress(progress_info: dict[str, Any]) -> None:
             st.error(progress_info["message"])
 
 
-def save_to_history(source_type: str, model: str, with_timestamps: bool) -> None:
+def save_to_history(
+    source_type: str, provider: str, model: str, with_timestamps: bool
+) -> None:
     """Persist the just-finished transcription into the SQLite history.
 
     Args:
         source_type: Either ``"audio"`` or ``"video"``.
+        provider: Engine used (OpenAI API or local).
         model: Transcription model used.
         with_timestamps: Whether subtitles were generated.
     """
@@ -105,6 +139,7 @@ def save_to_history(source_type: str, model: str, with_timestamps: bool) -> None
         filename=st.session_state.original_filename,
         source_type=source_type,
         model=model,
+        provider=provider,
         with_timestamps=with_timestamps,
         transcript=transcript_path.read_text(encoding="utf-8"),
         srt=srt_text,
@@ -158,42 +193,61 @@ def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
         st.error(f"Error preparing audio: {exc}")
 
 
-def run_transcription(model: str, with_timestamps: bool, source_type: str) -> None:
-    """Run the pipeline for the prepared audio and store result paths.
+def run_transcription(
+    provider: str, model: str, with_timestamps: bool, source_type: str
+) -> None:
+    """Run the selected provider's pipeline and store result paths.
 
     Args:
-        model: Selected transcription model.
+        provider: OpenAI API or local provider.
+        model: Selected model (API model name, or local model size).
         with_timestamps: Whether to generate timestamps/subtitles.
         source_type: Either ``"audio"`` or ``"video"``.
     """
-    api_key = resolve_openai_key()
-    if not api_key:
-        st.error("Enter your OpenAI API key in the sidebar to use the API.")
-        return
-
     settings = get_settings()
     base_name = Path(st.session_state.original_filename).stem
     transcript_path = settings.temp_dir / f"transcript_{base_name}.txt"
     srt_path = settings.temp_dir / f"transcript_{base_name}.srt"
+    srt_arg = srt_path if with_timestamps else None
 
-    with st.spinner("Transcription in progress... This may take several minutes."):
-        try:
-            transcribe.process_audio(
-                st.session_state.audio_path,
-                transcript_path,
-                api_key,
-                model=model,
-                with_timestamps=with_timestamps,
-                srt_output_file=srt_path if with_timestamps else None,
-                progress_callback=update_progress,
-            )
-            st.session_state.transcript_path = transcript_path
-            st.session_state.srt_path = (
-                srt_path if with_timestamps and srt_path.exists() else None
-            )
-            save_to_history(source_type, model, with_timestamps)
-        except AppError as exc:
-            st.error(f"Transcription error: {exc}")
+    try:
+        if provider == PROVIDER_LOCAL:
+            with st.spinner(f"Loading model '{model}' (first run downloads it)…"):
+                whisper_model = load_whisper_model(
+                    model, settings.local_device, settings.local_compute_type
+                )
+            with st.spinner("Transcribing locally… This may take a while on CPU."):
+                transcribe.transcribe_local(
+                    st.session_state.audio_path,
+                    transcript_path,
+                    whisper_model,
+                    with_timestamps=with_timestamps,
+                    srt_output_file=srt_arg,
+                    progress_callback=update_progress,
+                )
+        else:
+            api_key = resolve_openai_key()
+            if not api_key:
+                st.error("Enter your OpenAI API key in the sidebar to use the API.")
+                return
+            with st.spinner("Transcribing with the OpenAI API…"):
+                transcribe.transcribe_openai(
+                    st.session_state.audio_path,
+                    transcript_path,
+                    api_key,
+                    model=model,
+                    with_timestamps=with_timestamps,
+                    srt_output_file=srt_arg,
+                    progress_callback=update_progress,
+                )
+
+        st.session_state.transcript_path = transcript_path
+        st.session_state.srt_path = (
+            srt_path if with_timestamps and srt_path.exists() else None
+        )
+        save_to_history(source_type, provider, model, with_timestamps)
+    except AppError as exc:
+        st.error(f"Transcription error: {exc}")
 
 
 def render_results() -> None:
@@ -295,28 +349,51 @@ def render_transcribe_tab() -> None:
 
             if st.session_state.audio_path:
                 st.subheader("2️⃣ Transcription")
-                model = st.selectbox(
-                    "Transcription model",
-                    options=TRANSCRIPTION_MODELS,
-                    index=0,
-                    help=(
-                        "**gpt-4o-transcribe** — newer, more accurate.\n\n"
-                        "**whisper-1** — supports timestamps & subtitle (.srt) export."
-                    ),
-                )
-                if model in TIMESTAMP_MODELS:
+
+                providers = PROVIDERS if LOCAL_AVAILABLE else [PROVIDER_OPENAI]
+                provider = st.radio("Engine", providers, horizontal=True)
+                if not LOCAL_AVAILABLE:
+                    st.caption(
+                        "ℹ️ Install offline Whisper with `uv sync --extra local` "
+                        "to transcribe locally without an API key."
+                    )
+
+                if provider == PROVIDER_LOCAL:
+                    model = st.selectbox(
+                        "Local model",
+                        options=list(LOCAL_MODELS),
+                        index=list(LOCAL_MODELS).index(DEFAULT_LOCAL_MODEL),
+                        format_func=lambda name: f"{name} · {LOCAL_MODELS[name]}",
+                        help="Downloaded on first use; runs fully offline, no key.",
+                    )
+                    # Local models all return native timestamps.
                     with_timestamps = st.checkbox(
                         "Include timestamps & generate subtitles (.srt)", value=False
                     )
                 else:
-                    with_timestamps = False
-                    st.caption(
-                        "ℹ️ Timestamps & subtitles are available only with the "
-                        "whisper-1 model."
+                    model = st.selectbox(
+                        "Transcription model",
+                        options=TRANSCRIPTION_MODELS,
+                        index=0,
+                        help=(
+                            "**gpt-4o-transcribe** — newer, more accurate.\n\n"
+                            "**whisper-1** — supports timestamps & subtitles (.srt)."
+                        ),
                     )
+                    if model in TIMESTAMP_MODELS:
+                        with_timestamps = st.checkbox(
+                            "Include timestamps & generate subtitles (.srt)",
+                            value=False,
+                        )
+                    else:
+                        with_timestamps = False
+                        st.caption(
+                            "ℹ️ Timestamps & subtitles are available only with the "
+                            "whisper-1 model."
+                        )
 
                 if st.button("Start Transcription"):
-                    run_transcription(model, with_timestamps, source_type)
+                    run_transcription(provider, model, with_timestamps, source_type)
 
         st.divider()
         if st.button("🧹 Clean temporary files"):
@@ -340,10 +417,12 @@ def render_history_tab() -> None:
             f"{flag}{record['filename']} · {record['model']} · {record['created_at']}"
         )
         with st.expander(label):
-            meta = record["source_type"]
+            meta_parts = [record["source_type"]]
+            if record["provider"]:
+                meta_parts.append(record["provider"])
             if record["file_size_mb"]:
-                meta += f" · {record['file_size_mb']} MB"
-            st.caption(meta)
+                meta_parts.append(f"{record['file_size_mb']} MB")
+            st.caption(" · ".join(meta_parts))
 
             full = db.get_transcription(record["id"])
             base_name = Path(full["filename"]).stem
@@ -395,7 +474,7 @@ def main() -> None:
     render_sidebar()
 
     st.title("📝 Video & Audio Transcription")
-    st.write("Transcribe audio from video or audio files using OpenAI Whisper")
+    st.write("Transcribe video or audio — OpenAI API or a local offline Whisper model")
 
     tab_transcribe, tab_history = st.tabs(["🎙️ Transcribe", "📚 History"])
     with tab_transcribe:

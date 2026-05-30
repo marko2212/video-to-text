@@ -4,20 +4,23 @@ Guidance for Claude Code when working in this repository.
 
 ## Project
 
-Streamlit app that transcribes speech to text via the OpenAI audio API.
-It accepts video files (audio is extracted with ffmpeg) and audio files
-(fed straight to transcription). Long inputs are split into segments.
+Streamlit app that transcribes speech to text via either the OpenAI audio API
+or a local, offline Whisper model (`faster-whisper`). It accepts video files
+(audio is extracted with ffmpeg) and audio files (fed straight to
+transcription). Long API inputs are split into segments; the local backend
+transcribes the whole file at once.
 
 Module layout (UI thin, logic separated):
 
 - `app.py` — Streamlit UI only (render functions; no ffmpeg/IO inline)
 - `config.py` — Pydantic Settings + shared constants (single source of truth)
 - `audio.py` — ffmpeg helpers: save uploads, convert to mono-16k WAV
-- `transcribe.py` — transcription pipeline (`process_audio`), UI-agnostic
+- `transcribe.py` — UI-agnostic pipeline: `transcribe_openai` and `transcribe_local`
 - `db.py` — SQLite history (`data/transcriptions.db`)
 - `exceptions.py` — domain exceptions (`AppError` and subclasses)
 - `logger.py` — `get_logger()` (stdlib logging)
-- Dependencies managed with `uv` (see `pyproject.toml` / `uv.lock`)
+- Dependencies managed with `uv` (see `pyproject.toml` / `uv.lock`).
+  The offline backend is an optional extra: `uv sync --extra local`.
 
 ## Code conventions
 
