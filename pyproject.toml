@@ -47,6 +47,14 @@ Issues = "https://github.com/marko2212/video-to-text/issues" # Optional issue tr
 [tool.uv]
 package = false
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Flat layout: make root-level modules (db.py, transcribe.py, ...) importable.
+pythonpath = ["."]
+# pydub 0.25.1 emits SyntaxWarnings from invalid escape sequences in its
+# regexes (fixed upstream but unreleased). Keep test output clean.
+filterwarnings = ["ignore::SyntaxWarning"]
+
 [tool.ruff]
 # Target the minimum supported interpreter so pyupgrade (UP) rewrites safely.
 target-version = "py312"
@@ -91,5 +99,15 @@ ignore = [
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ruff.lint.per-file-ignores]
+# Tests use bare asserts and don't need docstrings / type hints.
+"tests/**" = ["S101", "ANN", "D"]
+
 [tool.ruff.format]
 # Defaults are fine (double quotes, 4-space indent).
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff==0.15.9",
+]

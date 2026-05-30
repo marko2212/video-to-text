@@ -41,7 +41,12 @@ Use the Makefile targets (run `make` for the full list):
 - `make run` — start the app (`uv run streamlit run app.py`)
 - `make sync` — install dependencies from `uv.lock`
 - `make lint` / `make format` — ruff
+- `make test` — run the pytest suite (`tests/`)
+- `make check` — lint + format check + tests (same gate as CI)
 - `make reset` — rebuild the `.venv`
+
+Tests live in `tests/` and run without network/ffmpeg (pure helpers + SQLite).
+CI (`.github/workflows/ci.yml`) runs `make check`'s steps on push/PR.
 
 ## Commit messages
 

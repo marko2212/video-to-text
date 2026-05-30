@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help run sync lock upgrade upgrade-package lint format fix clean clean-venv reset
+.PHONY: help run sync lock upgrade upgrade-package lint format fix test check clean clean-venv reset
 
 PYTHON_NO_PROJECT := uv run --no-project python
 
@@ -14,6 +14,8 @@ help:
 	@echo   make lint                        - Run ruff check
 	@echo   make format                      - Run ruff format
 	@echo   make fix                         - Auto-fix lint issues
+	@echo   make test                        - Run the pytest suite
+	@echo   make check                       - Lint + format check + tests (CI gate)
 	@echo   make clean                       - Remove temp/, uploads/ contents and __pycache__
 	@echo   make clean-venv                  - Remove .venv
 	@echo   make reset                       - clean-venv + sync
@@ -43,6 +45,14 @@ format:
 
 fix:
 	uv run ruff check --fix .
+
+test:
+	uv run pytest
+
+check:
+	uv run ruff check .
+	uv run ruff format --check .
+	uv run pytest
 
 clean:
 	$(PYTHON_NO_PROJECT) -c "import pathlib, shutil; [shutil.rmtree(p, ignore_errors=True) for p in pathlib.Path('.').rglob('__pycache__')]; [shutil.rmtree(d, ignore_errors=True) or pathlib.Path(d).mkdir(exist_ok=True) for d in ('temp', 'uploads')]"
