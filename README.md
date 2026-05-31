@@ -25,7 +25,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 
 ## Screenshots 📸
 
-| Upload & flexible API key | OpenAI API or offline engine | Persistent history |
+| Upload & flexible API key | Engine choice & live transcript | Persistent history |
 | --- | --- | --- |
 | ![Home](docs/screenshots/home.png) | ![Transcribe](docs/screenshots/transcribe.png) | ![History](docs/screenshots/history.png) |
 
