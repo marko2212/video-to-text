@@ -6,8 +6,6 @@ history persistence in :mod:`db`.
 """
 
 import importlib.util
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -60,13 +58,6 @@ def load_whisper_model(model_name: str, device: str, compute_type: str) -> Any:
     )
 
 
-def _dir_size(path: Path) -> int:
-    """Return the total size in bytes of all files under a directory."""
-    if not path.exists():
-        return 0
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-
-
 def _model_is_cached(model_name: str) -> bool:
     """Return True if the local model is already downloaded on disk."""
     from faster_whisper import download_model
@@ -80,53 +71,6 @@ def _model_is_cached(model_name: str) -> bool:
         return True
     except Exception:
         return False
-
-
-def download_model_with_progress(model_name: str) -> None:
-    """Download a local model with a real progress bar (no-op if cached).
-
-    The download runs in a background thread while the main thread polls the
-    growing size of the models directory against the model's expected size.
-
-    Args:
-        model_name: The faster-whisper model size to download.
-
-    Raises:
-        AppError: If the download fails.
-    """
-    if _model_is_cached(model_name):
-        return
-
-    from faster_whisper import download_model
-
-    models_dir = get_settings().whisper_model_dir
-    expected_bytes = LOCAL_MODEL_SIZES_MB.get(model_name, 500) * 1024 * 1024
-    baseline = _dir_size(models_dir)
-    result: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            download_model(model_name, cache_dir=str(models_dir))
-        except Exception as exc:  # surfaced on the main thread below
-            result["error"] = exc
-
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
-
-    bar = st.progress(0.0, text=f"Downloading model '{model_name}'…")
-    while thread.is_alive():
-        downloaded = max(0, _dir_size(models_dir) - baseline)
-        fraction = min(0.99, downloaded / expected_bytes) if expected_bytes else 0.0
-        bar.progress(
-            fraction,
-            text=f"Downloading '{model_name}'… {downloaded / (1024 * 1024):.0f} MB",
-        )
-        time.sleep(0.3)
-    thread.join()
-    bar.empty()
-
-    if "error" in result:
-        raise AppError(f"Model download failed: {result['error']}")
 
 
 def resolve_openai_key() -> str | None:
@@ -288,8 +232,15 @@ def run_transcription(
 
     try:
         if provider == PROVIDER_LOCAL:
-            download_model_with_progress(model)
-            with st.spinner(f"Loading model '{model}'…"):
+            if _model_is_cached(model):
+                spinner_msg = f"Loading model '{model}'…"
+            else:
+                size = LOCAL_MODEL_SIZES_MB.get(model)
+                hint = f" (~{size:.0f} MB)" if size else ""
+                spinner_msg = (
+                    f"Downloading '{model}'{hint} — first run only, please wait…"
+                )
+            with st.spinner(spinner_msg):
                 whisper_model = load_whisper_model(
                     model, settings.local_device, settings.local_compute_type
                 )
