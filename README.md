@@ -1,6 +1,6 @@
 # VideoToText Transcription App 📝
 
-A simple Streamlit web application to transcribe speech into text using the OpenAI Whisper API. It accepts both video files (it extracts the audio track) and audio files directly.
+A Streamlit web app that transcribes speech to text — using either the **OpenAI audio API** or a **local, offline Whisper model** (`faster-whisper`). It accepts both video files (the audio track is extracted automatically) and audio files directly, and can export subtitles (`.srt`).
 
 ## Features ✨
 
@@ -18,13 +18,19 @@ A simple Streamlit web application to transcribe speech into text using the Open
 * **Persistent history** of past transcriptions stored in a local SQLite database (survives the "Clean temporary files" action).
 * Button to clean up temporary working files (`temp/`, `uploads/`).
 
+## Screenshots 📸
+
+| Upload & flexible API key | OpenAI API or offline engine | Persistent history |
+| --- | --- | --- |
+| ![Home](docs/screenshots/home.png) | ![Transcribe](docs/screenshots/transcribe.png) | ![History](docs/screenshots/history.png) |
+
 ## Requirements 🛠️
 
-* **Python:** Version 3.10 or higher. (`uv` will fetch a matching interpreter automatically if you don't have one.)
+* **Python:** Version 3.12 or higher. (`uv` will fetch a matching interpreter automatically if you don't have one.)
 * **uv:** Used to manage the virtual environment and dependencies. Install from [the uv docs](https://docs.astral.sh/uv/getting-started/installation/).
 * **ffmpeg:** This external tool **must be installed and accessible** for the application to work. See installation instructions below.
-* **OpenAI API Key:** You need an API key from OpenAI to use the Whisper transcription service. You might incur costs depending on your usage.
-* **Python Packages:** Declared in `pyproject.toml` and locked in `uv.lock` — installed via `uv sync`.
+* **OpenAI API Key (optional):** only needed for the OpenAI engine. The local offline engine needs no key. You might incur costs depending on your OpenAI usage.
+* **Python Packages:** Declared in `pyproject.toml` and locked in `uv.lock` — installed via `uv sync` (add `--extra local` for the offline backend).
 
 ## Installation ⚙️
 
@@ -91,14 +97,13 @@ A simple Streamlit web application to transcribe speech into text using the Open
 
     You do **not** need to manually create or activate a virtual environment — `uv run` (see below) handles that for you. Re-run `uv sync` any time `pyproject.toml` or `uv.lock` changes.
 
-5. **Set up Environment Variables:**
-    * Copy the `.env.example` file to a new file named `.env`
-    * Replace `'your_openai_api_key_here'` with your actual key.
+5. **Set up Environment Variables (optional):**
+    * Only needed for the **OpenAI engine**. Copy `.env.example` to `.env` and set your `OPENAI_API_KEY`.
+    * You can skip this and either paste the key into the app's sidebar at runtime, or use the **offline engine** (no key at all — see [Offline mode](#offline-mode-no-api-key-)).
 
 ## Running the Application 🚀
 
-1. Ensure the `.env` file with your API key is present in the project root.
-2. Run the Streamlit application from your terminal:
+1. Run the Streamlit application from your terminal:
 
     ```bash
     uv run streamlit run app.py
@@ -106,14 +111,14 @@ A simple Streamlit web application to transcribe speech into text using the Open
 
     `uv run` automatically uses the project's `.venv` — no manual activation step needed.
 
-3. Streamlit will provide local and network URLs (usually `http://localhost:8501` or similar). Open one of these URLs in your web browser.
+2. Streamlit will provide local and network URLs (usually `http://localhost:8501` or similar). Open one of these URLs in your web browser.
 
 ## Usage 🖱️
 
 Work in the **Transcribe** tab:
 
 1. **Upload File:** Use the file uploader to select a video file (MKV, MP4, etc.) or an audio file (MP3, WAV, etc.). The audio is prepared automatically — a video's audio track is extracted on upload, and audio files are used directly. An audio player appears so you can listen first. (For video, you can also download the extracted `.wav`.)
-2. **Pick options:** Choose the transcription **model** (`gpt-4o-transcribe` by default, or `whisper-1`). With `whisper-1` you can tick **"Include timestamps & generate subtitles (.srt)"**.
+2. **Pick the engine & options:** Choose the **engine** — **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or **Local (offline)** (pick a model size that downloads on first use). Tick **"Include timestamps & generate subtitles (.srt)"** where available (`whisper-1` and any local model). For the OpenAI engine, set your key in `.env` or in the sidebar.
 3. **Start Transcription:** Click "Start Transcription". Progress is shown while segments are processed (this may take several minutes for long audio).
 4. **View & Download:** The transcript preview appears on the right with a "Download Transcript" button (and "Download Subtitles (.srt)" when timestamps were enabled).
 5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`. Your transcription **history is kept** (see below).
@@ -139,6 +144,18 @@ Then in the app choose the **Local (offline)** engine and a model size (`base` i
 
 * **`ffmpeg not found` Error / Runtime Warning:** This is the most common issue. Double-check that `ffmpeg` is correctly installed using **one** of the methods described in the "Installation" section. If you installed it manually (Windows non-Conda), ensure the **correct `bin` folder** path is added to your system's PATH and **restart your terminal/VS Code** afterwards. Verify by running `ffmpeg -version` in a new terminal.
 * **`openai.AuthenticationError`:** Double-check your API key in the `.env` file. Make sure the `.env` file is in the same directory where you run `streamlit run app.py`. Verify your OpenAI account status and billing information.
+
+## Development 🧑‍💻
+
+Common tasks are available as Makefile targets (run `make` for the full list):
+
+* `make run` — start the app
+* `make sync` — install dependencies from `uv.lock`
+* `make test` — run the pytest suite
+* `make check` — lint + format check + tests (the same gate as CI)
+* `make lint` / `make format` — ruff
+
+Continuous integration (`.github/workflows/ci.yml`) runs these checks on every push and pull request.
 
 ## Author 👨‍💻
 
