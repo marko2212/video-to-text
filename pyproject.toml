@@ -9,7 +9,21 @@ authors = [
 license = "MIT"
 requires-python = ">=3.12"
 
-keywords = ["video", "audio", "transcription", "openai", "whisper", "ffmpeg", "streamlit"]
+keywords = [
+    "video",
+    "audio",
+    "transcription",
+    "speech-to-text",
+    "whisper",
+    "faster-whisper",
+    "openai",
+    "gpt-4o",
+    "streamlit",
+    "ffmpeg",
+    "subtitles",
+    "srt",
+    "offline",
+]
 
 dependencies = [
     "streamlit==1.56.0",
