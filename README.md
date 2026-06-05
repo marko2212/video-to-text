@@ -130,6 +130,24 @@ Then **double-click "Video & Audio Transcription"** on your Desktop — it start
 
 **Linux / macOS** — run `bash scripts/run.sh` (or simply `make run`).
 
+## Run with Docker 🐳
+
+Prefer containers? Docker **bundles ffmpeg** and every dependency, so the host needs nothing but Docker itself. (Running without Docker still works — see above — but then **you must install ffmpeg yourself**.)
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:8501`. Provide `OPENAI_API_KEY` via a `.env` file or your shell (or just type it into the sidebar). Transcription history (`data/`) and downloaded offline models (`models/`) persist via volumes.
+
+To bake the **offline Whisper backend** into the image (bigger build):
+
+```bash
+INSTALL_LOCAL=true docker compose up --build
+```
+
+Docker is **optional** — it sits alongside the local `uv` / `make run` workflow; pick whichever you prefer.
+
 ## Usage 🖱️
 
 Work in the **Transcribe** tab:

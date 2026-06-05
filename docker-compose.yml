@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        # Set INSTALL_LOCAL=true to bake in the offline Whisper backend.
+        INSTALL_LOCAL: ${INSTALL_LOCAL:-false}
+    ports:
+      - "8501:8501"
+    environment:
+      # Read from a .env file or your shell. Leave empty to enter the key in
+      # the app's sidebar instead.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./data:/app/data       # persist transcription history
+      - ./models:/app/models   # persist downloaded offline models
