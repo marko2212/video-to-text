@@ -118,6 +118,18 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 
 2. Streamlit will provide local and network URLs (usually `http://localhost:8501` or similar). Open one of these URLs in your web browser.
 
+### Quick launch 🖱️
+
+**Windows** — run once to put an app icon on your Desktop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1
+```
+
+Then **double-click "Video & Audio Transcription"** on your Desktop — it starts the app (console minimized to the taskbar) and opens your browser automatically. You can also double-click `scripts\run.bat` directly.
+
+**Linux / macOS** — run `bash scripts/run.sh` (or simply `make run`).
+
 ## Usage 🖱️
 
 Work in the **Transcribe** tab:
