@@ -25,9 +25,17 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 
 ## Screenshots 📸
 
-| Upload & flexible API key | Engine choice & live transcript | Persistent history |
-| --- | --- | --- |
-| ![Home](docs/screenshots/home.png) | ![Transcribe](docs/screenshots/transcribe.png) | ![History](docs/screenshots/history.png) |
+**1. Upload & flexible API key** — drop in a video or audio file; the OpenAI key loads from `.env`, or type it into the sidebar (or skip it entirely and use the offline engine).
+
+![Upload screen with the sidebar API key field](docs/screenshots/home.png)
+
+**2. Choose the engine, then transcribe** — OpenAI API (`gpt-4o-transcribe` / `whisper-1`) or a local, offline Whisper model, with the transcript shown right next to the controls.
+
+![Engine selection and a live transcript result](docs/screenshots/transcribe.png)
+
+**3. Persistent history** — browse, re-download (TXT/SRT), and delete past transcriptions.
+
+![The transcription history list](docs/screenshots/history.png)
 
 ## Requirements 🛠️
 
