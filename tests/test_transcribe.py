@@ -36,3 +36,43 @@ def test_build_srt_preserves_offset_timeline():
 
 def test_build_srt_empty():
     assert transcribe.build_srt([]) == ""
+
+
+def test_format_clock():
+    assert transcribe._format_clock(0) == "0:00"
+    assert transcribe._format_clock(74) == "1:14"
+    assert transcribe._format_clock(3675) == "1:01:15"
+
+
+def test_build_transcript_prefixes_timestamps():
+    entries = [
+        {"start": 0.0, "end": 2.0, "text": "Hello there."},
+        {"start": 2.0, "end": 4.0, "text": "How are you?"},
+    ]
+    assert (
+        transcribe.build_transcript(entries)
+        == "(0:00) Hello there. (0:02) How are you?"
+    )
+
+
+def test_build_transcript_breaks_paragraph_on_pause():
+    entries = [
+        {"start": 0.0, "end": 2.0, "text": "First part."},
+        {"start": 10.0, "end": 12.0, "text": "After a long pause."},
+    ]
+    out = transcribe.build_transcript(entries, paragraph_gap=2.0)
+    assert out == "(0:00) First part.\n\n(0:10) After a long pause."
+
+
+def test_build_transcript_skips_empty_segments():
+    entries = [
+        {"start": 0.0, "end": 1.0, "text": "   "},
+        {"start": 1.0, "end": 2.0, "text": "Real text."},
+    ]
+    assert transcribe.build_transcript(entries) == "(0:01) Real text."
+
+
+def test_split_into_paragraphs_groups_sentences():
+    text = "One. Two. Three. Four. Five. Six."
+    out = transcribe.split_into_paragraphs(text, sentences_per_paragraph=2)
+    assert out == "One. Two.\n\nThree. Four.\n\nFive. Six."

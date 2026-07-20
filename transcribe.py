@@ -1,11 +1,14 @@
 """Transcription pipeline.
 
-Splits an audio file into chunks, transcribes each chunk with the OpenAI audio
-API, and writes a plain-text transcript plus an optional SRT subtitle file. This
-module is UI-agnostic: progress is reported through an optional callback.
+Transcribes audio with the OpenAI audio API (chunked, because of the 25 MB
+request limit) or a local faster-whisper model. When the engine returns timed
+segments, the transcript is rendered as timestamped paragraphs; otherwise it
+falls back to sentence-grouped paragraphs. This module is UI-agnostic:
+progress is reported through an optional callback.
 """
 
 import math
+import re
 import shutil
 import time
 from collections.abc import Callable
@@ -36,6 +39,12 @@ _MIN_SEGMENT_SIZE_MB = 0.1
 _MIN_TINY_SEGMENT_SIZE_MB = 0.01
 _MIN_DURATION_SECONDS = 5
 _MAX_RETRIES = 3
+
+# Readability tuning for the rendered transcript: start a new paragraph after a
+# pause this long, or once a paragraph grows past this many characters.
+_PARAGRAPH_GAP_SECONDS = 2.0
+_PARAGRAPH_MAX_CHARS = 350
+_SENTENCES_PER_PARAGRAPH = 4
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -71,6 +80,85 @@ def build_srt(entries: list[dict[str, Any]]) -> str:
         end = _format_srt_timestamp(entry["end"])
         blocks.append(f"{index}\n{start} --> {end}\n{entry['text']}\n")
     return "\n".join(blocks)
+
+
+def _format_clock(seconds: float) -> str:
+    """Format seconds as a short clock stamp: ``M:SS`` (or ``H:MM:SS``).
+
+    Args:
+        seconds: Time offset in seconds.
+
+    Returns:
+        The stamp shown inline in the transcript.
+    """
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def build_transcript(
+    entries: list[dict[str, Any]],
+    paragraph_gap: float = _PARAGRAPH_GAP_SECONDS,
+    paragraph_chars: int = _PARAGRAPH_MAX_CHARS,
+) -> str:
+    """Render timed segments as a readable, timestamped transcript.
+
+    Each segment is prefixed with its ``(M:SS)`` start time, and segments are
+    grouped into paragraphs: a new paragraph begins after a pause longer than
+    ``paragraph_gap`` or once the paragraph grows past ``paragraph_chars``.
+
+    Args:
+        entries: Segments with ``start``/``end`` (seconds) and ``text``.
+        paragraph_gap: Pause (seconds) that forces a paragraph break.
+        paragraph_chars: Soft maximum characters per paragraph.
+
+    Returns:
+        The transcript as blank-line separated paragraphs.
+    """
+    paragraphs: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    previous_end: float | None = None
+
+    for entry in entries:
+        text = str(entry["text"]).strip()
+        if not text:
+            continue
+        gap = entry["start"] - previous_end if previous_end is not None else 0.0
+        if current and (gap > paragraph_gap or current_chars >= paragraph_chars):
+            paragraphs.append(" ".join(current))
+            current, current_chars = [], 0
+        current.append(f"({_format_clock(entry['start'])}) {text}")
+        current_chars += len(text)
+        previous_end = entry["end"]
+
+    if current:
+        paragraphs.append(" ".join(current))
+    return "\n\n".join(paragraphs)
+
+
+def split_into_paragraphs(
+    text: str, sentences_per_paragraph: int = _SENTENCES_PER_PARAGRAPH
+) -> str:
+    """Group a flat transcript into paragraphs (used when there are no segments).
+
+    Models such as ``gpt-4o-transcribe`` return one continuous string, so the
+    text is split on sentence endings and regrouped to stay readable.
+
+    Args:
+        text: The flat transcript text.
+        sentences_per_paragraph: How many sentences to keep per paragraph.
+
+    Returns:
+        The transcript as blank-line separated paragraphs.
+    """
+    sentences = [part for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part]
+    paragraphs = [
+        " ".join(sentences[index : index + sentences_per_paragraph])
+        for index in range(0, len(sentences), sentences_per_paragraph)
+    ]
+    return "\n\n".join(paragraphs)
 
 
 def get_audio_info(file_path: Path, segment_duration_ms: int) -> dict[str, Any]:
@@ -157,7 +245,7 @@ def _transcribe_segment(
     file_path: Path,
     client: OpenAI,
     model: str = DEFAULT_MODEL,
-    with_timestamps: bool = False,
+    want_segments: bool = False,
     retry_count: int = _MAX_RETRIES,
 ) -> Any:
     """Transcribe a single chunk, retrying transient failures.
@@ -166,11 +254,11 @@ def _transcribe_segment(
         file_path: Path to the chunk MP3.
         client: Configured OpenAI client.
         model: Transcription model name.
-        with_timestamps: If True, request ``verbose_json`` (per-segment times).
+        want_segments: If True, request ``verbose_json`` (per-segment times).
         retry_count: Number of attempts before giving up.
 
     Returns:
-        The transcript text, or — when ``with_timestamps`` is set — the full
+        The transcript text, or — when ``want_segments`` is set — the full
         verbose response object (exposing ``.text`` and ``.segments``).
 
     Raises:
@@ -201,7 +289,7 @@ def _transcribe_segment(
 
             logger.info("Transcribing segment (attempt %d)", attempt + 1)
             with file_path.open("rb") as audio_file:
-                if with_timestamps:
+                if want_segments:
                     return client.audio.transcriptions.create(
                         model=model,
                         file=audio_file,
@@ -230,30 +318,56 @@ def _report(progress_callback: ProgressCallback | None, **payload: Any) -> None:
         progress_callback(payload)
 
 
+def _write_outputs(
+    output_file: Path,
+    texts: list[str],
+    timed_entries: list[dict[str, Any]],
+    srt_output_file: str | Path | None,
+) -> None:
+    """Write the rendered transcript and, when requested, the SRT file.
+
+    Timed segments give a timestamped, paragraphed transcript; without them the
+    flat text is at least regrouped into paragraphs so it stays readable.
+
+    Args:
+        output_file: Destination ``.txt`` path.
+        texts: Raw per-chunk transcript texts (fallback source).
+        timed_entries: Timed segments, if the engine returned any.
+        srt_output_file: Destination ``.srt`` path, or None to skip subtitles.
+    """
+    if timed_entries:
+        document = build_transcript(timed_entries)
+    else:
+        document = split_into_paragraphs(" ".join(text.strip() for text in texts))
+    output_file.write_text(document + "\n", encoding="utf-8")
+
+    if srt_output_file and timed_entries:
+        Path(srt_output_file).write_text(build_srt(timed_entries), encoding="utf-8")
+
+
 def _transcribe_all(
     segments: list[AudioSegment],
     client: OpenAI,
     model: str,
-    with_timestamps: bool,
+    want_segments: bool,
     temp_folder: Path,
-    output_file: Path,
     progress_callback: ProgressCallback | None,
-) -> list[dict[str, Any]]:
-    """Transcribe every chunk, appending text to the output and timing the SRT.
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Transcribe every chunk and collect its text and timed segments.
 
     Args:
         segments: Audio chunks to transcribe.
         client: Configured OpenAI client.
         model: Transcription model name.
-        with_timestamps: Whether per-segment timestamps were requested.
+        want_segments: Whether the model returns per-segment timestamps.
         temp_folder: Scratch directory for chunk MP3s.
-        output_file: Transcript file to append each chunk's text to.
         progress_callback: Optional progress callback.
 
     Returns:
-        SRT entries (``start``/``end``/``text``) with timeline offsets applied.
+        Per-chunk texts and timed entries with timeline offsets applied.
     """
-    srt_entries: list[dict[str, Any]] = []
+    texts: list[str] = []
+    timed_entries: list[dict[str, Any]] = []
     offset_seconds = 0.0
     total = len(segments)
 
@@ -267,12 +381,14 @@ def _transcribe_all(
         segment_path = _save_segment(segment, index, temp_folder)
         try:
             result = _transcribe_segment(
-                segment_path, client, model=model, with_timestamps=with_timestamps
+                segment_path, client, model=model, want_segments=want_segments
             )
-            if with_timestamps:
-                text = result.text
+            if want_segments:
+                texts.append(result.text)
+                # Offset each chunk's timestamps by its position in the original
+                # audio so the timeline stays continuous across chunks.
                 for seg in getattr(result, "segments", None) or []:
-                    srt_entries.append(
+                    timed_entries.append(
                         {
                             "start": seg.start + offset_seconds,
                             "end": seg.end + offset_seconds,
@@ -280,16 +396,13 @@ def _transcribe_all(
                         }
                     )
             else:
-                text = result
-
-            with output_file.open("a", encoding="utf-8") as handle:
-                handle.write(f"\n--- Segment {index + 1} ---\n{text}\n")
+                texts.append(result)
         finally:
             segment_path.unlink(missing_ok=True)
 
         offset_seconds += len(segment) / 1000.0
 
-    return srt_entries
+    return texts, timed_entries
 
 
 def transcribe_openai(
@@ -323,8 +436,11 @@ def transcribe_openai(
     temp_folder = get_settings().temp_dir / "segments"
     client = OpenAI(api_key=api_key)
 
-    # Timestamps/subtitles require a model that returns verbose_json.
-    if with_timestamps and model not in TIMESTAMP_MODELS:
+    # Only some models return verbose_json. Ask for segments whenever the model
+    # supports them (free) so the transcript can be rendered with timestamps;
+    # the SRT file itself is still written only when the user asked for it.
+    want_segments = model in TIMESTAMP_MODELS
+    if with_timestamps and not want_segments:
         with_timestamps = False
 
     try:
@@ -344,36 +460,32 @@ def transcribe_openai(
 
         segments = _split_audio(input_file, temp_folder, segment_duration_ms)
 
-        output_file.write_text(
-            f"Transcription started: {datetime.now()}\n\n", encoding="utf-8"
-        )
         _report(
             progress_callback,
             status="start",
             message=f"Transcription started at {datetime.now()}",
         )
 
-        srt_entries = _transcribe_all(
+        texts, timed_entries = _transcribe_all(
             segments,
             client,
             model,
-            with_timestamps,
+            want_segments,
             temp_folder,
-            output_file,
             progress_callback,
         )
 
-        if with_timestamps and srt_output_file and srt_entries:
-            Path(srt_output_file).write_text(build_srt(srt_entries), encoding="utf-8")
-
-        completion_time = datetime.now()
-        with output_file.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n\nTranscription completed: {completion_time}")
+        _write_outputs(
+            output_file,
+            texts,
+            timed_entries,
+            srt_output_file if with_timestamps else None,
+        )
 
         _report(
             progress_callback,
             status="complete",
-            message=f"Transcription completed at {completion_time}",
+            message=f"Transcription completed at {datetime.now()}",
         )
         logger.info("Transcription saved to %s", output_file)
 
@@ -423,22 +535,20 @@ def transcribe_local(
         # transcribe() returns a lazy generator; iterating it does the work.
         segments, info = whisper_model.transcribe(str(input_file), vad_filter=True)
 
-        output_file.write_text(
-            f"Transcription started: {datetime.now()}\n\n", encoding="utf-8"
-        )
-        srt_entries: list[dict[str, Any]] = []
+        # faster-whisper always returns timed segments, so collect them even when
+        # no SRT was requested — they drive the readable transcript.
+        timed_entries: list[dict[str, Any]] = []
         texts: list[str] = []
         duration = getattr(info, "duration", 0) or 0
         for segment in segments:
             texts.append(segment.text)
-            if with_timestamps:
-                srt_entries.append(
-                    {
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": segment.text.strip(),
-                    }
-                )
+            timed_entries.append(
+                {
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text.strip(),
+                }
+            )
             if progress_callback and duration:
                 _report(
                     progress_callback,
@@ -447,14 +557,12 @@ def transcribe_local(
                     progress=min(1.0, segment.end / duration),
                 )
 
-        with output_file.open("a", encoding="utf-8") as handle:
-            handle.write("".join(texts).strip() + "\n")
-
-        if with_timestamps and srt_output_file and srt_entries:
-            Path(srt_output_file).write_text(build_srt(srt_entries), encoding="utf-8")
-
-        with output_file.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n\nTranscription completed: {datetime.now()}")
+        _write_outputs(
+            output_file,
+            texts,
+            timed_entries,
+            srt_output_file if with_timestamps else None,
+        )
 
         _report(
             progress_callback,
