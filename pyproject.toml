@@ -31,6 +31,9 @@ dependencies = [
     "ffmpeg-python==0.2.0",
     "pydub==0.25.1",
     "openai==1.75.0",
+    # Used to perceptually deduplicate extracted video frames. Streamlit already
+    # pulls Pillow in, but frames.py imports it directly, so it is declared here.
+    "pillow>=10.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     # pydub imports the stdlib `audioop` module, which was removed in Python 3.13

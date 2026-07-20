@@ -64,6 +64,54 @@ DEFAULT_SEGMENT_DURATION_MINUTES: int = 10
 TARGET_CHANNELS: int = 1
 TARGET_SAMPLE_RATE: int = 16000
 
+# On-screen context: key frames pulled from a video and described by a vision
+# model, so slides and shared screens end up in the transcript alongside speech.
+DEFAULT_VISION_MODEL: str = "gpt-5.4-nano"
+VISION_MODELS: list[str] = [DEFAULT_VISION_MODEL, "gpt-5.4-mini"]
+# How different a frame must look from the previous one to count as a new scene
+# (0–1). Far below the 0.3 usually quoted for film, because ffmpeg's score is
+# tuned for natural footage: a measured full-screen slide change from navy to
+# dark red scored only 0.077. Scene detection is treated as a cheap candidate
+# generator here, not as the thing that guarantees coverage.
+SCENE_THRESHOLD: float = 0.1
+# A frame is taken at least this often even when nothing trips scene detection,
+# which is what actually guarantees coverage of slow fades and subtle changes.
+# Adjustable in the UI within this range.
+FRAME_MAX_INTERVAL_SECONDS: float = 30.0
+FRAME_INTERVAL_MIN_SECONDS: int = 5
+FRAME_INTERVAL_MAX_SECONDS: int = 300
+FRAME_INTERVAL_STEP_SECONDS: int = 5
+# A single hard cut can trip scene detection several times in a row; one of
+# those frames is enough.
+FRAME_MIN_INTERVAL_SECONDS: float = 2.0
+# Hard cap on frames per video, so the cost of the feature stays predictable.
+FRAME_MAX_COUNT: int = 40
+# Edge length of the difference hash; 8 yields the usual 64-bit hash. A bigger
+# hash is tempting but measurably worse here: slides are mostly flat, and the
+# extra bits sample flat area where adjacent pixels tie, so they are noise.
+HASH_SIZE: int = 8
+# Hamming distance below which two frames count as the same picture. Deliberately
+# tight: re-encodes of one static slide land at 0–3 bits, while distinct slides
+# from the same template sit around 7. The costs are asymmetric — a false merge
+# silently loses a slide forever, a false keep only spends a fraction of a cent.
+# The known limit is that a slide differing only in a word or a number is ~1 bit
+# away, i.e. inside the noise floor, so it will be treated as a duplicate.
+FRAME_DUPLICATE_DISTANCE: int = 2
+# JPEG quality for extracted frames (ffmpeg -qscale:v, 2 = best, 31 = worst).
+FRAME_QUALITY: int = 4
+# Image fidelity sent to the vision model. "low" downsamples server-side to
+# 512x512 for a flat, predictable token cost — enough to read slide headings.
+FRAME_DETAIL_LEVELS: list[str] = ["low", "high"]
+DEFAULT_FRAME_DETAIL: str = "low"
+# Approximate tokens charged per frame, used only for the pre-run cost estimate.
+VISION_TOKENS_PER_FRAME: dict[str, int] = {"low": 630, "high": 2300}
+# Indicative input price in USD per million tokens, for that estimate only.
+# Checked 2026-07-20 — re-check against OpenAI's pricing page if it looks wrong.
+VISION_PRICE_PER_MTOK: dict[str, float] = {
+    "gpt-5.4-nano": 0.20,
+    "gpt-5.4-mini": 0.75,
+}
+
 # Transcription providers (engine choice shown in the UI).
 PROVIDER_OPENAI: str = "OpenAI API"
 PROVIDER_LOCAL: str = "Local (offline)"

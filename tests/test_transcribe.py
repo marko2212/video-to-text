@@ -72,6 +72,73 @@ def test_build_transcript_skips_empty_segments():
     assert transcribe.build_transcript(entries) == "(0:01) Real text."
 
 
+def test_build_transcript_interleaves_visual_notes_by_time():
+    entries = [
+        {"start": 0.0, "end": 2.0, "text": "Here are the results."},
+        {"start": 10.0, "end": 12.0, "text": "You can see the growth."},
+    ]
+    notes = [{"time": 5.0, "description": "Slide: Q3 Revenue"}]
+    out = transcribe.build_transcript(entries, visual_notes=notes)
+
+    assert out.split("\n\n") == [
+        "(0:00) Here are the results.",
+        "🖥️ (0:05) Slide: Q3 Revenue",
+        "(0:10) You can see the growth.",
+    ]
+
+
+def test_build_transcript_orders_unsorted_notes():
+    entries = [{"start": 30.0, "end": 32.0, "text": "Wrapping up."}]
+    notes = [
+        {"time": 20.0, "description": "Second slide"},
+        {"time": 10.0, "description": "First slide"},
+    ]
+    out = transcribe.build_transcript(entries, visual_notes=notes)
+
+    assert out.split("\n\n") == [
+        "🖥️ (0:10) First slide",
+        "🖥️ (0:20) Second slide",
+        "(0:30) Wrapping up.",
+    ]
+
+
+def test_build_transcript_note_precedes_speech_sharing_its_time():
+    entries = [{"start": 5.0, "end": 7.0, "text": "Look at this."}]
+    notes = [{"time": 5.0, "description": "Slide shown"}]
+    out = transcribe.build_transcript(entries, visual_notes=notes)
+
+    assert out == "🖥️ (0:05) Slide shown\n\n(0:05) Look at this."
+
+
+def test_build_transcript_note_splits_the_paragraph_it_lands_in():
+    entries = [
+        {"start": 12.0, "end": 14.0, "text": "Moving on to next year."},
+        {"start": 16.0, "end": 18.0, "text": "And who owns each workstream."},
+    ]
+    notes = [{"time": 15.0, "description": "Next Steps slide"}]
+    out = transcribe.build_transcript(entries, visual_notes=notes)
+
+    assert out.split("\n\n") == [
+        "(0:12) Moving on to next year.",
+        "🖥️ (0:15) Next Steps slide",
+        "(0:16) And who owns each workstream.",
+    ]
+
+
+def test_build_transcript_keeps_notes_after_the_last_segment():
+    entries = [{"start": 0.0, "end": 1.0, "text": "Start."}]
+    notes = [{"time": 90.0, "description": "Closing slide"}]
+    out = transcribe.build_transcript(entries, visual_notes=notes)
+
+    assert out.endswith("🖥️ (1:30) Closing slide")
+
+
+def test_build_transcript_without_notes_is_unchanged():
+    entries = [{"start": 0.0, "end": 2.0, "text": "Only speech."}]
+    out = transcribe.build_transcript(entries, visual_notes=[])
+    assert out == "(0:00) Only speech."
+
+
 def test_split_into_paragraphs_groups_sentences():
     text = "One. Two. Three. Four. Five. Six."
     out = transcribe.split_into_paragraphs(text, sentences_per_paragraph=2)

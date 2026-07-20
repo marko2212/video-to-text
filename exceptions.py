@@ -16,3 +16,7 @@ class AudioProcessingError(AppError):
 
 class TranscriptionError(AppError):
     """Raised when the transcription pipeline or the OpenAI request fails."""
+
+
+class VisualContextError(AppError):
+    """Raised when extracting or describing video key frames fails."""

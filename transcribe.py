@@ -46,6 +46,10 @@ _PARAGRAPH_GAP_SECONDS = 2.0
 _PARAGRAPH_MAX_CHARS = 350
 _SENTENCES_PER_PARAGRAPH = 4
 
+# Prefix marking a line that describes what was on screen rather than spoken.
+_VISUAL_NOTE_MARKER = "🖥️"
+_VISUAL_SECTION_HEADING = "On-screen context"
+
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -97,25 +101,44 @@ def _format_clock(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
+def format_visual_note(note: dict[str, Any]) -> str:
+    """Render one on-screen observation as a transcript line.
+
+    Args:
+        note: Dict with ``time`` (seconds) and ``description``.
+
+    Returns:
+        The note prefixed with a screen marker and its ``(M:SS)`` stamp.
+    """
+    description = str(note["description"]).strip()
+    return f"{_VISUAL_NOTE_MARKER} ({_format_clock(note['time'])}) {description}"
+
+
 def build_transcript(
     entries: list[dict[str, Any]],
     paragraph_gap: float = _PARAGRAPH_GAP_SECONDS,
     paragraph_chars: int = _PARAGRAPH_MAX_CHARS,
+    visual_notes: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render timed segments as a readable, timestamped transcript.
 
     Each segment is prefixed with its ``(M:SS)`` start time, and segments are
     grouped into paragraphs: a new paragraph begins after a pause longer than
     ``paragraph_gap`` or once the paragraph grows past ``paragraph_chars``.
+    On-screen observations, when supplied, are interleaved by timestamp so a
+    slide is described right after the speech it accompanies.
 
     Args:
         entries: Segments with ``start``/``end`` (seconds) and ``text``.
         paragraph_gap: Pause (seconds) that forces a paragraph break.
         paragraph_chars: Soft maximum characters per paragraph.
+        visual_notes: Optional on-screen notes with ``time`` and ``description``.
 
     Returns:
         The transcript as blank-line separated paragraphs.
     """
+    notes = sorted(visual_notes or [], key=lambda note: note["time"])
+    note_index = 0
     paragraphs: list[str] = []
     current: list[str] = []
     current_chars = 0
@@ -125,6 +148,17 @@ def build_transcript(
         text = str(entry["text"]).strip()
         if not text:
             continue
+
+        # Anything that appeared on screen before this line was spoken belongs
+        # above it. The paragraph is closed first so the note stands alone —
+        # otherwise a note landing mid-paragraph would be pushed past all of it.
+        while note_index < len(notes) and notes[note_index]["time"] <= entry["start"]:
+            if current:
+                paragraphs.append(" ".join(current))
+                current, current_chars = [], 0
+            paragraphs.append(format_visual_note(notes[note_index]))
+            note_index += 1
+
         gap = entry["start"] - previous_end if previous_end is not None else 0.0
         if current and (gap > paragraph_gap or current_chars >= paragraph_chars):
             paragraphs.append(" ".join(current))
@@ -135,6 +169,8 @@ def build_transcript(
 
     if current:
         paragraphs.append(" ".join(current))
+    paragraphs += [format_visual_note(note) for note in notes[note_index:]]
+
     return "\n\n".join(paragraphs)
 
 
@@ -323,6 +359,7 @@ def _write_outputs(
     texts: list[str],
     timed_entries: list[dict[str, Any]],
     srt_output_file: str | Path | None,
+    visual_notes: list[dict[str, Any]] | None = None,
 ) -> None:
     """Write the rendered transcript and, when requested, the SRT file.
 
@@ -334,11 +371,17 @@ def _write_outputs(
         texts: Raw per-chunk transcript texts (fallback source).
         timed_entries: Timed segments, if the engine returned any.
         srt_output_file: Destination ``.srt`` path, or None to skip subtitles.
+        visual_notes: Optional on-screen notes with ``time`` and ``description``.
     """
     if timed_entries:
-        document = build_transcript(timed_entries)
+        document = build_transcript(timed_entries, visual_notes=visual_notes)
     else:
         document = split_into_paragraphs(" ".join(text.strip() for text in texts))
+        if visual_notes:
+            # Without timed speech there is nothing to interleave against, so
+            # the observations are listed as their own section instead.
+            lines = [format_visual_note(note) for note in visual_notes]
+            document += f"\n\n{_VISUAL_SECTION_HEADING}\n\n" + "\n\n".join(lines)
     output_file.write_text(document + "\n", encoding="utf-8")
 
     if srt_output_file and timed_entries:
@@ -414,6 +457,7 @@ def transcribe_openai(
     srt_output_file: str | Path | None = None,
     segment_duration_minutes: int = 10,
     progress_callback: ProgressCallback | None = None,
+    visual_notes: list[dict[str, Any]] | None = None,
 ) -> None:
     """Transcribe an audio/video file with the OpenAI API (segmented upload).
 
@@ -426,6 +470,7 @@ def transcribe_openai(
         srt_output_file: Destination ``.srt`` path; written only with timestamps.
         segment_duration_minutes: Length of each audio chunk in minutes.
         progress_callback: Optional callback receiving status payloads.
+        visual_notes: Optional on-screen notes to interleave into the transcript.
 
     Raises:
         TranscriptionError: If transcription fails at any stage.
@@ -480,6 +525,7 @@ def transcribe_openai(
             texts,
             timed_entries,
             srt_output_file if with_timestamps else None,
+            visual_notes=visual_notes,
         )
 
         _report(
@@ -506,6 +552,7 @@ def transcribe_local(
     with_timestamps: bool = False,
     srt_output_file: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
+    visual_notes: list[dict[str, Any]] | None = None,
 ) -> None:
     """Transcribe an audio/video file with a local faster-whisper model.
 
@@ -520,6 +567,7 @@ def transcribe_local(
         with_timestamps: Whether to also write an SRT subtitle file.
         srt_output_file: Destination ``.srt`` path; written only with timestamps.
         progress_callback: Optional callback receiving status payloads.
+        visual_notes: Optional on-screen notes to interleave into the transcript.
 
     Raises:
         TranscriptionError: If transcription fails.
@@ -562,6 +610,7 @@ def transcribe_local(
             texts,
             timed_entries,
             srt_output_file if with_timestamps else None,
+            visual_notes=visual_notes,
         )
 
         _report(

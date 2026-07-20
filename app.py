@@ -6,6 +6,7 @@ history persistence in :mod:`db`.
 """
 
 import importlib.util
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +14,19 @@ import streamlit as st
 
 import audio
 import db
+import frames
 import transcribe
+import vision
 from config import (
     AUDIO_FORMATS,
+    DEFAULT_FRAME_DETAIL,
     DEFAULT_LOCAL_MODEL,
+    FRAME_DETAIL_LEVELS,
+    FRAME_INTERVAL_MAX_SECONDS,
+    FRAME_INTERVAL_MIN_SECONDS,
+    FRAME_INTERVAL_STEP_SECONDS,
+    FRAME_MAX_COUNT,
+    FRAME_MAX_INTERVAL_SECONDS,
     LOCAL_MODEL_SIZES_MB,
     LOCAL_MODELS,
     PROVIDER_LOCAL,
@@ -25,6 +35,7 @@ from config import (
     TIMESTAMP_MODELS,
     TRANSCRIPTION_MODELS,
     VIDEO_FORMATS,
+    VISION_MODELS,
     get_settings,
 )
 from exceptions import AppError
@@ -176,7 +187,13 @@ def clean_temp_files() -> None:
             for path in directory.iterdir():
                 if path.is_file():
                     path.unlink()
-        for key in ("audio_path", "transcript_path", "srt_path", "original_filename"):
+        for key in (
+            "audio_path",
+            "video_path",
+            "transcript_path",
+            "srt_path",
+            "original_filename",
+        ):
             st.session_state[key] = None
         if "progress_container" in st.session_state:
             st.session_state.progress_container.empty()
@@ -205,6 +222,8 @@ def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
         else:
             with st.spinner("Extracting audio from video..."):
                 source = audio.save_uploaded_file(uploaded_file)
+                # Kept so on-screen context can go back to the video for frames.
+                st.session_state.video_path = source
                 wav_name = f"{Path(uploaded_file.name).stem}.wav"
                 st.session_state.audio_path = audio.to_wav(
                     source, get_settings().temp_dir / wav_name
@@ -213,8 +232,125 @@ def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
         st.error(f"Error preparing audio: {exc}")
 
 
+def render_visual_options(source_type: str) -> dict[str, Any] | None:
+    """Offer on-screen context for video uploads.
+
+    Args:
+        source_type: Either ``"audio"`` or ``"video"``.
+
+    Returns:
+        The chosen settings (``model``, ``detail``, ``interval``), or ``None``
+        when the feature is switched off or unavailable.
+    """
+    if source_type != "video":
+        return None
+
+    enabled = st.checkbox(
+        "🖥️ Describe what's on screen (slides, diagrams, code)",
+        value=False,
+        help=(
+            "Extracts the frames where the picture changed and has a vision "
+            "model describe them, merged into the transcript by timestamp. "
+            "Needs an OpenAI API key even when transcribing locally."
+        ),
+    )
+    if not enabled:
+        return None
+    if not resolve_openai_key():
+        st.warning(
+            "On-screen context needs an OpenAI API key — add one in the sidebar."
+        )
+        return None
+
+    vision_model = st.selectbox(
+        "Vision model",
+        options=VISION_MODELS,
+        index=0,
+        help="The cheaper model is usually enough to read slide headings.",
+    )
+    detail = st.radio(
+        "Image detail",
+        options=FRAME_DETAIL_LEVELS,
+        index=FRAME_DETAIL_LEVELS.index(DEFAULT_FRAME_DETAIL),
+        horizontal=True,
+        help="Use **high** only when you need to read small text off a slide.",
+    )
+    interval = st.slider(
+        "Screenshot at least every (seconds)",
+        min_value=FRAME_INTERVAL_MIN_SECONDS,
+        max_value=FRAME_INTERVAL_MAX_SECONDS,
+        value=int(FRAME_MAX_INTERVAL_SECONDS),
+        step=FRAME_INTERVAL_STEP_SECONDS,
+        help=(
+            "How often to grab a frame even when the picture has not changed. "
+            "Scene changes are always captured on top of this, and short videos "
+            "get extra samples so they are not covered by a single frame. "
+            "Near-identical frames are discarded before anything is sent."
+        ),
+    )
+
+    cost = vision.estimate_frame_cost(FRAME_MAX_COUNT, vision_model, detail)
+    if cost is None:
+        price_hint = ""
+    elif cost < 0.01:
+        price_hint = " — well under a cent"
+    else:
+        price_hint = f" — up to about ${cost:.2f}"
+    st.caption(
+        f"At most {FRAME_MAX_COUNT} frames per video{price_hint}. "
+        "Recordings where little changes on screen use far fewer."
+    )
+    return {"model": vision_model, "detail": detail, "interval": float(interval)}
+
+
+def collect_visual_notes(visual: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract key frames from the uploaded video and describe what they show.
+
+    Failures here are reported but never fatal: a transcript without on-screen
+    context is still worth having, so the run continues without notes.
+
+    Args:
+        visual: Settings from :func:`render_visual_options` (``model``,
+            ``detail``, ``interval``).
+
+    Returns:
+        Notes with ``time`` and ``description``, or an empty list.
+    """
+    video_path: Path | None = st.session_state.video_path
+    api_key = resolve_openai_key()
+    if not video_path or not api_key:
+        return []
+
+    frame_dir = get_settings().temp_dir / "frames"
+    try:
+        with st.spinner("Looking for scene changes in the video…"):
+            keyframes = frames.extract_keyframes(
+                video_path, frame_dir, max_interval=visual["interval"]
+            )
+        if not keyframes:
+            st.info("No on-screen changes were detected — nothing to describe.")
+            return []
+        with st.spinner(f"Describing {len(keyframes)} key frames…"):
+            return vision.describe_keyframes(
+                keyframes,
+                api_key,
+                model=visual["model"],
+                detail=visual["detail"],
+                progress_callback=update_progress,
+            )
+    except AppError as exc:
+        st.warning(f"On-screen context skipped: {exc}")
+        return []
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+
+
 def run_transcription(
-    provider: str, model: str, with_timestamps: bool, source_type: str
+    provider: str,
+    model: str,
+    with_timestamps: bool,
+    source_type: str,
+    visual: dict[str, Any] | None = None,
 ) -> None:
     """Run the selected provider's pipeline and store result paths.
 
@@ -223,12 +359,16 @@ def run_transcription(
         model: Selected model (API model name, or local model size).
         with_timestamps: Whether to generate timestamps/subtitles.
         source_type: Either ``"audio"`` or ``"video"``.
+        visual: On-screen context settings, or None to skip that step.
     """
     settings = get_settings()
     base_name = Path(st.session_state.original_filename).stem
     transcript_path = settings.temp_dir / f"transcript_{base_name}.txt"
     srt_path = settings.temp_dir / f"transcript_{base_name}.srt"
     srt_arg = srt_path if with_timestamps else None
+    # Gathered before transcription so the notes are ready for the single writer
+    # that renders the transcript at the end of either pipeline.
+    visual_notes = collect_visual_notes(visual) if visual else None
 
     try:
         if provider == PROVIDER_LOCAL:
@@ -252,6 +392,7 @@ def run_transcription(
                     with_timestamps=with_timestamps,
                     srt_output_file=srt_arg,
                     progress_callback=update_progress,
+                    visual_notes=visual_notes,
                 )
         else:
             api_key = resolve_openai_key()
@@ -271,6 +412,7 @@ def run_transcription(
                     with_timestamps=with_timestamps,
                     srt_output_file=srt_arg,
                     progress_callback=update_progress,
+                    visual_notes=visual_notes,
                 )
 
         st.session_state.transcript_path = transcript_path
@@ -357,7 +499,7 @@ def render_transcribe_tab() -> None:
         if uploaded_file:
             # Reset previous results when a different file is uploaded.
             if st.session_state.original_filename != uploaded_file.name:
-                for key in ("audio_path", "transcript_path", "srt_path"):
+                for key in ("audio_path", "video_path", "transcript_path", "srt_path"):
                     st.session_state[key] = None
             st.session_state.original_filename = uploaded_file.name
 
@@ -384,11 +526,6 @@ def render_transcribe_tab() -> None:
 
                 providers = PROVIDERS if LOCAL_AVAILABLE else [PROVIDER_OPENAI]
                 provider = st.radio("Engine", providers, horizontal=True)
-                if not LOCAL_AVAILABLE:
-                    st.caption(
-                        "ℹ️ Install offline Whisper with `uv sync --extra local` "
-                        "to transcribe locally without an API key."
-                    )
 
                 if provider == PROVIDER_LOCAL:
                     model = st.selectbox(
@@ -424,8 +561,12 @@ def render_transcribe_tab() -> None:
                             "whisper-1 model."
                         )
 
+                visual = render_visual_options(source_type)
+
                 if st.button("Start Transcription"):
-                    run_transcription(provider, model, with_timestamps, source_type)
+                    run_transcription(
+                        provider, model, with_timestamps, source_type, visual=visual
+                    )
 
         st.divider()
         if st.button("🧹 Clean temporary files"):
