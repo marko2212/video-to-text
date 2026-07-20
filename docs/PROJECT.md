@@ -38,6 +38,8 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `app.py` | **UI only** — render functions, tabs, sidebar. No ffmpeg/IO logic inline. |
 | `config.py` | **Pydantic Settings + every constant** (single source of truth): formats, models, paths, limits |
 | `audio.py` | ffmpeg helpers: `save_uploaded_file`, `to_wav` (mono 16 kHz) — UI-agnostic |
+| `frames.py` | ffmpeg key-frame selection + perceptual dedup for on-screen context |
+| `vision.py` | Describes those frames with a vision model; cost estimates for the UI |
 | `transcribe.py` | Pipeline: `transcribe_openai` (chunked) and `transcribe_local`; transcript rendering |
 | `db.py` | SQLite history (`data/transcriptions.db`) |
 | `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError`) |
@@ -49,9 +51,11 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 ```
 upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
        → audio player
-       → pick engine + model
+       → pick engine + model  [+ optional on-screen context, video only]
+       → (on-screen context: ffmpeg selects key frames → dedup → vision model)
        → OpenAI (split into 10-min chunks, 25 MB limit)  OR  local (whole file at once)
-       → rendering: (M:SS) + paragraphs → .txt   (+ .srt if requested)
+       → rendering: (M:SS) + paragraphs, on-screen notes interleaved → .txt
+                                                          (+ .srt if requested)
        → write to SQLite history
 ```
 
@@ -84,6 +88,56 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
   markers plus paragraph breaks (on a pause > 2 s, or once a paragraph exceeds 350
   characters). With no segments available, sentences are grouped instead. *Reason: the
   output used to be one unreadable wall of text.*
+
+### On-screen context (video)
+- **Coverage is guaranteed by time sampling, not by scene detection.** ffmpeg's
+  `scene` score is tuned for natural footage: a measured full-screen slide change
+  from navy to dark red scored only **0.077**, far below the 0.3 usually quoted.
+  So scene detection runs at a permissive 0.1 as a *candidate generator*, and a
+  frame is taken at least every 30 s regardless. Relying on the threshold alone
+  silently drops slides.
+- **One ffmpeg pass does both**, via `select='eq(n,0)+gt(scene,T)+gte(t-prev_selected_t,I)'`.
+  `eq(n,0)` is required — the first frame's scene score is undefined, so it is
+  otherwise never emitted — and `+` acts as OR because any non-zero value is true.
+  One pass keeps every timestamp on the same timeline and avoids one ffmpeg
+  invocation per sampled second.
+- **`-fps_mode vfr` is mandatory.** Without it the image2 muxer pads back to a
+  constant frame rate: one measurement turned 4 selected frames into 79 files,
+  which misaligns images against timestamps *silently*. The flag is probed for at
+  runtime because it replaced `-vsync` only in ffmpeg 5.1, and git builds report
+  no parseable version number.
+- **Timestamps come from `showinfo`, matched positionally to the written files.**
+  The parser is anchored on `Parsed_showinfo` because ffmpeg logs other lines
+  containing `pts_time`, and matching one shifts every frame. A count mismatch
+  raises rather than mislabels the video.
+- **The sampling interval is a UI slider** (5–300 s, default 30). It is an *upper*
+  bound — scene changes are captured on top of it — so the label reads "at least
+  every".
+- **Short videos get tightened, but only just.** A clip shorter than the chosen
+  interval would be represented by a single frame, so the interval drops to
+  `duration / 2`. An earlier version aimed for ~8 samples, which silently
+  overrode the slider on anything short; the guarantee is now the minimum that
+  fixes the bug and otherwise leaves the chosen cadence alone.
+- **Deduplication uses a 64-bit dHash, threshold 2.** Bigger hashes measured
+  *worse*: slides are mostly flat, so extra bits sample areas where adjacent
+  pixels tie and become coin-flips. The threshold is deliberately tight because
+  the costs are asymmetric — a false merge loses a slide forever, a false keep
+  wastes a fraction of a cent. Each frame is compared to the **last kept** frame,
+  not its predecessor, so a slow fade cannot ratchet past the threshold.
+  **Known limit:** a slide differing only in a word or number is ~1 bit away —
+  inside the noise floor — so it is treated as a duplicate and dropped.
+- **A hard cap of 40 frames** keeps the cost bounded; over the cap, frames are
+  sampled evenly across the timeline rather than truncated.
+- **Chat Completions, not the Responses API** — the repo pins `openai==1.75.0`,
+  whose `Responses` type does not accept the newer reasoning/detail values. In
+  Chat Completions, `detail` goes *inside* `image_url`.
+- **One request per frame.** Batching saves only the shared prompt (image tokens
+  dominate and are billed per image regardless) while risking the model
+  conflating frames and losing everything on a single failure.
+- **Uninformative frames are dropped by the model itself** — it replies `NONE` for
+  a face or a blank desktop, so a talking-head recording adds nothing.
+- **Failure is never fatal**: if extraction or description fails, the run warns
+  and continues, because a transcript without on-screen notes is still worth having.
 
 ### Offline engine
 - **`faster-whisper`** (not `openai-whisper`, not `whisper.cpp`) — the best fit for Python
@@ -161,6 +215,9 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 - **Two engines**: OpenAI API (`gpt-4o-transcribe` / `whisper-1`) and **Local offline** (faster-whisper, selectable model size)
 - **Timestamps + `.srt`** export (whisper-1 and every local model)
 - **Readable transcript**: inline `(M:SS)` + paragraphs *(2026-07-20)*
+- **On-screen context** for video: key frames described by a vision model and
+  interleaved into the transcript by timestamp, with a selectable screenshot
+  interval and a pre-run cost ceiling *(2026-07-20)*
 - **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
 - **Hybrid API key** (`.env` or sidebar); offline works with no key
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
@@ -168,7 +225,7 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 14 tests** (DB CRUD + PRAGMAs, SRT and formatting helpers) — no network, no ffmpeg
+- **pytest: 46 tests** (DB CRUD + PRAGMAs, SRT/formatting helpers, frame selection and dedup, cost estimates, headless Streamlit UI checks) — no network, no ffmpeg
 - **CI** (GitHub Actions): ruff + format check + pytest on push/PR
 - **Makefile**: `run` / `sync` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Docker**: `Dockerfile` + `docker-compose.yml` + `.dockerignore` (ffmpeg bundled, offline backend opt-in via `INSTALL_LOCAL=true`)
@@ -180,11 +237,12 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 
 ## 5. Next steps
 
-- [ ] **Visual context from video** *(designed, not implemented)* — capture frames on scene
-      changes (`ffmpeg select='gt(scene,0.3)'` plus the **mandatory `-fps_mode vfr`**),
-      dedupe with pHash, apply min/max interval and a hard cap, then run a vision model or
-      local OCR; merge with the transcript by timestamp. *Roughly 90% fewer tokens than
-      sampling a frame every 10 s.*
+- [ ] **Local OCR as a cheaper visual layer** — Tesseract could read slide text for zero
+      tokens, leaving the vision model only for "describe what is happening". Deferred
+      because it adds a second system binary alongside ffmpeg. It would also fix the
+      known dedup limit (slides differing only in text), since OCR compares words.
+- [ ] **Downscale frames before upload** — at `detail: "low"` the server resizes to
+      512×512 anyway, so sending 1080p JPEGs wastes upload bandwidth for no benefit.
 - [ ] **Hosting** *(researched)* — Hugging Face Spaces (Docker, 16 GB RAM, easy) or an
       Oracle Always Free VM (4 ARM cores / 24 GB, more powerful but more DevOps).
       **Condition:** users must supply **their own** OpenAI key, otherwise the owner pays
@@ -198,6 +256,50 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 ---
 
 ## 6. Journal
+
+### 2026-07-20 (part 2) — On-screen context from video
+
+**Goal:** a meeting recording's slides and shared screens should reach the transcript,
+not just the speech — without paying to look at 360 near-identical frames.
+
+**Built:** `frames.py` (ffmpeg key-frame selection + dHash dedup) and `vision.py`
+(captioning + cost estimates), interleaved into the transcript by `build_transcript`.
+UI: a video-only checkbox with a model/detail choice and a pre-run cost ceiling.
+
+**Four assumptions that measurement overturned** — each would have shipped a silent bug:
+
+1. **"Scene threshold 0.3 catches slide changes."** It does not. A measured
+   full-screen navy→dark-red change scored **0.077**. Fix: treat scene detection as a
+   candidate generator at 0.1 and guarantee coverage with time sampling instead.
+2. **"A 30 s sampling floor is enough."** On a 25 s test clip it never fired, so a
+   whole slide went missing. Fix: the interval tightens to spread ~8 samples over
+   short videos.
+3. **"A bigger 256-bit hash separates slides better."** My own measurement said yes —
+   but it compared two *identically rendered PNGs*, with no JPEG noise. On a realistic
+   corpus the bigger hash is **worse**: slides are mostly flat, so extra bits sample
+   ties and become coin-flips. Fix: 64-bit dHash, threshold 2 (was 16-bit/10).
+4. **"Newer models need the Responses API."** They accept Chat Completions, which is
+   what the pinned `openai==1.75.0` actually supports — the newer API rejects its
+   reasoning/detail values on that version.
+
+**Also fixed before it bit:** the `pts_time` parser was matching an unrelated ffmpeg
+log line, which would have shifted every frame's timestamp. Now anchored on
+`Parsed_showinfo`, with a regression test.
+
+**Verified end-to-end**, not just by unit test: a generated four-slide video produced
+5 candidates → dedup → exactly the 3 distinct slides, and a real vision call read them
+back correctly (`The slide displays "Q3 Revenue" and "4.2M (+18% YoY)"`). Confirmed
+`gpt-5.4-nano`/`gpt-5.4-mini` are reachable before defaulting to them.
+
+**Tests: 48** (was 18), including headless Streamlit `AppTest` checks of the new
+controls — the browser cannot drive a native file picker, so the upload-gated UI is
+covered there instead. Estimated ceiling for the default settings: 40 frames ≈ 25K
+image tokens ≈ half a cent.
+
+**Follow-ups the same day:** removed the "install offline Whisper" hint from the UI
+(it belongs in the README, not in front of users), and exposed the screenshot
+interval as a slider — which surfaced that the short-video tightening was
+overriding any value the user picked.
 
 ### 2026-07-20 — Readable transcript + documentation
 

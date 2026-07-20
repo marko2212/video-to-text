@@ -16,6 +16,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 * **Two engines:** the **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or a **local, offline Whisper** model (`faster-whisper`) that runs on your machine — free, private, no API key.
 * **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`); it downloads on first use.
 * **Readable transcripts** — inline `(M:SS)` time markers and automatic paragraph breaks instead of one wall of text.
+* **On-screen context (video):** optionally pull the frames where the picture changed, have a vision model describe them, and merge those notes into the transcript by timestamp — so slides, diagrams and shared screens are captured, not just speech.
 * **Optional timestamps & subtitle export** (`.srt`) — with `whisper-1` and with any local model.
 * **Flexible API key:** read from `.env` if present, otherwise entered in the sidebar (kept only for the session).
 * Handles large audio files by splitting them into smaller segments for transcription.
@@ -42,7 +43,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 
 * **Python:** Version 3.12 or higher. (`uv` will fetch a matching interpreter automatically if you don't have one.)
 * **uv:** Used to manage the virtual environment and dependencies. Install from [the uv docs](https://docs.astral.sh/uv/getting-started/installation/).
-* **ffmpeg:** This external tool **must be installed and accessible** for the application to work. See installation instructions below.
+* **ffmpeg:** This external tool **must be installed and accessible** for the application to work. See installation instructions below. (**5.1 or newer** is recommended — older builds still work, but the on-screen context feature falls back to a deprecated flag.)
 * **OpenAI API Key (optional):** only needed for the OpenAI engine. The local offline engine needs no key. You might incur costs depending on your OpenAI usage.
 * **Python Packages:** Declared in `pyproject.toml` and locked in `uv.lock` — installed via `uv sync` (add `--extra local` for the offline backend).
 
@@ -162,12 +163,28 @@ Docker is **optional** — it sits alongside the local `uv` / `make run` workflo
 Work in the **Transcribe** tab:
 
 1. **Upload File:** Use the file uploader to select a video file (MKV, MP4, etc.) or an audio file (MP3, WAV, etc.). The audio is prepared automatically — a video's audio track is extracted on upload, and audio files are used directly. An audio player appears so you can listen first. (For video, you can also download the extracted `.wav`.)
-2. **Pick the engine & options:** Choose the **engine** — **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or **Local (offline)** (pick a model size that downloads on first use). Tick **"Include timestamps & generate subtitles (.srt)"** where available (`whisper-1` and any local model). For the OpenAI engine, set your key in `.env` or in the sidebar.
+2. **Pick the engine & options:** Choose the **engine** — **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or **Local (offline)** (pick a model size that downloads on first use). Tick **"Include timestamps & generate subtitles (.srt)"** where available (`whisper-1` and any local model). For video, you can also tick **"Describe what's on screen"** (see [On-screen context](#on-screen-context-video-) below). For the OpenAI engine, set your key in `.env` or in the sidebar.
 3. **Start Transcription:** Click "Start Transcription". Progress is shown while segments are processed (this may take several minutes for long audio).
 4. **View & Download:** The transcript preview appears on the right with a "Download Transcript" button (and "Download Subtitles (.srt)" when timestamps were enabled).
 5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`. Your transcription **history is kept** (see below).
 
 In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts.
+
+## On-screen context (video) 🖥️
+
+Audio-only transcription misses whatever was *shown* rather than said. Tick **"Describe what's on screen"** when transcribing a video and the app extracts the frames where the picture actually changed, has a vision model describe them, and merges those notes into the transcript by timestamp:
+
+```
+🖥️ (0:05) A slide shows the title "Roadmap 2026" with the heading "Phase 1: migration".
+
+(0:12) Moving on to what we have planned for next year.
+```
+
+This needs an **OpenAI API key** even when you transcribe with the local offline engine. Cost is bounded before you start: at most **40 frames per video** (about half a cent on the default model at `low` detail), and recordings where little changes on screen use far fewer. Pick **`high`** detail only when you need to read small text off a slide.
+
+**"Screenshot at least every N seconds"** sets how often a frame is grabbed even when the picture has not changed — 5 to 300 seconds, 30 by default. Scene changes are always captured *in addition* to this, so a lower value mainly helps with slow fades and gradual changes that never look like a cut. Very short clips get a couple of extra samples so they are not represented by a single frame.
+
+Frames that show nothing useful — a face, a blank desktop — are dropped automatically, and near-identical frames are deduplicated. Note that two slides differing only in a word or a number may be treated as duplicates, since the deduplication compares layout rather than text.
 
 ## Offline mode (no API key) 🔒
 
