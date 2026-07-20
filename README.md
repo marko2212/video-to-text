@@ -15,6 +15,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 * **Built-in audio player** to listen to the uploaded/extracted audio before transcribing.
 * **Two engines:** the **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or a **local, offline Whisper** model (`faster-whisper`) that runs on your machine — free, private, no API key.
 * **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`); it downloads on first use.
+* **Readable transcripts** — inline `(M:SS)` time markers and automatic paragraph breaks instead of one wall of text.
 * **Optional timestamps & subtitle export** (`.srt`) — with `whisper-1` and with any local model.
 * **Flexible API key:** read from `.env` if present, otherwise entered in the sidebar (kept only for the session).
 * Handles large audio files by splitting them into smaller segments for transcription.
@@ -199,6 +200,8 @@ Common tasks are available as Makefile targets (run `make` for the full list):
 * `make lint` / `make format` — ruff
 
 Continuous integration (`.github/workflows/ci.yml`) runs these checks on every push and pull request.
+
+Project documentation — architecture, the reasoning behind each design decision, and a dated changelog — lives in [`docs/PROJECT.md`](docs/PROJECT.md).
 
 ## Author 👨‍💻
 

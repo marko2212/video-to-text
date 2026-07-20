@@ -1,70 +1,49 @@
-# CLAUDE.md
+# CLAUDE.md — rules for working in this repo
 
-Guidance for Claude Code when working in this repository.
+Living docs: [docs/PROJECT.md](docs/PROJECT.md) (goal, architecture, **decisions with
+reasons**, done / next, journal) · public docs: [README.md](README.md) ·
+screenshots: [docs/screenshots/](docs/screenshots/).
 
-## Project
+**Read `docs/PROJECT.md` §3 before changing behaviour** — most "why is it like this?"
+questions are already answered there (and several choices are workarounds for real bugs).
 
-Streamlit app that transcribes speech to text via either the OpenAI audio API
-or a local, offline Whisper model (`faster-whisper`). It accepts video files
-(audio is extracted with ffmpeg) and audio files (fed straight to
-transcription). Long API inputs are split into segments; the local backend
-transcribes the whole file at once.
+## Documentation rule
 
-Module layout (UI thin, logic separated):
+After any significant work, update **docs/PROJECT.md** in the same pass
+(Done / Next / Decisions / Journal — entry `### YYYY-MM-DD — title`, newest on top).
+User-facing changes (formats, flags, `.env` keys, commands) must also land in README.
 
-- `app.py` — Streamlit UI only (render functions; no ffmpeg/IO inline)
-- `config.py` — Pydantic Settings + shared constants (single source of truth)
-- `audio.py` — ffmpeg helpers: save uploads, convert to mono-16k WAV
-- `transcribe.py` — UI-agnostic pipeline: `transcribe_openai` and `transcribe_local`
-- `db.py` — SQLite history (`data/transcriptions.db`)
-- `exceptions.py` — domain exceptions (`AppError` and subclasses)
-- `logger.py` — `get_logger()` (stdlib logging)
-- Dependencies managed with `uv` (see `pyproject.toml` / `uv.lock`).
-  The offline backend is an optional extra: `uv sync --extra local`.
+## Invariants
+
+- **Never commit unprompted** — the owner says when to commit.
+- **Never add a `Co-authored-by` trailer** (it was scrubbed from the whole history).
+- **Never print or echo the API key**, not even in tests — `config` calls
+  `load_dotenv(override=True)`, so a "cleared" env var comes back with the real value.
+- **Constants live in `config.py` only** — no format lists, model names, or limits
+  duplicated in `app.py` / `transcribe.py`.
+- **`app.py` is UI only** — no ffmpeg, IO, or API calls inline; that belongs in
+  `audio.py` / `transcribe.py` (which must stay Streamlit-free).
+- **Never widen `.gitignore` to `*.db`** — only `data/transcriptions.db` (+ `-*`).
+- Local backend stays **`device="cpu"`** by default; CUDA is opt-in via `LOCAL_DEVICE`.
 
 ## Code conventions
 
-- **Functional-first.** Pure functions for logic; classes only where natural
-  (Pydantic Settings/models, stateful service clients).
-- **Modern type hints** everywhere (PEP 585/604: `list[str]`, `str | None`).
-  Target Python **3.12+**.
-- **Google-style docstrings** on modules and public functions (`Args`/`Returns`/
-  `Raises`). Keep trivial private helpers' docstrings short.
-- **No `print()`** — use `logger.get_logger(__name__)`.
-- **Domain exceptions** from `exceptions.py`, not bare `Exception`.
-- **Config/secrets** via `config.get_settings()` (Pydantic Settings + `.env`),
-  never `os.getenv` scattered around.
-- Code must pass `ruff check` and `ruff format` (config in `pyproject.toml`).
-- Prefer `pathlib` over `os.path`.
+- **Functional-first.** Classes only where natural (Pydantic Settings, service clients).
+- **Modern type hints** (PEP 585/604) everywhere; target Python **3.12+**.
+- **Google-style docstrings** on modules and public functions.
+- **No `print()`** — `logger.get_logger(__name__)`. **No bare `Exception`** — use
+  `exceptions.py`. **No scattered `os.getenv`** — `config.get_settings()`.
+- Prefer `pathlib`. Must pass `ruff check` + `ruff format`.
 
 ## Dev commands
 
-Use the Makefile targets (run `make` for the full list):
+`make run` · `make sync` (add `--extra local` for the offline backend) ·
+`make lint` / `make format` · `make test` · `make check` (CI gate) · `make reset`.
 
-- `make run` — start the app (`uv run streamlit run app.py`)
-- `make sync` — install dependencies from `uv.lock`
-- `make lint` / `make format` — ruff
-- `make test` — run the pytest suite (`tests/`)
-- `make check` — lint + format check + tests (same gate as CI)
-- `make reset` — rebuild the `.venv`
-
-Tests live in `tests/` and run without network/ffmpeg (pure helpers + SQLite).
-CI (`.github/workflows/ci.yml`) runs `make check`'s steps on push/PR.
+Tests run without network or ffmpeg. CI runs `make check` on push/PR.
 
 ## Commit messages
 
-Use **Conventional Commits**:
-
-```
-<type>(<scope>): <short summary>
-```
-
-- Types: `feat`, `fix`, `docs`, `refactor`, `chore`, `test`, `perf`, `style`, `build`, `ci`
-- Scope optional but encouraged (e.g. `feat(upload)`, `fix(transcribe)`)
-- Summary in imperative mood, lowercase, no trailing period
-
-Examples:
-
-- `feat(upload): add direct audio file upload support`
-- `fix(transcribe): offset subtitle timestamps per segment`
-- `docs(readme): document supported audio formats`
+**Conventional Commits**: `<type>(<scope>): <short summary>` — imperative, lowercase,
+no trailing period. Types: `feat`, `fix`, `docs`, `refactor`, `chore`, `test`, `perf`,
+`style`, `build`, `ci`. Example: `fix(transcribe): offset subtitle timestamps per segment`
