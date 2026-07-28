@@ -165,10 +165,10 @@ Work in the **Transcribe** tab:
 1. **Upload File:** Use the file uploader to select a video file (MKV, MP4, etc.) or an audio file (MP3, WAV, etc.). The audio is prepared automatically — a video's audio track is extracted on upload, and audio files are used directly. An audio player appears so you can listen first. (For video, you can also download the extracted `.wav`.)
 2. **Pick the engine & options:** Choose the **engine** — **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or **Local (offline)** (pick a model size that downloads on first use). Tick **"Include timestamps & generate subtitles (.srt)"** where available (`whisper-1` and any local model). For video, you can also tick **"Describe what's on screen"** (see [On-screen context](#on-screen-context-video-) below). For the OpenAI engine, set your key in `.env` or in the sidebar.
 3. **Start Transcription:** Click "Start Transcription". Progress is shown while segments are processed (this may take several minutes for long audio).
-4. **View & Download:** The transcript preview appears on the right with a "Download Transcript" button (and "Download Subtitles (.srt)" when timestamps were enabled).
+4. **View & Download:** The transcript preview appears on the right, showing **how long the run took**, with a "Download Transcript" button (and "Download Subtitles (.srt)" when timestamps were enabled).
 5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`. Your transcription **history is kept** (see below).
 
-In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts.
+In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions, each showing how long it took to produce. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts. Entries recorded before this was added simply omit the timing.
 
 ## On-screen context (video) 🖥️
 
@@ -180,9 +180,15 @@ Audio-only transcription misses whatever was *shown* rather than said. Tick **"D
 (0:12) Moving on to what we have planned for next year.
 ```
 
-This needs an **OpenAI API key** even when you transcribe with the local offline engine. Cost is bounded before you start: at most **40 frames per video** (about half a cent on the default model at `low` detail), and recordings where little changes on screen use far fewer. Pick **`high`** detail only when you need to read small text off a slide.
+This needs an **OpenAI API key** even when you transcribe with the local offline engine. Cost is bounded before you start: at most **200 screenshots per video** (about 5 cents on the default model at `low` detail), and recordings where little changes on screen use far fewer. Raise or lower that ceiling with `FRAME_MAX_COUNT` in `.env`. Pick **`high`** detail only when you need to read small text off a slide.
 
 **"Screenshot at least every N seconds"** sets how often a frame is grabbed even when the picture has not changed — 5 to 300 seconds, 30 by default. Scene changes are always captured *in addition* to this, so a lower value mainly helps with slow fades and gradual changes that never look like a cut. Very short clips get a couple of extra samples so they are not represented by a single frame.
+
+As you move the slider the app shows **roughly how many screenshots it expects to take** for your video (its length divided by the interval), together with the estimated cost. Treat it as an indication rather than a promise: scene changes push the real number up, and discarded near-duplicates pull it back down.
+
+If the interval you pick would exceed the screenshot limit — say every 10 seconds across a 90-minute recording — the screenshots are **spread evenly across the whole video** at a wider interval instead, so you still get coverage from start to finish, just at a coarser resolution. The app spells this out rather than quietly ignoring your choice:
+
+> One every 5 s would exceed the 300-screenshot limit for this 1:23:12 video, so they are spread across the whole video instead: **300** screenshots, one about every 17 s (about $0.07).
 
 Frames that show nothing useful — a face, a blank desktop — are dropped automatically, and near-identical frames are deduplicated. Note that two slides differing only in a word or a number may be treated as duplicates, since the deduplication compares layout rather than text.
 
@@ -199,7 +205,7 @@ Then in the app choose the **Local (offline)** engine and a model size (`base` i
 ## Configuration 🔑
 
 * **OpenAI API Key (only for the OpenAI engine):** set it in the `.env` file as `OPENAI_API_KEY`, **or** type it into the sidebar at runtime (kept only for the session, never written to disk). The local offline engine needs no key.
-* **Optional `.env` overrides:** `LOCAL_DEVICE` (`cpu`/`cuda`), `WHISPER_MODEL_DIR` (model cache location).
+* **Optional `.env` overrides:** `LOCAL_DEVICE` (`cpu`/`cuda`), `WHISPER_MODEL_DIR` (model cache location), `FRAME_MAX_COUNT` (screenshot ceiling for on-screen context; default 200).
 
 ## Troubleshooting ⚠️
 

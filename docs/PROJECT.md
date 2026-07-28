@@ -113,11 +113,29 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 - **The sampling interval is a UI slider** (5–300 s, default 30). It is an *upper*
   bound — scene changes are captured on top of it — so the label reads "at least
   every".
+- **The expected screenshot count is shown before the run**, from the video's
+  duration over the effective interval, alongside the estimated cost. It counts
+  only what the interval guarantees, so it reads high when deduplication kicks in
+  and low on a video full of cuts — the caption says so rather than implying a
+  promise. Measured against real extractions on a 25 s clip it matched exactly at
+  10/30/300 s and over-counted 6 vs 3 at 5 s, where dedup did its job. The
+  duration probe is cached on path plus file size, so dragging the slider does
+  not spawn an `ffprobe` per rerun.
+- **The cost estimate includes output tokens.** Counting only image tokens
+  understated it by about half, because a caption's output tokens are priced
+  several times higher than input ones.
 - **Short videos get tightened, but only just.** A clip shorter than the chosen
   interval would be represented by a single frame, so the interval drops to
   `duration / 2`. An earlier version aimed for ~8 samples, which silently
   overrode the slider on anything short; the guarantee is now the minimum that
   fixes the bug and otherwise leaves the chosen cadence alone.
+- **Deduplication runs before anything is sent**, so discarded frames cost
+  nothing. Measured on a meeting-shaped video (4 slides held 30 s each): ffmpeg
+  produced 30 candidates, dedup kept 4 — the slide boundaries — and 86% of the
+  frames never reached the API. This is also why the UI estimate is an upper
+  bound: it is computed before dedup, so the real spend is usually lower.
+  The model's own `NONE` reply is a second filter, but it costs a request and
+  only keeps the transcript clean.
 - **Deduplication uses a 64-bit dHash, threshold 2.** Bigger hashes measured
   *worse*: slides are mostly flat, so extra bits sample areas where adjacent
   pixels tie and become coin-flips. The threshold is deliberately tight because
@@ -126,8 +144,24 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
   not its predecessor, so a slow fade cannot ratchet past the threshold.
   **Known limit:** a slide differing only in a word or number is ~1 bit away —
   inside the noise floor — so it is treated as a duplicate and dropped.
-- **A hard cap of 40 frames** keeps the cost bounded; over the cap, frames are
-  sampled evenly across the timeline rather than truncated.
+- **The frame cap is a backstop, not the control.** It was originally 40, which
+  was low enough to bind at *every* slider position on an 83-minute meeting —
+  the estimate sat at "about 40… never more than 40" and dragging the slider
+  changed nothing. Raised to 200: the real constraint is wall-clock (one request
+  per frame), not money, since 200 frames is roughly 5 cents.
+- **The cap widens the interval up front** rather than extracting and discarding.
+  Clamping afterwards would write ~1,000 JPEGs and hash them only to throw most
+  away. When it binds, the UI says so and shows the interval that will actually
+  be used, instead of silently ignoring the chosen one.
+- **Widening beats truncating** when the cap binds. Taking the first N frames
+  would cover only the opening stretch of a recording; widening keeps coverage
+  from start to finish and degrades resolution instead. What is lost is temporal
+  detail, which degrades gracefully — whole missing sections do not.
+- **`FRAME_MAX_COUNT` is a Settings field, not a bare constant**, so it can be
+  set per machine in `.env`. The module constant is only the default; call sites
+  resolve it at call time, because a default argument would freeze the value at
+  import and quietly ignore the `.env`. `tests/conftest.py` pins it so a
+  developer's own `.env` cannot change what the tests assert.
 - **Chat Completions, not the Responses API** — the repo pins `openai==1.75.0`,
   whose `Responses` type does not accept the newer reasoning/detail values. In
   Chat Completions, `detail` goes *inside* `image_url`.
@@ -178,9 +212,18 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 - **PRAGMA `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`** — better defaults
   for Streamlit's rerun model and multiple open sessions.
 - **Migration without a migration tool:** `init_db()` checks `PRAGMA table_info` and adds
-  the `provider` column when missing, so existing databases are not lost.
+  any missing column — currently `provider` and `elapsed_seconds` — so existing
+  databases are not lost. New columns must be nullable, since existing rows have
+  no value for them.
 - **Audio is NOT stored as a BLOB** — only the transcript and SRT text; `audio_path` is a
   best-effort reference that may disappear after a cleanup.
+- **Run time is measured in `app.py`, around the whole click**, not inside the
+  pipeline: on-screen context can dominate the wait, and the number worth
+  reporting is how long the user actually sat there. Stored per run in a new
+  `elapsed_seconds` column — deliberately not the unrelated (and still unused)
+  `duration_minutes`, which means the *audio* length. Measured with
+  `time.monotonic()`, not `datetime.now()`: it is a duration, so a clock change
+  must not corrupt it.
 
 ### Code and process
 - **Functional-first**, classes only where natural (Pydantic Settings, service clients).
@@ -217,7 +260,8 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 - **Readable transcript**: inline `(M:SS)` + paragraphs *(2026-07-20)*
 - **On-screen context** for video: key frames described by a vision model and
   interleaved into the transcript by timestamp, with a selectable screenshot
-  interval and a pre-run cost ceiling *(2026-07-20)*
+  interval and a pre-run estimate of the screenshot count and cost *(2026-07-20)*
+- **Run time reported** next to the transcript and in history *(2026-07-28)*
 - **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
 - **Hybrid API key** (`.env` or sidebar); offline works with no key
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
@@ -225,7 +269,7 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 46 tests** (DB CRUD + PRAGMAs, SRT/formatting helpers, frame selection and dedup, cost estimates, headless Streamlit UI checks) — no network, no ffmpeg
+- **pytest: 66 tests** (DB CRUD + PRAGMAs + schema migration, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, headless Streamlit UI checks) — no network, no ffmpeg
 - **CI** (GitHub Actions): ruff + format check + pytest on push/PR
 - **Makefile**: `run` / `sync` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Docker**: `Dockerfile` + `docker-compose.yml` + `.dockerignore` (ffmpeg bundled, offline backend opt-in via `INSTALL_LOCAL=true`)
@@ -257,7 +301,48 @@ upload → (video? ffmpeg to_wav mono-16k : use the file as-is)
 
 ## 6. Journal
 
-### 2026-07-20 (part 2) — On-screen context from video
+### 2026-07-28 — Report how long a run took
+
+The wait had no feedback beyond a spinner, and with on-screen context a run can
+take minutes. Each run now reports its wall-clock time next to the transcript
+(`⏱️ Finished in 2:34`) and in the history list.
+
+Measured in `app.py` around the whole click rather than inside the pipeline, so
+frame extraction and captioning are included — that is the wait the user
+experiences. Persisted in a new `elapsed_seconds` column; the existing
+`duration_minutes` column was left alone because it means the audio's length, not
+the processing time, and conflating them would have been a silent lie in the data.
+
+While here, replaced the two progress messages that printed a raw
+`datetime.now()` — "Transcription completed at 2026-07-28 11:16:08.813456" —
+with "Transcription completed in 0:03". The timestamp was noise; the duration is
+the useful part. That removed the last use of `datetime` in `transcribe.py`.
+
+**Migration verified on the real database, not just a fixture:** a copy of the
+owner's 45-record history was migrated first (all records intact, old rows get
+`None`, new rows accept the column), then backed up before the app touched the
+original. A regression test now recreates the pre-`provider` schema, migrates it,
+and asserts the existing rows survive — the previous migration path had no test
+at all.
+
+**Two defects found while reviewing the change:**
+
+1. **A failed run kept the previous run's time.** `run_transcription` assigned
+   `elapsed_seconds` only on success, so the no-API-key early return and the
+   `except AppError` path left the old figure in place — and the result panel
+   then claimed "Finished in 2:34" next to a red error, about a run that never
+   finished. Worse, a partial failure rewrites the `.txt` before the `.srt`, so a
+   *new* transcript could be shown stamped with an *old* duration. Fixed by
+   clearing it before the timer starts. The regression test was checked by
+   removing the fix and confirming it fails.
+2. **`init_session_state()` had drifted out of sync.** It listed four keys while
+   the two reset paths listed six; `video_path` and `elapsed_seconds` were never
+   initialised and only existed by accident, because the new-upload reset happens
+   to run first. Three hand-maintained copies of one list is the actual bug, so
+   they now derive from a single `_RUN_STATE_KEYS` tuple, with a test asserting
+   every key is initialised.
+
+Tests: 68 (was 61).
 
 **Goal:** a meeting recording's slides and shared screens should reach the transcript,
 not just the speech — without paying to look at 360 near-identical frames.
@@ -293,13 +378,31 @@ back correctly (`The slide displays "Q3 Revenue" and "4.2M (+18% YoY)"`). Confir
 
 **Tests: 48** (was 18), including headless Streamlit `AppTest` checks of the new
 controls — the browser cannot drive a native file picker, so the upload-gated UI is
-covered there instead. Estimated ceiling for the default settings: 40 frames ≈ 25K
-image tokens ≈ half a cent.
+covered there instead. The cap shipped at 40 frames; see the correction below.
 
 **Follow-ups the same day:** removed the "install offline Whisper" hint from the UI
-(it belongs in the README, not in front of users), and exposed the screenshot
-interval as a slider — which surfaced that the short-video tightening was
-overriding any value the user picked.
+(it belongs in the README, not in front of users); exposed the screenshot interval
+as a slider — which surfaced that the short-video tightening was overriding any
+value the user picked; and added the expected screenshot count next to the cost.
+
+**That count is what exposed the real bug.** On an 83-minute meeting the caption
+read "About 40 screenshots… never more than 40" and did not move as the slider was
+dragged: at 40 frames the cap bound at every position below ~125 s, so the control
+did nothing on exactly the long recordings it was meant for. Two things were wrong
+at once — a cap set for a cost that turned out to be trivial, and a message that
+reported the clamp as if it were an estimate. The cap is now 200 and is applied by
+widening the interval before extraction, and when it does bind the caption states
+the interval that will really be used. Also corrected the cost estimate, which
+omitted output tokens and so read about half the true figure.
+
+**Then made the cap configurable** (`FRAME_MAX_COUNT` in `.env`, owner runs 300).
+Chose an env setting over a second UI control deliberately: interval and frame
+count both determine the same outcome, so a second widget would give two knobs
+where one always silently wins — the exact confusion just fixed. The env route
+keeps one control on screen and puts the budget where it is set once and
+forgotten. Making it work needed more than a Settings field: every call site took
+the cap as a default argument, which is evaluated at import and would have
+ignored `.env` entirely.
 
 ### 2026-07-20 — Readable transcript + documentation
 
