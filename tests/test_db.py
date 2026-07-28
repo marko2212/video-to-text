@@ -48,6 +48,65 @@ def test_delete_removes_record():
     assert db.list_transcriptions() == []
 
 
+def test_elapsed_seconds_roundtrips():
+    db.init_db()
+    record_id = db.add_transcription(
+        filename="meeting.mkv",
+        source_type="video",
+        model="whisper-1",
+        with_timestamps=False,
+        transcript="text",
+        elapsed_seconds=154.5,
+    )
+
+    assert db.get_transcription(record_id)["elapsed_seconds"] == 154.5
+    # The history list renders it, so it must survive the lightweight query too.
+    assert db.list_transcriptions()[0]["elapsed_seconds"] == 154.5
+
+
+def test_init_db_migrates_a_database_without_the_newer_columns():
+    # Recreate the original schema: no `provider`, no `elapsed_seconds`.
+    conn = db._connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE transcriptions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename         TEXT NOT NULL,
+                source_type      TEXT NOT NULL,
+                model            TEXT NOT NULL,
+                with_timestamps  INTEGER NOT NULL,
+                transcript       TEXT NOT NULL,
+                srt              TEXT,
+                audio_path       TEXT,
+                file_size_mb     REAL,
+                duration_minutes REAL,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO transcriptions "
+            "(filename, source_type, model, with_timestamps, transcript) "
+            "VALUES ('old.mp3', 'audio', 'whisper-1', 0, 'existing history')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db()
+
+    rows = db.list_transcriptions()
+    assert len(rows) == 1, "pre-existing history must survive the migration"
+    assert rows[0]["elapsed_seconds"] is None
+    assert db.get_transcription(rows[0]["id"])["transcript"] == "existing history"
+    # And the migrated database still accepts new rows with the new columns.
+    new_id = db.add_transcription(
+        "new.mp3", "audio", "whisper-1", False, "fresh", elapsed_seconds=12.0
+    )
+    assert db.get_transcription(new_id)["elapsed_seconds"] == 12.0
+
+
 def test_pragmas_are_applied():
     conn = db._connect()
     try:

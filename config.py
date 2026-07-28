@@ -84,8 +84,13 @@ FRAME_INTERVAL_STEP_SECONDS: int = 5
 # A single hard cut can trip scene detection several times in a row; one of
 # those frames is enough.
 FRAME_MIN_INTERVAL_SECONDS: float = 2.0
-# Hard cap on frames per video, so the cost of the feature stays predictable.
-FRAME_MAX_COUNT: int = 40
+# Hard cap on frames per video: a backstop, not the main control. It has to stay
+# well clear of ordinary use or it silently overrides the interval the user
+# chose — at 40 an 83-minute meeting was pinned to the cap at every slider
+# position. The binding constraint is wall-clock, not money: frames are captioned
+# one request at a time, so 200 is a few minutes of waiting and roughly 5 cents.
+# Override per-machine with FRAME_MAX_COUNT in .env.
+DEFAULT_FRAME_MAX_COUNT: int = 200
 # Edge length of the difference hash; 8 yields the usual 64-bit hash. A bigger
 # hash is tempting but measurably worse here: slides are mostly flat, and the
 # extra bits sample flat area where adjacent pixels tie, so they are noise.
@@ -103,13 +108,16 @@ FRAME_QUALITY: int = 4
 # 512x512 for a flat, predictable token cost — enough to read slide headings.
 FRAME_DETAIL_LEVELS: list[str] = ["low", "high"]
 DEFAULT_FRAME_DETAIL: str = "low"
-# Approximate tokens charged per frame, used only for the pre-run cost estimate.
+# Approximate image tokens charged per frame, for the pre-run cost estimate.
 VISION_TOKENS_PER_FRAME: dict[str, int] = {"low": 630, "high": 2300}
-# Indicative input price in USD per million tokens, for that estimate only.
-# Checked 2026-07-20 — re-check against OpenAI's pricing page if it looks wrong.
-VISION_PRICE_PER_MTOK: dict[str, float] = {
-    "gpt-5.4-nano": 0.20,
-    "gpt-5.4-mini": 0.75,
+# A caption is short, but output tokens cost several times more than input ones,
+# so leaving them out understated the estimate by roughly half.
+VISION_OUTPUT_TOKENS_PER_FRAME: int = 80
+# Indicative (input, output) price in USD per million tokens, for that estimate
+# only. Checked 2026-07-20 — re-check OpenAI's pricing page if it looks wrong.
+VISION_PRICE_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gpt-5.4-nano": (0.20, 1.25),
+    "gpt-5.4-mini": (0.75, 4.50),
 }
 
 # Transcription providers (engine choice shown in the UI).
@@ -151,6 +159,7 @@ class Settings(BaseSettings):
         segment_duration_minutes: Length of each audio chunk in minutes.
         local_device: Device for local Whisper ("auto", "cpu" or "cuda").
         local_compute_type: Quantization for local Whisper (e.g. "int8").
+        frame_max_count: Hard cap on screenshots described per video.
     """
 
     openai_api_key: str | None = Field(
@@ -166,6 +175,8 @@ class Settings(BaseSettings):
     # CPU works everywhere; set LOCAL_DEVICE=cuda only with a working CUDA setup.
     local_device: str = Field(default="cpu")
     local_compute_type: str = Field(default="int8")
+    # Raising this costs mostly time: frames are described one request at a time.
+    frame_max_count: int = Field(default=DEFAULT_FRAME_MAX_COUNT, ge=1)
 
     model_config = SettingsConfigDict(
         env_file=".env",

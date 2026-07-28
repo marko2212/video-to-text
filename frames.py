@@ -20,7 +20,6 @@ from PIL import Image
 
 from config import (
     FRAME_DUPLICATE_DISTANCE,
-    FRAME_MAX_COUNT,
     FRAME_MAX_INTERVAL_SECONDS,
     FRAME_MIN_INTERVAL_SECONDS,
     FRAME_QUALITY,
@@ -45,6 +44,18 @@ _FRAME_PATTERN = "frame_%05d.jpg"
 # Deliberately small: beyond avoiding that, the chosen cadence is left alone.
 _MIN_SAMPLES_PER_VIDEO = 2
 _MIN_SAMPLE_SECONDS = 5.0
+
+
+def max_frames_setting() -> int:
+    """Return the configured cap on frames per video.
+
+    Read at call time rather than baked into a default argument, so setting
+    ``FRAME_MAX_COUNT`` in ``.env`` actually takes effect.
+
+    Returns:
+        The maximum number of frames to describe for one video.
+    """
+    return get_settings().frame_max_count
 
 
 def _ffmpeg_error_detail(exc: ffmpeg.Error) -> str:
@@ -180,22 +191,63 @@ def video_duration(video_path: Path) -> float:
         return 0.0
 
 
-def sample_interval(duration: float, max_interval: float) -> float:
-    """Return how often to take a frame regardless of scene changes.
+def effective_interval(
+    duration: float,
+    max_interval: float,
+    max_frames: int | None = None,
+) -> float:
+    """Return how often a frame is actually taken, ignoring scene changes.
+
+    The requested interval is adjusted at both ends: tightened when the video is
+    too short for it to fire more than once, and widened when honouring it would
+    blow past the frame cap. Widening up front matters — otherwise thousands of
+    frames are written to disk and hashed only to be discarded by the cap.
 
     Args:
         duration: Video duration in seconds; 0 when unknown.
         max_interval: The requested upper bound between samples.
+        max_frames: Hard cap on the number of frames; defaults to the setting.
 
     Returns:
-        The requested interval, tightened only when the video is too short for
-        it to fire more than once.
+        The interval the extraction will really use.
     """
     if duration <= 0:
         return max_interval
-    return min(
+    if max_frames is None:
+        max_frames = max_frames_setting()
+    interval = min(
         max_interval, max(duration / _MIN_SAMPLES_PER_VIDEO, _MIN_SAMPLE_SECONDS)
     )
+    if max_frames > 0:
+        interval = max(interval, duration / max_frames)
+    return interval
+
+
+def estimate_frame_count(
+    duration: float,
+    max_interval: float = FRAME_MAX_INTERVAL_SECONDS,
+    max_frames: int | None = None,
+) -> int:
+    """Estimate how many frames a video will yield, for the pre-run UI hint.
+
+    Only the frames the interval guarantees are counted — one at the start and
+    one per interval after that. Scene changes push the real number up and
+    deduplication pulls it back down, so this is an indication, not a promise.
+
+    Args:
+        duration: Video duration in seconds; 0 when unknown.
+        max_interval: Requested longest stretch without a frame.
+        max_frames: Hard cap applied to the selection; defaults to the setting.
+
+    Returns:
+        The estimated frame count, or 0 when the duration is unknown.
+    """
+    if duration <= 0:
+        return 0
+    if max_frames is None:
+        max_frames = max_frames_setting()
+    interval = effective_interval(duration, max_interval, max_frames)
+    return min(max_frames, int(duration // interval) + 1)
 
 
 def dhash(image_path: Path, size: int = HASH_SIZE) -> int:
@@ -308,7 +360,7 @@ def drop_near_duplicates(
 
 
 def cap_frame_count(
-    frames: list[dict[str, Any]], max_frames: int = FRAME_MAX_COUNT
+    frames: list[dict[str, Any]], max_frames: int | None = None
 ) -> list[dict[str, Any]]:
     """Thin the list down to at most ``max_frames``, spread evenly over time.
 
@@ -317,11 +369,13 @@ def cap_frame_count(
 
     Args:
         frames: Frames ordered by time.
-        max_frames: Maximum number of frames to keep.
+        max_frames: Maximum number of frames to keep; defaults to the setting.
 
     Returns:
         At most ``max_frames`` frames, always including the first and last.
     """
+    if max_frames is None:
+        max_frames = max_frames_setting()
     if max_frames <= 0:
         return []
     if len(frames) <= max_frames:
@@ -341,7 +395,7 @@ def extract_keyframes(
     threshold: float = SCENE_THRESHOLD,
     min_interval: float = FRAME_MIN_INTERVAL_SECONDS,
     max_interval: float = FRAME_MAX_INTERVAL_SECONDS,
-    max_frames: int = FRAME_MAX_COUNT,
+    max_frames: int | None = None,
 ) -> list[dict[str, Any]]:
     """Extract a small, representative set of frames from a video.
 
@@ -356,7 +410,7 @@ def extract_keyframes(
         threshold: Scene-change threshold between 0 and 1 (higher = fewer frames).
         min_interval: Minimum spacing in seconds between kept frames.
         max_interval: Longest stretch in seconds allowed without a frame.
-        max_frames: Hard upper bound on the number of frames returned.
+        max_frames: Hard upper bound on frames returned; defaults to the setting.
 
     Returns:
         Frames as dicts with ``time`` (seconds) and ``path``, ordered by time.
@@ -365,6 +419,8 @@ def extract_keyframes(
         VisualContextError: If ffmpeg cannot read the video.
     """
     video_path = Path(video_path)
+    if max_frames is None:
+        max_frames = max_frames_setting()
     if output_dir is None:
         output_dir = get_settings().temp_dir / "frames"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -373,7 +429,7 @@ def extract_keyframes(
     for stale in output_dir.glob("*.jpg"):
         stale.unlink(missing_ok=True)
 
-    interval = sample_interval(video_duration(video_path), max_interval)
+    interval = effective_interval(video_duration(video_path), max_interval, max_frames)
     stderr = _run_frame_select(video_path, output_dir, threshold, interval)
     times = _parse_frame_times(stderr)
     written = sorted(output_dir.glob("frame_*.jpg"))

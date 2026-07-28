@@ -21,6 +21,7 @@ from openai import OpenAI, OpenAIError
 from config import (
     DEFAULT_FRAME_DETAIL,
     DEFAULT_VISION_MODEL,
+    VISION_OUTPUT_TOKENS_PER_FRAME,
     VISION_PRICE_PER_MTOK,
     VISION_TOKENS_PER_FRAME,
 )
@@ -73,10 +74,13 @@ def estimate_frame_cost(
     Returns:
         The approximate cost, or ``None`` if no price is known for the model.
     """
-    price = VISION_PRICE_PER_MTOK.get(model)
-    if price is None:
+    prices = VISION_PRICE_PER_MTOK.get(model)
+    if prices is None:
         return None
-    return estimate_frame_tokens(frame_count, detail) * price / 1_000_000
+    input_price, output_price = prices
+    input_cost = estimate_frame_tokens(frame_count, detail) * input_price
+    output_cost = frame_count * VISION_OUTPUT_TOKENS_PER_FRAME * output_price
+    return (input_cost + output_cost) / 1_000_000
 
 
 def _encode_frame(frame_path: Path) -> str:

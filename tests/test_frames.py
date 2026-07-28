@@ -38,22 +38,71 @@ def test_parse_frame_times_without_matches():
     assert frames._parse_frame_times("nothing useful here") == []
 
 
-def test_sample_interval_tightens_for_short_videos():
+def test_effective_interval_tightens_for_short_videos():
     # A 25 s clip would otherwise get a single sample from a 30 s interval.
-    assert frames.sample_interval(25.0, 30.0) == 12.5
+    assert frames.effective_interval(25.0, 30.0) == 12.5
 
 
-def test_sample_interval_honours_the_chosen_cadence_on_long_videos():
-    assert frames.sample_interval(3600.0, 30.0) == 30.0
-    assert frames.sample_interval(3600.0, 300.0) == 300.0
+def test_effective_interval_honours_the_chosen_cadence():
+    assert frames.effective_interval(3600.0, 30.0) == 30.0
+    assert frames.effective_interval(3600.0, 300.0) == 300.0
 
 
-def test_sample_interval_never_goes_below_the_floor():
-    assert frames.sample_interval(4.0, 30.0) == 5.0
+def test_effective_interval_widens_when_the_cap_would_bind():
+    # 30 minutes every 10 s is 180 frames; a 60-frame cap means one every 30 s.
+    assert frames.effective_interval(1800.0, 10.0, max_frames=60) == 30.0
 
 
-def test_sample_interval_falls_back_when_duration_is_unknown():
-    assert frames.sample_interval(0.0, 30.0) == 30.0
+def test_effective_interval_never_goes_below_the_floor():
+    assert frames.effective_interval(4.0, 30.0) == 5.0
+
+
+def test_effective_interval_falls_back_when_duration_is_unknown():
+    assert frames.effective_interval(0.0, 30.0) == 30.0
+
+
+def test_estimate_frame_count_divides_duration_by_the_interval():
+    # A frame at t=0 and then one per interval: 600 / 30 = 20, plus the first.
+    assert frames.estimate_frame_count(600.0, 30.0) == 21
+
+
+def test_estimate_frame_count_respects_the_hard_cap():
+    cap = frames.max_frames_setting()
+    assert frames.estimate_frame_count(36000.0, 10.0) == cap
+
+
+def test_the_cap_is_read_from_the_environment(monkeypatch):
+    import config
+
+    monkeypatch.setenv("FRAME_MAX_COUNT", "300")
+    config.get_settings.cache_clear()
+
+    assert frames.max_frames_setting() == 300
+    # A cap read at call time is useless if the callers baked in the default.
+    assert frames.estimate_frame_count(36000.0, 10.0) == 300
+    assert frames.effective_interval(3000.0, 5.0) == 10.0
+
+
+def test_estimate_frame_count_tracks_the_slider_on_a_long_meeting():
+    # The regression this guards: with too tight a cap every interval collapsed
+    # to the same number, so moving the slider changed nothing on screen.
+    counts = [frames.estimate_frame_count(4992.0, i) for i in (30.0, 40.0, 120.0)]
+    assert counts == [167, 125, 42]
+    assert len(set(counts)) == len(counts)
+
+
+def test_estimate_frame_count_uses_the_tightened_short_video_interval():
+    # 25 s at a 30 s setting really samples every 12.5 s, so 3 — not 1.
+    assert frames.estimate_frame_count(25.0, 30.0) == 3
+
+
+def test_estimate_frame_count_is_zero_when_duration_is_unknown():
+    assert frames.estimate_frame_count(0.0, 30.0) == 0
+
+
+def test_estimate_frame_count_falls_as_the_interval_grows():
+    counts = [frames.estimate_frame_count(1800.0, i) for i in (30.0, 120.0, 300.0)]
+    assert counts == sorted(counts, reverse=True)
 
 
 def test_apply_min_interval_drops_closely_spaced_frames():

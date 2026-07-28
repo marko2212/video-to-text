@@ -7,6 +7,7 @@ history persistence in :mod:`db`.
 
 import importlib.util
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,6 @@ from config import (
     FRAME_INTERVAL_MAX_SECONDS,
     FRAME_INTERVAL_MIN_SECONDS,
     FRAME_INTERVAL_STEP_SECONDS,
-    FRAME_MAX_COUNT,
     FRAME_MAX_INTERVAL_SECONDS,
     LOCAL_MODEL_SIZES_MB,
     LOCAL_MODELS,
@@ -45,6 +45,17 @@ logger = get_logger(__name__)
 
 # faster-whisper is an optional dependency (install via `uv sync --extra local`).
 LOCAL_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
+
+# Session-state keys describing one upload and its result. Listed once because
+# they are initialised, reset on a new upload, and cleared on cleanup — three
+# hand-kept copies drifted apart and left new keys uninitialised.
+_RUN_STATE_KEYS = (
+    "audio_path",
+    "video_path",
+    "transcript_path",
+    "srt_path",
+    "elapsed_seconds",
+)
 
 
 @st.cache_resource(show_spinner=False)
@@ -176,6 +187,7 @@ def save_to_history(
         srt=srt_text,
         audio_path=str(audio_path) if audio_path else None,
         file_size_mb=file_size_mb,
+        elapsed_seconds=st.session_state.elapsed_seconds,
     )
 
 
@@ -187,13 +199,7 @@ def clean_temp_files() -> None:
             for path in directory.iterdir():
                 if path.is_file():
                     path.unlink()
-        for key in (
-            "audio_path",
-            "video_path",
-            "transcript_path",
-            "srt_path",
-            "original_filename",
-        ):
+        for key in (*_RUN_STATE_KEYS, "original_filename"):
             st.session_state[key] = None
         if "progress_container" in st.session_state:
             st.session_state.progress_container.empty()
@@ -230,6 +236,99 @@ def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
                 )
     except AppError as exc:
         st.error(f"Error preparing audio: {exc}")
+
+
+@st.cache_data(show_spinner=False)
+def _video_length(video_path: str, size_bytes: int) -> float:
+    """Return a video's duration in seconds, cached across reruns.
+
+    Args:
+        video_path: Path to the video file.
+        size_bytes: File size, part of the cache key so a replaced file is
+            probed again rather than reusing a stale duration.
+
+    Returns:
+        Duration in seconds, or 0.0 when it cannot be determined.
+    """
+    del size_bytes  # cache key only
+    return frames.video_duration(Path(video_path))
+
+
+def _format_cost(cost: float | None) -> str:
+    """Phrase an estimated cost for a caption.
+
+    Args:
+        cost: Estimated cost in USD, or None when the model has no known price.
+
+    Returns:
+        A short phrase that reads naturally in parentheses.
+    """
+    if cost is None:
+        return "cost unknown"
+    if cost < 0.01:
+        return "well under a cent"
+    return f"about ${cost:.2f}"
+
+
+def _format_length(seconds: float) -> str:
+    """Render a video duration as ``M:SS`` or ``H:MM:SS``.
+
+    Args:
+        seconds: Duration in seconds.
+
+    Returns:
+        The duration as a clock string.
+    """
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def _screenshot_estimate(interval: float, model: str, detail: str) -> str:
+    """Describe how many screenshots the current settings are likely to take.
+
+    Args:
+        interval: Chosen maximum seconds between screenshots.
+        model: Selected vision model.
+        detail: Selected image fidelity.
+
+    Returns:
+        A caption stating the expected count and cost, and saying so plainly
+        when the frame cap overrides the chosen interval.
+    """
+    video_path: Path | None = st.session_state.get("video_path")
+    cap = frames.max_frames_setting()
+
+    duration = 0.0
+    if video_path and video_path.exists():
+        duration = _video_length(str(video_path), video_path.stat().st_size)
+
+    expected = frames.estimate_frame_count(duration, interval)
+    if not expected:
+        ceiling = _format_cost(vision.estimate_frame_cost(cap, model, detail))
+        return (
+            f"At most {cap} screenshots per video ({ceiling}). "
+            "The estimate for your video appears once it has been prepared."
+        )
+
+    cost = _format_cost(vision.estimate_frame_cost(expected, model, detail))
+    length = _format_length(duration)
+    actual = frames.effective_interval(duration, interval)
+    if actual > interval + 1:
+        # The cap is binding, so the chosen interval is not what will happen.
+        # Spell out the substitution rather than quietly applying it.
+        return (
+            f"One every {interval:.0f} s would exceed the {cap}-screenshot limit "
+            f"for this {length} video, so they are spread across the whole video "
+            f"instead: **{expected}** screenshots, one about every "
+            f"{actual:.0f} s ({cost})."
+        )
+    return (
+        f"About **{expected}** screenshots for this {length} video ({cost}), "
+        "plus any scene changes. Near-identical frames are discarded before "
+        "anything is sent."
+    )
 
 
 def render_visual_options(source_type: str) -> dict[str, Any] | None:
@@ -289,17 +388,7 @@ def render_visual_options(source_type: str) -> dict[str, Any] | None:
         ),
     )
 
-    cost = vision.estimate_frame_cost(FRAME_MAX_COUNT, vision_model, detail)
-    if cost is None:
-        price_hint = ""
-    elif cost < 0.01:
-        price_hint = " — well under a cent"
-    else:
-        price_hint = f" — up to about ${cost:.2f}"
-    st.caption(
-        f"At most {FRAME_MAX_COUNT} frames per video{price_hint}. "
-        "Recordings where little changes on screen use far fewer."
-    )
+    st.caption(_screenshot_estimate(float(interval), vision_model, detail))
     return {"model": vision_model, "detail": detail, "interval": float(interval)}
 
 
@@ -366,6 +455,13 @@ def run_transcription(
     transcript_path = settings.temp_dir / f"transcript_{base_name}.txt"
     srt_path = settings.temp_dir / f"transcript_{base_name}.srt"
     srt_arg = srt_path if with_timestamps else None
+    # Drop the previous run's timing before starting. Without this, a run that
+    # fails or returns early leaves the old figure on screen, so the result panel
+    # claims "Finished in …" for a run that never finished.
+    st.session_state.elapsed_seconds = None
+    # Timed from here so the reported figure matches the wait the user actually
+    # sits through, on-screen context included.
+    started = time.monotonic()
     # Gathered before transcription so the notes are ready for the single writer
     # that renders the transcript at the end of either pipeline.
     visual_notes = collect_visual_notes(visual) if visual else None
@@ -419,6 +515,7 @@ def run_transcription(
         st.session_state.srt_path = (
             srt_path if with_timestamps and srt_path.exists() else None
         )
+        st.session_state.elapsed_seconds = time.monotonic() - started
         save_to_history(source_type, provider, model, with_timestamps)
     except AppError as exc:
         st.error(f"Transcription error: {exc}")
@@ -431,6 +528,10 @@ def render_results() -> None:
     if not transcript_path or not transcript_path.exists():
         st.info("The transcript will appear here after you run a transcription.")
         return
+
+    elapsed: float | None = st.session_state.elapsed_seconds
+    if elapsed is not None:
+        st.caption(f"⏱️ Finished in {_format_length(elapsed)}")
 
     st.text_area(
         "Transcript preview:", transcript_path.read_text(encoding="utf-8"), height=420
@@ -499,7 +600,7 @@ def render_transcribe_tab() -> None:
         if uploaded_file:
             # Reset previous results when a different file is uploaded.
             if st.session_state.original_filename != uploaded_file.name:
-                for key in ("audio_path", "video_path", "transcript_path", "srt_path"):
+                for key in _RUN_STATE_KEYS:
                     st.session_state[key] = None
             st.session_state.original_filename = uploaded_file.name
 
@@ -595,9 +696,16 @@ def render_history_tab() -> None:
                 meta_parts.append(record["provider"])
             if record["file_size_mb"]:
                 meta_parts.append(f"{record['file_size_mb']} MB")
+            if record["elapsed_seconds"]:
+                meta_parts.append(f"took {_format_length(record['elapsed_seconds'])}")
             st.caption(" · ".join(meta_parts))
 
             full = db.get_transcription(record["id"])
+            if full is None:
+                # Another session deleted it between the list query and this
+                # fetch; skip the row rather than blanking the whole tab.
+                st.info("This entry was deleted in another session.")
+                continue
             base_name = Path(full["filename"]).stem
 
             st.text_area(
@@ -628,7 +736,7 @@ def render_history_tab() -> None:
 
 def init_session_state() -> None:
     """Initialise the session-state keys used across reruns."""
-    for key in ("audio_path", "transcript_path", "srt_path", "original_filename"):
+    for key in (*_RUN_STATE_KEYS, "original_filename"):
         if key not in st.session_state:
             st.session_state[key] = None
 

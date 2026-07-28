@@ -12,7 +12,6 @@ import re
 import shutil
 import time
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -480,6 +479,7 @@ def transcribe_openai(
     segment_duration_ms = segment_duration_minutes * 60 * 1000
     temp_folder = get_settings().temp_dir / "segments"
     client = OpenAI(api_key=api_key)
+    started = time.monotonic()
 
     # Only some models return verbose_json. Ask for segments whenever the model
     # supports them (free) so the transcript can be rendered with timestamps;
@@ -505,11 +505,7 @@ def transcribe_openai(
 
         segments = _split_audio(input_file, temp_folder, segment_duration_ms)
 
-        _report(
-            progress_callback,
-            status="start",
-            message=f"Transcription started at {datetime.now()}",
-        )
+        _report(progress_callback, status="start", message="Transcription started…")
 
         texts, timed_entries = _transcribe_all(
             segments,
@@ -531,7 +527,10 @@ def transcribe_openai(
         _report(
             progress_callback,
             status="complete",
-            message=f"Transcription completed at {datetime.now()}",
+            message=(
+                "Transcription completed in "
+                f"{_format_clock(time.monotonic() - started)}"
+            ),
         )
         logger.info("Transcription saved to %s", output_file)
 
@@ -574,11 +573,10 @@ def transcribe_local(
     """
     input_file = Path(input_file)
     output_file = Path(output_file)
+    started = time.monotonic()
     try:
         _report(
-            progress_callback,
-            status="start",
-            message=f"Local transcription started at {datetime.now()}",
+            progress_callback, status="start", message="Local transcription started…"
         )
         # transcribe() returns a lazy generator; iterating it does the work.
         segments, info = whisper_model.transcribe(str(input_file), vad_filter=True)
@@ -616,7 +614,10 @@ def transcribe_local(
         _report(
             progress_callback,
             status="complete",
-            message=f"Transcription completed at {datetime.now()}",
+            message=(
+                "Transcription completed in "
+                f"{_format_clock(time.monotonic() - started)}"
+            ),
         )
         logger.info("Local transcription saved to %s", output_file)
     except Exception as exc:

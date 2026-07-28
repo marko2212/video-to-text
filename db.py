@@ -53,14 +53,19 @@ def init_db() -> None:
                 audio_path       TEXT,
                 file_size_mb     REAL,
                 duration_minutes REAL,
+                elapsed_seconds  REAL,
                 created_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
             )
             """
         )
-        # Migrate older databases created before the `provider` column existed.
+        # Add columns introduced after a database may already have been created.
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(transcriptions)")}
-        if "provider" not in columns:
-            conn.execute("ALTER TABLE transcriptions ADD COLUMN provider TEXT")
+        for name, column_type in (("provider", "TEXT"), ("elapsed_seconds", "REAL")):
+            if name not in columns:
+                # Both values are literals from the tuple above, never user input.
+                conn.execute(
+                    f"ALTER TABLE transcriptions ADD COLUMN {name} {column_type}"
+                )
 
 
 def add_transcription(
@@ -74,6 +79,7 @@ def add_transcription(
     file_size_mb: float | None = None,
     duration_minutes: float | None = None,
     provider: str | None = None,
+    elapsed_seconds: float | None = None,
 ) -> int:
     """Insert a transcription record.
 
@@ -88,6 +94,7 @@ def add_transcription(
         file_size_mb: Optional audio size in megabytes.
         duration_minutes: Optional audio duration in minutes.
         provider: Engine used ("OpenAI API" or "Local (offline)").
+        elapsed_seconds: Optional wall-clock time the run took.
 
     Returns:
         The id of the newly inserted row.
@@ -97,8 +104,9 @@ def add_transcription(
             """
             INSERT INTO transcriptions (
                 filename, source_type, model, provider, with_timestamps,
-                transcript, srt, audio_path, file_size_mb, duration_minutes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transcript, srt, audio_path, file_size_mb, duration_minutes,
+                elapsed_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 filename,
@@ -111,6 +119,7 @@ def add_transcription(
                 audio_path,
                 file_size_mb,
                 duration_minutes,
+                elapsed_seconds,
             ),
         )
         return cursor.lastrowid
@@ -126,7 +135,7 @@ def list_transcriptions() -> list[sqlite3.Row]:
         return conn.execute(
             """
             SELECT id, filename, source_type, model, provider, with_timestamps,
-                   file_size_mb, duration_minutes, created_at
+                   file_size_mb, duration_minutes, elapsed_seconds, created_at
             FROM transcriptions
             ORDER BY created_at DESC, id DESC
             """
