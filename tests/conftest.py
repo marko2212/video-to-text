@@ -19,7 +19,12 @@ def isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "uploads"))
     # Pin the overridable settings, so a developer's own .env cannot change
     # what the tests assert (and CI, which has no .env, agrees with them).
+    # load_dotenv(override=True) has already copied .env into the environment,
+    # and pydantic would read the file again, so both routes are closed.
+    monkeypatch.setitem(config.Settings.model_config, "env_file", None)
     monkeypatch.setenv("FRAME_MAX_COUNT", str(config.DEFAULT_FRAME_MAX_COUNT))
+    monkeypatch.delenv("SEGMENT_DURATION_MINUTES", raising=False)
+    monkeypatch.setenv("SERBIAN_LATIN", "true")
 
     config.get_settings.cache_clear()
     yield

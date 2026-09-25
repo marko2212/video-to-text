@@ -6,9 +6,10 @@ the frames selected by :mod:`frames` into short factual notes that
 :mod:`transcribe` interleaves into the transcript by timestamp.
 
 Frames the model judges uninformative are dropped, so a recording of a talking
-head adds nothing to the transcript even if a few frames were extracted. Like
-the rest of the pipeline this module is UI-agnostic: progress is reported
-through an optional callback.
+head adds nothing to the transcript even if a few frames were extracted. Each
+description is checkpointed as it arrives, so a failed or interrupted run does
+not pay for the same frames twice. Like the rest of the pipeline this module is
+UI-agnostic: progress is reported through an optional callback.
 """
 
 import base64
@@ -18,6 +19,8 @@ from typing import Any
 
 from openai import OpenAI, OpenAIError
 
+import checkpoints
+import openai_api
 from config import (
     DEFAULT_FRAME_DETAIL,
     DEFAULT_VISION_MODEL,
@@ -43,6 +46,12 @@ _CAPTION_PROMPT = (
 )
 _SKIP_MARKER = "NONE"
 _MAX_CAPTION_TOKENS = 120
+# Give up after this many frames fail in a row: the cause is then the network or
+# the service, not one bad frame, and every further attempt would wait it out.
+_MAX_CONSECUTIVE_FAILURES = 3
+# Bump when the prompt changes, so descriptions made with the old prompt are not
+# reused.
+_CACHE_VERSION = "v1"
 
 
 def estimate_frame_tokens(frame_count: int, detail: str = DEFAULT_FRAME_DETAIL) -> int:
@@ -117,7 +126,8 @@ def _describe_frame(
         The description, or ``None`` when the frame holds nothing worth noting.
 
     Raises:
-        VisualContextError: If the API request fails.
+        OpenAIAccountError: If the key or the account is refused.
+        VisualContextError: If this request fails for any other reason.
     """
     try:
         response = client.chat.completions.create(
@@ -141,8 +151,10 @@ def _describe_frame(
             ],
         )
     except OpenAIError as exc:
-        raise VisualContextError(f"Vision request failed: {exc}") from exc
+        raise openai_api.translate_error(exc, VisualContextError) from exc
 
+    if not response.choices:
+        raise VisualContextError("OpenAI returned no answer for this frame")
     description = (response.choices[0].message.content or "").strip()
     if not description or description.upper().startswith(_SKIP_MARKER):
         return None
@@ -160,12 +172,32 @@ def _report(progress_callback: ProgressCallback | None, **payload: Any) -> None:
         progress_callback(payload)
 
 
+def cache_dir(video_digest: str, model: str, detail: str) -> Path:
+    """Return where descriptions of one video's frames are kept.
+
+    A frame at a given time is the same picture whatever interval selected it,
+    so descriptions are keyed by frame time and reused across settings.
+
+    Args:
+        video_digest: :func:`checkpoints.file_digest` of the video.
+        model: Vision model name.
+        detail: Image fidelity, ``"low"`` or ``"high"``.
+
+    Returns:
+        The cache directory (created on first save).
+    """
+    return checkpoints.run_dir(video_digest, "frames", model, detail, _CACHE_VERSION)
+
+
 def describe_keyframes(
     frames: list[dict[str, Any]],
     api_key: str,
     model: str = DEFAULT_VISION_MODEL,
     detail: str = DEFAULT_FRAME_DETAIL,
     progress_callback: ProgressCallback | None = None,
+    cache: Path | None = None,
+    failed: list[float] | None = None,
+    collected: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Describe every extracted key frame, keeping only the informative ones.
 
@@ -179,6 +211,12 @@ def describe_keyframes(
         model: Vision model name.
         detail: Image fidelity, ``"low"`` or ``"high"``.
         progress_callback: Optional callback receiving status payloads.
+        cache: Directory from :func:`cache_dir`; descriptions found there are
+            reused and new ones saved. ``None`` disables caching.
+        failed: When given, the times of frames that could not be described
+            are appended to it, so the caller can say how many were lost.
+        collected: When given, each note is appended to it as it is made, so
+            the notes already paid for survive an early stop.
 
     Returns:
         Notes with ``time`` and ``description``, ordered by time. Frames the
@@ -186,32 +224,62 @@ def describe_keyframes(
         ``frames`` — or empty.
 
     Raises:
-        VisualContextError: If every frame fails.
+        OpenAIAccountError: At the first frame refused for account reasons
+            (bad key, no credit) — every other frame would be too.
+        VisualContextError: If every frame fails, or several in a row do.
     """
     if not frames:
         return []
 
-    client = OpenAI(api_key=api_key)
-    notes: list[dict[str, Any]] = []
+    client: OpenAI | None = None
+    notes: list[dict[str, Any]] = collected if collected is not None else []
     failures = 0
+    consecutive = 0
     total = len(frames)
 
-    for index, frame in enumerate(frames, start=1):
-        _report(
-            progress_callback,
-            status="progress",
-            message=f"Reading screen {index}/{total}",
-            progress=index / total,
-        )
-        try:
-            description = _describe_frame(client, Path(frame["path"]), model, detail)
-        except VisualContextError as exc:
-            # One unreadable frame should not cost the user the whole run.
-            failures += 1
-            logger.warning("Skipping frame at %.1fs: %s", frame["time"], exc)
-            continue
-        if description:
-            notes.append({"time": frame["time"], "description": description})
+    try:
+        for index, frame in enumerate(frames):
+            name = f"frame_{round(frame['time'] * 1000):09d}"
+            saved = checkpoints.load(cache, name) if cache else None
+            if saved is not None:
+                description = saved.get("description")
+                # A frame described earlier is a success: it ends a run of
+                # failures, or a resumed step would stop at old bad frames.
+                consecutive = 0
+            else:
+                _report(
+                    progress_callback,
+                    status="progress",
+                    message=f"Reading screen {index + 1} of {total}…",
+                    progress=index / total,
+                )
+                client = client or openai_api.make_client(api_key)
+                try:
+                    description = _describe_frame(
+                        client, Path(frame["path"]), model, detail
+                    )
+                except VisualContextError as exc:
+                    # One unreadable frame should not cost the user the whole run.
+                    # An OpenAIAccountError is not a VisualContextError, so a bad
+                    # key or an empty balance passes straight through.
+                    failures += 1
+                    consecutive += 1
+                    if failed is not None:
+                        failed.append(frame["time"])
+                    logger.warning("Skipping frame at %.1fs: %s", frame["time"], exc)
+                    if consecutive >= _MAX_CONSECUTIVE_FAILURES:
+                        raise VisualContextError(
+                            f"{consecutive} frames in a row failed; last error: {exc}"
+                        ) from exc
+                    continue
+                consecutive = 0
+                if cache:
+                    checkpoints.save(cache, name, {"description": description})
+            if description:
+                notes.append({"time": frame["time"], "description": description})
+    finally:
+        if client is not None:
+            client.close()
 
     if failures == total:
         raise VisualContextError(
@@ -219,4 +287,4 @@ def describe_keyframes(
         )
 
     logger.info("Kept %d on-screen notes from %d frames", len(notes), total)
-    return notes
+    return list(notes)

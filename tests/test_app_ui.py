@@ -160,8 +160,7 @@ import app
 
 app.init_session_state()
 st.session_state.seen = sorted(
-    key for key in app._RUN_STATE_KEYS + ("original_filename",)
-    if key in st.session_state
+    key for key in app._SESSION_KEYS if key in st.session_state
 )
 """
 
@@ -172,17 +171,22 @@ def test_every_run_state_key_is_initialised():
     test = AppTest.from_string(_INIT_SCRIPT).run()
     import app
 
-    assert test.session_state.seen == sorted(
-        (*app._RUN_STATE_KEYS, "original_filename")
-    )
+    assert test.session_state.seen == sorted(app._SESSION_KEYS)
     assert "elapsed_seconds" in app._RUN_STATE_KEYS
     assert "video_path" in app._RUN_STATE_KEYS
+    # Reset with every new upload, so one file's result never shows for another.
+    assert "partial" in app._RUN_STATE_KEYS
+    assert "run_notices" in app._RUN_STATE_KEYS
+    # These detect the new upload and carry the run request, so they are not.
+    assert "upload_id" not in app._RUN_STATE_KEYS
+    assert "job" not in app._RUN_STATE_KEYS
 
 
 _RESULTS_SCRIPT = """
 import streamlit as st
 import app
 
+app.init_session_state()
 app.render_results()
 """
 
@@ -216,8 +220,10 @@ _FAILED_RUN_SCRIPT = """
 import streamlit as st
 import app
 
+app.init_session_state()
 app.run_transcription("OpenAI API", "whisper-1", False, "audio", visual=None)
 st.session_state.result_elapsed = st.session_state.elapsed_seconds
+app.render_run_notices()
 app.render_results()
 """
 

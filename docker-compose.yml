@@ -6,7 +6,9 @@ services:
         # Set INSTALL_LOCAL=true to bake in the offline Whisper backend.
         INSTALL_LOCAL: ${INSTALL_LOCAL:-false}
     ports:
-      - "8501:8501"
+      # This machine only: transcripts are confidential and there is no login.
+      # Use "8501:8501" to open it to the network on purpose.
+      - "127.0.0.1:8501:8501"
     environment:
       # Read from a .env file or your shell. Leave empty to enter the key in
       # the app's sidebar instead.

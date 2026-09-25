@@ -58,11 +58,44 @@ TIMESTAMP_MODELS: set[str] = {"whisper-1"}
 
 # OpenAI rejects transcription files larger than 25 MB per request.
 MAX_SEGMENT_SIZE_MB: float = 25.0
-# Default length of each audio chunk sent to the API.
-DEFAULT_SEGMENT_DURATION_MINUTES: int = 10
+# Length of each audio chunk sent to the API, per model. The gpt-4o family stops
+# writing at about 2,000 output tokens per request, and dense Serbian speech
+# reaches 2,450-2,920 tokens per 10 minutes, so 10-minute chunks silently lost
+# their last minute or so (measured 2026-09-25). Five minutes stays well under
+# the cap; whisper-1 has no such cap. Billing is per audio minute either way.
+SEGMENT_MINUTES_BY_MODEL: dict[str, int] = {"gpt-4o-transcribe": 5, "whisper-1": 10}
+# Used for any model not listed above, until its output cap is known.
+DEFAULT_SEGMENT_MINUTES: int = 5
+# A response this long is treated as cut off by the output cap: the chunk is
+# split in two and both halves are transcribed again.
+OUTPUT_TOKEN_CAP_GUARD: int = 1900
+# Chunks are never split below this length, so a runaway split cannot loop.
+MIN_SPLIT_SECONDS: float = 30.0
+# Chunk boundaries move to the quietest moment within this distance of the
+# nominal cut, so a boundary falls in a pause rather than mid-word.
+CUT_SEARCH_SECONDS: float = 10.0
+# A final chunk shorter than this is merged into the previous one. Tiny tails
+# used to fail the whole run after the earlier chunks had been paid for.
+MIN_TAIL_SECONDS: float = 10.0
+# The SDK retries connection errors, timeouts, 408/409/429 and 5xx (honouring
+# Retry-After). Errors that cannot succeed — bad key, no credit — are never
+# retried; see openai_api.py.
+OPENAI_MAX_RETRIES: int = 3
+# Read timeout per request (a 5-minute chunk normally answers in seconds), and a
+# short connect timeout so an offline machine fails fast.
+OPENAI_TIMEOUT_SECONDS: float = 300.0
+OPENAI_CONNECT_TIMEOUT_SECONDS: float = 10.0
 # Target audio parameters for transcription (mono, 16 kHz is plenty for speech).
 TARGET_CHANNELS: int = 1
 TARGET_SAMPLE_RATE: int = 16000
+# Audio formats Chromium-based browsers cannot play. They, and every video, get
+# a small MP3 preview for the player instead of the raw file or the big WAV.
+BROWSER_UNPLAYABLE_AUDIO: set[str] = {"amr", "wma", "aiff", "aif"}
+# Bitrate of that preview: plenty for checking speech, ~22 MB for 90 minutes.
+PREVIEW_BITRATE: str = "32k"
+# Playable uploads bigger than this get the preview too: the player re-reads its
+# file on every click, which cost ~0.5 s per click with a 150 MB WAV.
+PREVIEW_ABOVE_MB: float = 25.0
 
 # On-screen context: key frames pulled from a video and described by a vision
 # model, so slides and shared screens end up in the transcript alongside speech.
@@ -120,6 +153,18 @@ VISION_PRICE_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-5.4-mini": (0.75, 4.50),
 }
 
+# Saved parts of unfinished runs hold transcript text; they are deleted after
+# this many days without use, even if nobody cleans temporary files.
+CHECKPOINT_MAX_AGE_DAYS: float = 14.0
+# Scratch folders of a run killed mid-way (audio chunks, screenshots) are deleted
+# after this long. Generous: a live screenshot folder can sit unchanged for over
+# an hour while its frames are described.
+SCRATCH_MAX_AGE_HOURS: float = 24.0
+
+# While a job runs, a hidden fragment checks this often whether the run was
+# stopped (toolbar Stop), so the disabled controls come back without a reload.
+JOB_WATCHDOG_SECONDS: float = 2.0
+
 # Transcription providers (engine choice shown in the UI).
 PROVIDER_OPENAI: str = "OpenAI API"
 PROVIDER_LOCAL: str = "Local (offline)"
@@ -155,11 +200,12 @@ class Settings(BaseSettings):
         upload_dir: Directory where uploaded source files are stored.
         data_dir: Directory holding the SQLite history database.
         whisper_model_dir: Download cache for local faster-whisper models.
-        default_model: Transcription model used unless overridden in the UI.
-        segment_duration_minutes: Length of each audio chunk in minutes.
+        segment_duration_minutes: Chunk length for every model, overriding
+            the per-model defaults; unset means per model.
         local_device: Device for local Whisper ("auto", "cpu" or "cuda").
         local_compute_type: Quantization for local Whisper (e.g. "int8").
         frame_max_count: Hard cap on screenshots described per video.
+        serbian_latin: Rewrite Serbian Cyrillic in transcripts as Latin.
     """
 
     openai_api_key: str | None = Field(
@@ -170,18 +216,23 @@ class Settings(BaseSettings):
     upload_dir: Path = Field(default=BASE_DIR / "uploads")
     data_dir: Path = Field(default=BASE_DIR / "data")
     whisper_model_dir: Path = Field(default=BASE_DIR / "models")
-    default_model: str = Field(default=DEFAULT_MODEL)
-    segment_duration_minutes: int = Field(default=DEFAULT_SEGMENT_DURATION_MINUTES)
+    # Capped at 15 so a chunk stays under the 25 MB request limit.
+    segment_duration_minutes: int | None = Field(default=None, ge=1, le=15)
     # CPU works everywhere; set LOCAL_DEVICE=cuda only with a working CUDA setup.
     local_device: str = Field(default="cpu")
     local_compute_type: str = Field(default="int8")
     # Raising this costs mostly time: frames are described one request at a time.
     frame_max_count: int = Field(default=DEFAULT_FRAME_MAX_COUNT, ge=1)
+    # Without a language hint the API picks the script per chunk, so one Serbian
+    # meeting came back in alternating Latin and Cyrillic blocks.
+    serbian_latin: bool = Field(default=True)
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # `SEGMENT_DURATION_MINUTES=` in .env means "not set", not a startup error.
+        env_ignore_empty=True,
     )
 
     def model_post_init(self, __context: Any) -> None:
