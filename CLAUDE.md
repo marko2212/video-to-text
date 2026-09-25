@@ -25,6 +25,11 @@ User-facing changes (formats, flags, `.env` keys, commands) must also land in RE
   `audio.py` / `transcribe.py` (which must stay Streamlit-free).
 - **Never widen `.gitignore` to `*.db`** — only `data/transcriptions.db` (+ `-*`).
 - Local backend stays **`device="cpu"`** by default; CUDA is opt-in via `LOCAL_DEVICE`.
+- **The real `data/`, `uploads/` and `temp/` hold confidential client meetings.** Anything
+  that runs app code outside normal use — scripts, AppTest, subagents, a second instance —
+  sets `DATA_DIR`/`TEMP_DIR`/`UPLOAD_DIR` to a scratch folder (a July agent wrote test rows
+  into the real history). Real data is read only read-only, as aggregates; history rows
+  are changed only with the owner's OK and after a `Connection.backup()` copy.
 
 ## Code conventions
 
@@ -37,8 +42,11 @@ User-facing changes (formats, flags, `.env` keys, commands) must also land in RE
 
 ## Dev commands
 
-`make run` · `make sync` (add `--extra local` for the offline backend) ·
-`make lint` / `make format` · `make test` · `make check` (CI gate) · `make reset`.
+`make run` · `make lint` / `make format` · `make test` · `make check` (CI gate).
+
+**Syncing:** `make sync` / `upgrade` / `reset` keep the offline backend when it is installed
+(`EXTRAS` in the Makefile); `make sync-local` adds it. **Plain `uv sync` uninstalls it**
+(uv sync is exact) — use `uv sync --extra local`, or `uv run --no-sync` to avoid syncing.
 
 Tests run without network or ffmpeg. CI runs `make check` on push/PR.
 

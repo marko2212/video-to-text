@@ -12,15 +12,18 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 * Upload **video** files in MKV, MP4, MOV, AVI, WebM, M4V, WMV, FLV, MPEG/MPG, 3GP, TS/MTS/M2TS, OGV, or VOB format.
 * Upload **audio** files directly in MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, or AMR format.
 * **Automatic preparation:** audio from a video is extracted automatically on upload (no manual step); audio files are used as-is.
-* **Built-in audio player** to listen to the uploaded/extracted audio before transcribing.
+* **Built-in audio player** to listen to the uploaded/extracted audio before transcribing — including phone recordings (AMR) that browsers cannot play natively; videos and large files get a small MP3 preview so the page stays fast.
 * **Two engines:** the **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or a **local, offline Whisper** model (`faster-whisper`) that runs on your machine — free, private, no API key.
 * **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`); it downloads on first use.
-* **Readable transcripts** — inline `(M:SS)` time markers and automatic paragraph breaks instead of one wall of text.
-* **On-screen context (video):** optionally pull the frames where the picture changed, have a vision model describe them, and merge those notes into the transcript by timestamp — so slides, diagrams and shared screens are captured, not just speech.
+* **Readable transcripts** — time markers and automatic paragraph breaks instead of one wall of text: exact `(M:SS)` with `whisper-1` and the local engine, approximate `(~M:SS)` per paragraph with `gpt-4o-transcribe`.
+* **On-screen context (video):** optionally pull the frames where the picture changed, have a vision model describe them, and place those notes in the transcript at their time — so slides, diagrams and shared screens are captured, not just speech.
 * **Optional timestamps & subtitle export** (`.srt`) — with `whisper-1` and with any local model.
 * **Flexible API key:** read from `.env` if present, otherwise entered in the sidebar (kept only for the session).
-* Handles large audio files by splitting them into smaller segments for transcription.
-* Displays the transcription progress and a preview of the final transcript.
+* **Long recordings:** audio is sent in chunks of a few minutes, cut in pauses rather than mid-word, and short enough that the model never runs out of room to write (see [Configuration](#configuration-)).
+* **Paid work is kept:** every finished chunk and screenshot description is saved on disk, so if a run stops — no credit, lost connection, the Stop button — pressing Start again sends only what is missing. A run that stops part-way shows what it has, clearly marked.
+* **Clear errors:** a bad key or an empty OpenAI balance is reported in one sentence after one request, not retried and not shown as raw JSON.
+* **Serbian in one script:** Serbian transcripts come out in Latin script even when the model switches to Cyrillic between chunks (optional).
+* Displays the transcription progress (with elapsed time) and a preview of the final transcript. The controls are locked while a run works, so a stray click cannot cancel it; History stays usable.
 * Download the transcript as a TXT file (and subtitles as SRT).
 * **Persistent history** of past transcriptions stored in a local SQLite database (survives the "Clean temporary files" action).
 * Button to clean up temporary working files (`temp/`, `uploads/`).
@@ -45,7 +48,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 * **uv:** Used to manage the virtual environment and dependencies. Install from [the uv docs](https://docs.astral.sh/uv/getting-started/installation/).
 * **ffmpeg:** This external tool **must be installed and accessible** for the application to work. See installation instructions below. (**5.1 or newer** is recommended — older builds still work, but the on-screen context feature falls back to a deprecated flag.)
 * **OpenAI API Key (optional):** only needed for the OpenAI engine. The local offline engine needs no key. You might incur costs depending on your OpenAI usage.
-* **Python Packages:** Declared in `pyproject.toml` and locked in `uv.lock` — installed via `uv sync` (add `--extra local` for the offline backend).
+* **Python Packages:** Declared in `pyproject.toml` and locked in `uv.lock` — installed via `uv sync` (`uv sync --extra local` for the offline backend; see the note in [Offline mode](#offline-mode-no-api-key-)).
 
 ## Installation ⚙️
 
@@ -110,7 +113,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
     uv sync
     ```
 
-    You do **not** need to manually create or activate a virtual environment — `uv run` (see below) handles that for you. Re-run `uv sync` any time `pyproject.toml` or `uv.lock` changes.
+    You do **not** need to manually create or activate a virtual environment — `uv run` (see below) handles that for you. Re-run it any time `pyproject.toml` or `uv.lock` changes — with `--extra local` if you use the offline engine, or simply `make sync`, which keeps it.
 
 5. **Set up Environment Variables (optional):**
     * Only needed for the **OpenAI engine**. Copy `.env.example` to `.env` and set your `OPENAI_API_KEY`.
@@ -126,7 +129,9 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 
     `uv run` automatically uses the project's `.venv` — no manual activation step needed.
 
-2. Streamlit will provide local and network URLs (usually `http://localhost:8501` or similar). Open one of these URLs in your web browser.
+2. Open `http://localhost:8501` in your web browser.
+
+    The app listens on **this machine only** (`.streamlit/config.toml`): transcripts are often confidential and the app has no login, so other devices on your network cannot reach it. To open it to your network on purpose — knowing that anyone who can reach the port can read and delete the whole history — start it with `uv run streamlit run app.py --server.address=0.0.0.0`. Streamlit's anonymous usage statistics are switched off in the same file.
 
 ### Quick launch 🖱️
 
@@ -148,7 +153,7 @@ Prefer containers? Docker **bundles ffmpeg** and every dependency, so the host n
 docker compose up --build
 ```
 
-Open `http://localhost:8501`. Provide `OPENAI_API_KEY` via a `.env` file or your shell (or just type it into the sidebar). Transcription history (`data/`) and downloaded offline models (`models/`) persist via volumes.
+Open `http://localhost:8501`. The port is published on `127.0.0.1` only, for the same reason as above; change it to `"8501:8501"` in `docker-compose.yml` to expose it deliberately. Provide `OPENAI_API_KEY` via a `.env` file or your shell (or just type it into the sidebar). Transcription history (`data/`) and downloaded offline models (`models/`) persist via volumes.
 
 To bake the **offline Whisper backend** into the image (bigger build):
 
@@ -156,7 +161,7 @@ To bake the **offline Whisper backend** into the image (bigger build):
 INSTALL_LOCAL=true docker compose up --build
 ```
 
-Docker is **optional** — it sits alongside the local `uv` / `make run` workflow; pick whichever you prefer.
+Docker is **optional** — it sits alongside the local `uv` / `make run` workflow; pick whichever you prefer. Two differences: only `OPENAI_API_KEY` is passed into the container (other `.env` settings are not), and `temp/` is not a volume, so saved parts of an unfinished run are lost when the container is recreated.
 
 ## Usage 🖱️
 
@@ -164,15 +169,16 @@ Work in the **Transcribe** tab:
 
 1. **Upload File:** Use the file uploader to select a video file (MKV, MP4, etc.) or an audio file (MP3, WAV, etc.). The audio is prepared automatically — a video's audio track is extracted on upload, and audio files are used directly. An audio player appears so you can listen first. (For video, you can also download the extracted `.wav`.)
 2. **Pick the engine & options:** Choose the **engine** — **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or **Local (offline)** (pick a model size that downloads on first use). Tick **"Include timestamps & generate subtitles (.srt)"** where available (`whisper-1` and any local model). For video, you can also tick **"Describe what's on screen"** (see [On-screen context](#on-screen-context-video-) below). For the OpenAI engine, set your key in `.env` or in the sidebar.
-3. **Start Transcription:** Click "Start Transcription". Progress is shown while segments are processed (this may take several minutes for long audio).
+3. **Start Transcription:** Click "Start Transcription". Progress is shown part by part, with the elapsed time (this may take several minutes for long audio). The controls are locked until the run finishes, so a click cannot cancel it by accident; the History tab stays usable (an entry you open meanwhile fills in when the run ends). The toolbar's **Stop** does cancel it; a request already sent to OpenAI still finishes (and is kept), so the controls come back once it has — usually within seconds — with a note that the run was stopped.
 4. **View & Download:** The transcript preview appears on the right, showing **how long the run took**, with a "Download Transcript" button (and "Download Subtitles (.srt)" when timestamps were enabled).
-5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`. Your transcription **history is kept** (see below).
+    If an OpenAI run stops part-way (no credit left, no connection), you see the **partial transcript** instead, ending with a `⚠️` line that says where it stops and why; it is not saved to history. The finished parts are kept on disk, so **Start** again transcribes only the rest — the app says so under the button when it finds saved parts for your file.
+5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`, including saved parts of unfinished runs, and empties the uploader. It is unavailable while a transcription is running — in any tab — so it can never delete a live run's saved parts. Those saved parts contain transcript text, so they are also deleted automatically after 14 days without use. Your transcription **history is kept** (see below).
 
-In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions, each showing how long it took to produce. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts. Entries recorded before this was added simply omit the timing.
+In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions, each showing how long it took to produce. An entry's text is loaded only when you open it, so a long history does not slow the page down. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts. Entries recorded before this was added simply omit the timing.
 
 ## On-screen context (video) 🖥️
 
-Audio-only transcription misses whatever was *shown* rather than said. Tick **"Describe what's on screen"** when transcribing a video and the app extracts the frames where the picture actually changed, has a vision model describe them, and merges those notes into the transcript by timestamp:
+Audio-only transcription misses whatever was *shown* rather than said. Tick **"Describe what's on screen"** when transcribing a video and the app extracts the frames where the picture actually changed, has a vision model describe them, and places those notes in the transcript at their time:
 
 ```
 🖥️ (0:05) A slide shows the title "Roadmap 2026" with the heading "Phase 1: migration".
@@ -180,7 +186,9 @@ Audio-only transcription misses whatever was *shown* rather than said. Tick **"D
 (0:12) Moving on to what we have planned for next year.
 ```
 
-This needs an **OpenAI API key** even when you transcribe with the local offline engine. Cost is bounded before you start: at most **200 screenshots per video** (about 5 cents on the default model at `low` detail), and recordings where little changes on screen use far fewer. Raise or lower that ceiling with `FRAME_MAX_COUNT` in `.env`. Pick **`high`** detail only when you need to read small text off a slide.
+With `whisper-1` or the local engine the speech has exact times, so each note lands exactly where it belongs. `gpt-4o-transcribe` returns no times, so its paragraphs are stamped `(~M:SS)` from where they sit in their chunk — assuming an even speaking rate — and a note goes before the first paragraph that starts after it. That is usually within a minute; use `whisper-1` or the local engine when it has to be exact.
+
+This needs an **OpenAI API key** even when you transcribe with the local offline engine. If OpenAI refuses the key or the account has no credit, a local run goes ahead without the notes (with a warning), while an OpenAI run stops at once — its transcription would be refused the same way. Descriptions are saved as they arrive, so if the run stops, running it again does not pay for them twice; they are deleted once the run succeeds. Screenshots that could not be described are counted in a warning, not dropped silently. Cost is bounded before you start: at most **200 screenshots per video** (about 5 cents on the default model at `low` detail), and recordings where little changes on screen use far fewer. Raise or lower that ceiling with `FRAME_MAX_COUNT` in `.env`. Pick **`high`** detail only when you need to read small text off a slide.
 
 **"Screenshot at least every N seconds"** sets how often a frame is grabbed even when the picture has not changed — 5 to 300 seconds, 30 by default. Scene changes are always captured *in addition* to this, so a lower value mainly helps with slow fades and gradual changes that never look like a cut. Very short clips get a couple of extra samples so they are not represented by a single frame.
 
@@ -194,30 +202,39 @@ Frames that show nothing useful — a face, a blank desktop — are dropped auto
 
 ## Offline mode (no API key) 🔒
 
-You can transcribe entirely on your machine with a local Whisper model — free, private, and offline. Install the optional backend once:
+You can transcribe entirely on your machine with a local Whisper model — free, private, and offline. Install the optional backend:
 
 ```bash
 uv sync --extra local
 ```
+
+(or `make sync-local`). **A later plain `uv sync` removes it again**, because `uv sync` installs exactly what it is asked for — add `--extra local` every time, or use `make sync`, which keeps the backend when it is installed. If the **Local (offline)** engine disappears from the app, this is why.
 
 Then in the app choose the **Local (offline)** engine and a model size (`base` is a good default). The model downloads from Hugging Face on first use into `models/` and is cached afterwards. Local transcription runs on the **CPU** by default; if you have a working CUDA setup, set `LOCAL_DEVICE=cuda` in `.env`.
 
 ## Configuration 🔑
 
 * **OpenAI API Key (only for the OpenAI engine):** set it in the `.env` file as `OPENAI_API_KEY`, **or** type it into the sidebar at runtime (kept only for the session, never written to disk). The local offline engine needs no key.
-* **Optional `.env` overrides:** `LOCAL_DEVICE` (`cpu`/`cuda`), `WHISPER_MODEL_DIR` (model cache location), `FRAME_MAX_COUNT` (screenshot ceiling for on-screen context; default 200).
+* **Optional `.env` overrides:**
+    * `LOCAL_DEVICE` (`cpu`/`cuda`) and `WHISPER_MODEL_DIR` (model cache location) for the local engine.
+    * `FRAME_MAX_COUNT` — screenshot ceiling for on-screen context (default 200).
+    * `SEGMENT_DURATION_MINUTES` — chunk length sent to OpenAI, 1–15 minutes, for every model. By default it is **5 minutes for `gpt-4o-transcribe`**, whose answers stop at about 2,000 tokens — dense speech reaches that in well under 10 minutes, and the rest of the chunk used to be silently lost — and 10 for `whisper-1`. If an answer still comes back at that limit, the chunk is split once and both halves are transcribed again; a half that hits the limit again is kept and marked `⚠️` in the transcript. Cost is per audio minute, so chunk length does not change the price.
+    * `SERBIAN_LATIN` — `true` by default: Serbian transcripts are rewritten in Latin script, because the model picks Latin or Cyrillic per chunk. Only text recognisable as Serbian (by letters such as ђ, ћ, џ, љ, њ, ј) is touched; set `false` to keep what the model returned. Transcripts saved before this can be converted once with `uv run python scripts/serbian_latin_backfill.py` (reports what it would change) and then `--apply` (backs up the database first).
 
 ## Troubleshooting ⚠️
 
 * **`ffmpeg not found` Error / Runtime Warning:** This is the most common issue. Double-check that `ffmpeg` is correctly installed using **one** of the methods described in the "Installation" section. If you installed it manually (Windows non-Conda), ensure the **correct `bin` folder** path is added to your system's PATH and **restart your terminal/VS Code** afterwards. Verify by running `ffmpeg -version` in a new terminal.
-* **`openai.AuthenticationError`:** Double-check your API key in the `.env` file. Make sure the `.env` file is in the same directory where you run `streamlit run app.py`. Verify your OpenAI account status and billing information.
+* **"OpenAI rejected the API key":** check `OPENAI_API_KEY` in `.env` (in the folder you start the app from) or the key in the sidebar.
+* **"OpenAI credit exhausted":** the account has no prepaid balance left. Add credit at [platform.openai.com/settings/organization/billing](https://platform.openai.com/settings/organization/billing) — for the organization and project the key belongs to — or switch to the **Local (offline)** engine. A new balance can take a few minutes to reach the API.
+* **"Stopped after part N of M":** see step 4 under Usage — press Start again and only the missing parts are sent.
+* **The Local (offline) engine is missing:** the backend is not installed (or a plain `uv sync` removed it) — run `make sync-local`.
 
 ## Development 🧑‍💻
 
 Common tasks are available as Makefile targets (run `make` for the full list):
 
 * `make run` — start the app
-* `make sync` — install dependencies from `uv.lock`
+* `make sync` — install dependencies from `uv.lock`, keeping the offline engine if it is installed (`make sync-local` adds it)
 * `make test` — run the pytest suite
 * `make check` — lint + format check + tests (the same gate as CI)
 * `make lint` / `make format` — ruff
