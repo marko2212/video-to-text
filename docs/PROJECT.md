@@ -38,12 +38,13 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job). No ffmpeg/IO logic inline. |
 | `config.py` | **Pydantic Settings + every constant** (single source of truth): formats, models, paths, limits |
 | `audio.py` | ffmpeg helpers: `save_uploaded_file`, `to_wav` (mono 16 kHz), `to_preview` (small MP3 for the player) — UI-agnostic |
-| `frames.py` | ffmpeg key-frame selection + perceptual dedup for on-screen context |
+| `frames.py` | One-pass video scan (scene changes + 5 s grid, dHash), selection from the scan, single-frame extraction |
 | `vision.py` | Describes those frames with a vision model (cached per frame); cost estimates for the UI |
 | `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed) and `transcribe_local`; transcript rendering |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
 | `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume |
-| `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions) |
+| `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions; opt-in) |
+| `usage.py` | Per-request token and cost records (transcription, vision), totals, USD formatting; pure functions |
 | `db.py` | SQLite history (`data/transcriptions.db`) |
 | `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `OpenAIAccountError`) |
 | `logger.py` | `get_logger()` — stdlib logging (never `print()`) |
@@ -56,13 +57,15 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
        → audio player (MP3 preview for video, AMR/WMA/AIFF and files > 25 MB)
        → pick engine + model  [+ optional on-screen context, video only]
        → Start: request stored, page redrawn with every control locked, job runs
-       → (on-screen context: ffmpeg selects key frames → dedup → vision model,
-          each description cached under temp/checkpoints/)
+       → (on-screen context: one ffmpeg scan per video (temp/scan-<hash>) →
+          select_from_scan for the slider → a frame whose JPEG is shared is taken
+          from the video again at its own time → vision model, each description
+          cached under temp/checkpoints/)
        → OpenAI (5-min chunks for gpt-4o, 10 for whisper-1, cut in pauses; each
           chunk checkpointed; an answer at the output cap is split and redone)
           OR  local (whole file at once)
        → rendering: (M:SS) or (~M:SS) + paragraphs, on-screen notes placed by time,
-          Serbian Cyrillic → Latin → .txt (+ .srt if requested)
+          Serbian Cyrillic → Latin only with SERBIAN_LATIN=true → .txt (+ .srt if requested)
        → write to SQLite history (a partial run is shown, marked, and not saved)
 ```
 
@@ -73,7 +76,7 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 | Chunking | **yes** (5 min for gpt-4o — output cap; 10 for whisper-1) | **no** (whole file) |
 | Timestamps | exact with `whisper-1` (`verbose_json`); approximate `(~M:SS)` with gpt-4o | **always** (native) |
 | Resume after a failure | **yes** (chunk checkpoints) | no (one pass) |
-| Cost | billed per minute | free (costs CPU time) |
+| Cost | per token (gpt-4o-transcribe; per minute only as a `≈` estimate when no usage is reported) or per minute (whisper-1); recorded per run | free (costs CPU time) |
 
 ---
 
@@ -88,6 +91,27 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   that date the API path has no segments, SRT or speaker labels, and the **local engine
   is the only source of timestamps**. The two model decisions below are therefore
   time-limited; the migration is in §5.
+- **No LiteLLM; if a second provider comes, a thin adapter per vendor** *(2026-09-25,
+  researched with sources and a skeptic pass)*. LiteLLM v1.102.1 does route
+  transcription to Gemini, Deepgram, ElevenLabs, Soniox, Groq and others, but it loses
+  what this app needs: its Gemini path cannot send custom vocabulary and turns on
+  diarization with word timestamps (30-minute cap), its Deepgram path never sends the
+  `language` parameter, its Azure path uses the short-audio API, speaker labels are
+  dropped from the normalized output, it requires `openai>=2.20` (the app pins 1.75),
+  and two releases were compromised on PyPI in March 2026 — a poor fit for an app
+  holding API keys and confidential meetings. The app's own logic (25 MB chunks, the
+  output cap, checkpoints) is tuned per provider anyway.
+- **OpenAI is not the only option for Serbian/Macedonian.** Hosted services that
+  officially list both sr and mk and return timestamps (which `gpt-transcribe` does not):
+  ElevenLabs Scribe v2 ($0.22/h, 10 h per file, diarization, 1,000 keyterms; training on
+  content unless opted out), Google Gemini 3.5 Transcribe (~$0.30/h; public preview; 1 h
+  per request, 30 min with timestamps), Deepgram Nova-3 ($0.26/h; `mip_opt_out`), Soniox
+  ($0.10/h; no training), Azure fast transcription ($0.36/h; Serbian returned in Cyrillic;
+  no retention), Amazon Transcribe ($0.36/h). Ruled out for sr/mk: AssemblyAI (Serbian
+  rated >50% WER), Mistral Voxtral and Speechmatics (no sr/mk), Google Chirp 3 (preview,
+  no diarization). No neutral sr/mk benchmark exists; vendor tiers only. Whisper
+  large-v3 (the local engine's best model) scores FLEURS WER sr 11.6 / mk 14.7; the
+  local default `base` is far weaker for South Slavic. See §5 → P1.
 - **`gpt-4o-transcribe` is the default** — measurably more accurate than `whisper-1` in a
   real side-by-side run on the same file ("Microsoft **Stack**" vs "Microsoft's **back**";
   "based in **Serbia**" vs "Croatia, Serbia"). **But it returns no timestamps** — the API
@@ -113,7 +137,8 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   *(2026-09-25)*. The gpt-4o family stops writing at about 2,000 output tokens per
   request; dense Serbian speech reaches 2,450–2,920 tokens per 10 minutes, and one
   measured chunk lost its last 30–45 s with no warning. Five minutes peaks near 1,460.
-  Billing is per audio minute, so it costs nothing extra. `SEGMENT_DURATION_MINUTES`
+  The price follows the audio length (per minute for whisper-1, audio tokens for
+  gpt-4o-transcribe), so it costs nothing extra. `SEGMENT_DURATION_MINUTES`
   overrides it for every model (1–15; 15 keeps a chunk under 25 MB). Unknown models get
   5 until their cap is known.
 - **An answer at the cap is split and redone — once** — `usage.output_tokens` ≥ 1,900
@@ -122,8 +147,9 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   speech (dense Serbian is ~730 tokens per 2.5 min), so it is kept with a visible
   "⚠️ … may be missing" line rather than split further — unlimited splitting cost up to
   4× on a looping chunk. With 5-minute chunks the guard should rarely fire. `usage` is read from the response (SDK 1.75 keeps unknown fields);
-  whether gpt-4o-transcribe actually returns it could not be confirmed live yet (no
-  credit) — without it the guard stays silent and the shorter chunks are the protection.
+  confirmed live on 2026-09-25: gpt-4o-transcribe returns it (300 input / 79 output
+  tokens for a 30 s clip). If an answer ever lacks it, the guard stays silent and the
+  shorter chunks are the protection.
 - **Chunks are cut in pauses, and tiny tails are merged** — each boundary moves to the
   quietest 250 ms window within ±10 s of the nominal cut, so shorter chunks do not
   mean more words cut in half; a final chunk under 10 s joins the previous one. The
@@ -157,15 +183,16 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   `temp/frames` could otherwise cache one video's screens under another's hash; a
   folder left by a killed process is deleted after 24 hours (never while a run is
   active, since a screenshot folder can sit unchanged for over an hour).
-- **Serbian comes out in Latin script** *(2026-09-25)*. Without a language hint the
-  model picks the script per chunk, so a meeting read LLL CCC LLL in chunk-sized blocks
-  (7 saved records, 2 calls fully Cyrillic). A deterministic 1:1 transliteration runs
-  on the finished document when it is recognisably Serbian — Serbian-only letters
-  (ђ ћ џ љ њ ј) present and outnumbering letters Serbian never uses — so Russian or
-  Bulgarian is never touched. Chosen over `language="sr"` + a prompt because it is
-  guaranteed (the prompt is a hint, and `sr` alone may push towards Cyrillic) and it
-  also works for the local engine. `SERBIAN_LATIN=false` turns it off. Old records are
-  converted only by an explicit one-off script, after a verified backup.
+- **Transcripts keep the script the model returned; Serbian → Latin is opt-in**
+  *(2026-09-25)*. Without a language hint the model picks the script per chunk, so a
+  Serbian meeting can read LLL CCC LLL in chunk-sized blocks (7 saved records). A
+  deterministic 1:1 transliteration exists (`SERBIAN_LATIN=true`): it runs when the text
+  is recognisably Serbian — Serbian-only letters (ђ ћ џ љ њ ј) outnumbering letters
+  Serbian never uses. It was on by default for a few hours and was turned off, and the
+  10 converted records put back, at the owner's request: Macedonian colleagues use the
+  app, Macedonian shares exactly those letters and would be rewritten in *Serbian*
+  Latin (ќ→ć, ѓ→đ), and a transcript read by another AI does not need one script. No
+  per-run switch in the UI either (the owner's call).
 
 ### On-screen context (video)
 - **Coverage is guaranteed by time sampling, not by scene detection.** ffmpeg's
@@ -191,17 +218,58 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **The sampling interval is a UI slider** (5–300 s, default 30). It is an *upper*
   bound — scene changes are captured on top of it — so the label reads "at least
   every".
-- **The expected screenshot count is shown before the run**, from the video's
-  duration over the effective interval, alongside the estimated cost. It counts
-  only what the interval guarantees, so it reads high when deduplication kicks in
-  and low on a video full of cuts — the caption says so rather than implying a
-  promise. Measured against real extractions on a 25 s clip it matched exactly at
-  10/30/300 s and over-counted 6 vs 3 at 5 s, where dedup did its job. The
-  duration probe is cached on path plus file size, so dragging the slider does
-  not spawn an `ffprobe` per rerun.
+- **The screenshot count shown before the run is exact, from a scan of the video**
+  *(2026-09-25)*. It used to be the video's length over the interval, which is not
+  what gets described: on four real recordings a static 115-minute meeting estimated
+  at 231 screenshots described 10, and a busy 16-minute screen share estimated at 4
+  described 28 — the number described is the number of *distinct screens*. Now
+  ticking the box scans the video once (`frames.scan_video`): one ffmpeg pass keeps
+  every scene change plus a frame every 5 s (the slider's finest step), with each
+  frame's scene score and perceptual hash, and a run of near-identical frames keeps
+  one JPEG (the static 115-minute meeting: 1,390 frames, 2 MB instead of 253 MB).
+  `frames.select_from_scan` then gives the selection for any slider position in
+  under a millisecond — every scene change, the first grid frame after each
+  interval, one frame per burst, repeats dropped, the cap — and **the run describes
+  exactly that selection**. The scan costs about the time the old extraction took
+  (170 s for 115 min, 23 s for 16 min); it is stored as `temp/scan-<hash of the
+  video>/` until clean-up or 24 h, with its threshold and grid, so a scan made with
+  other settings is redone. Interval samples may come up to one grid step (5 s) later
+  than the exact interval. The fallback when a scan fails is the old rough
+  length-over-interval guess, said to be a guess.
+- **A frame whose JPEG is shared is taken from the video again before it is
+  described** *(2026-09-27, review finding S1)*. The shared JPEG is only a disk
+  saving: "near-identical" is the 8×8 hash's opinion, and two slides of one template
+  hash within 1 bit. Describing the shared JPEG put an earlier screen under a later
+  time (a synthetic deck: the 2:00 note described the previous slide; a typing
+  editor: pictures up to 100 s old), and a slide that only ever shared a picture was
+  never described. Each frame now records `shared`, and `frames.pictures` seeks to
+  the frame's own time (`ffmpeg -ss`) when it is about to be described — only for
+  frames not in the description cache. Measured with real ffmpeg: the extracted
+  JPEG is byte-identical to what the scan wrote at that time (80 of 80 frames on two
+  synthetic videos; the review then confirmed it for MP4, MKV, WebM with and without
+  cues, AVI, WMV, VFR, edit lists, a start offset and a one-hour file), 0.2–0.3 s per
+  frame, so 200 frames add about a minute at worst to a run that spends several
+  seconds per description anyway. Keeping every JPEG instead would bring back the
+  253 MB. **Not in containers without an index** (MPEG-TS/PS: .ts, .mts, .m2ts, .mpg,
+  .mpeg, .vob): there the seek landed up to a keyframe interval late — the next slide
+  under the label — or wrote nothing in the last GOP, so the scan keeps every frame's
+  own JPEG for them (`FRAME_UNINDEXED_FORMATS`). As a last check, an extracted frame
+  whose hash is more than 2 bits from the scan's falls back to the shared JPEG.
 - **The cost estimate includes output tokens.** Counting only image tokens
   understated it by about half, because a caption's output tokens are priced
   several times higher than input ones.
+- **Image tokens are measured, not assumed** *(2026-09-25)*. Real requests: a
+  1920×1080 frame costs 2,519 input tokens and a 1280×720 one 1,175 on gpt-5.4-nano
+  and -mini alike — roughly proportional to the pixel count — and `detail` low or high
+  makes no difference. The estimate had assumed 630 (half or less). Downscaling frames
+  before upload (R42) would now cut the cost roughly in proportion.
+- **A burst keeps its last frame** *(2026-09-25, R09)*. Frames less than 2 s apart
+  count as one burst; keeping the *first* threw away the scene-change frame whenever a
+  slide changed within 2 s after an interval sample — on the test video slide 4 (cut at
+  41.5 s) was stamped 46.5 s or 51.5 s, a whole interval late, and a slide shown
+  briefly could be lost. Now every interval from 5 to 300 s catches it at 41.53 s, and
+  every kept frame shows the slide that was on screen at its time (checked by
+  perceptual hash against the slide images).
 - **Short videos get tightened, but only just.** A clip shorter than the chosen
   interval would be represented by a single frame, so the interval drops to
   `duration / 2`. An earlier version aimed for ~8 samples, which silently
@@ -210,8 +278,9 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **Deduplication runs before anything is sent**, so discarded frames cost
   nothing. Measured on a meeting-shaped video (4 slides held 30 s each): ffmpeg
   produced 30 candidates, dedup kept 4 — the slide boundaries — and 86% of the
-  frames never reached the API. This is also why the UI estimate is an upper
-  bound: it is computed before dedup, so the real spend is usually lower.
+  frames never reached the API. The count shown before a run is taken from the
+  scan after this dedup (and the cap), so it is the number described; only the rough
+  guess shown while a job runs without a stored scan ignores scene changes and dedup.
   The model's own `NONE` reply is a second filter, but it costs a request and
   only keeps the transcript clean.
 - **Deduplication uses a 64-bit dHash, threshold 2.** Bigger hashes measured
@@ -222,19 +291,65 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   not its predecessor, so a slow fade cannot ratchet past the threshold.
   **Known limit:** a slide differing only in a word or number is ~1 bit away —
   inside the noise floor — so it is treated as a duplicate and dropped.
+- **The job reads its settings from the page it draws, and owns its run from the
+  first line** *(2026-09-27, review findings C4 and C6)*. Start used to capture the
+  settings in its click; clicked while the page was still busy (ticking on-screen
+  context starts a scan of a minute or more), it carried the previous run's settings
+  and transcribed without screenshots. Now the click only records that a job was
+  requested; the job run takes the settings from the widgets it draws (locked, so
+  unchanged). The run is also the job's owner from `main()`'s first line, and while a
+  job runs the settings panel only *loads* a stored scan, never starts one: a Stop
+  during such a scan used to leave a job with no owner — every control locked, and
+  the next rerun ran the stopped job.
+- **A failed scan is remembered per video; one scan per video at a time**
+  *(2026-09-27, review findings C1/C5/C7)*. A failed scan used to run again on every
+  rerun (each slider step), and every rerun during a long scan started another full
+  decode of the same video. Failures are kept in the session until the box is
+  unticked; a lock per scan folder makes a second caller wait and load the result.
+  The warning shows the last lines of ffmpeg's log, not its 2,000-character banner, and
+  a file with no picture stream says so instead of promising screenshots.
+- **Costs of work paid in an earlier, unsaved attempt land in a row** *(2026-09-27,
+  review findings C9–C14)*. Only the descriptions a saved row used are marked as
+  counted; when a complete run discards the description cache, entries no row has
+  counted are added to that row. Split markers and halves saved before cost recording
+  count as per-minute estimates, not as free; a partial run reports the length its
+  transcript covers; a first chunk that fails after a paid split says what it spent;
+  an answer without choices still counts its tokens.
+- **The dHash rule stays, although it merges same-template slides** *(2026-09-27,
+  review finding S3)*. Two slides of one template are 0–1 bits apart, and so are
+  frames a few code lines apart, so the second one is never described. A study
+  replaced the dHash with three thumbnail-based rules (motion masks for webcams,
+  pointer tolerance), each measured on 7 synthetic videos with exact ground truth and
+  then cross-checked on 21 more adversarial ones: the two finalists caught every
+  reachable change (58/58 states against 45 at slider 5) with 0–1 extra frames. **On
+  the owner's real recordings they made things worse.** Counts on five recordings (at
+  30 s): 4 → 15 and 33 → 64 described; with the owner's OK, 13 of the disputed frame
+  pairs were looked at, and 12 differed only in the Teams UI — the active-speaker
+  border moving between tiles, the participant tiles rearranging, a hover preview, a
+  page still loading. The participants were avatars, so the motion masks had nothing
+  to learn from, and a thin border reads like a new line of text. One finalist also
+  described 13 fewer of 45 frames on a busy screen share, because its mask covered 60%
+  of the screen. Shipping either would have cost ~500 lines, 10–15 tuned constants
+  and a second ffmpeg stream in the scan, for more noise on the recordings that
+  matter. What would change this: a rule that ignores the call UI (speaker border,
+  tile layout) — see §5 P3.
 - **The frame cap is a backstop, not the control.** It was originally 40, which
   was low enough to bind at *every* slider position on an 83-minute meeting —
   the estimate sat at "about 40… never more than 40" and dragging the slider
   changed nothing. Raised to 200: the real constraint is wall-clock (one request
-  per frame), not money, since 200 frames is roughly 5 cents.
-- **The cap widens the interval up front** rather than extracting and discarding.
-  Clamping afterwards would write ~1,000 JPEGs and hash them only to throw most
-  away. When it binds, the UI says so and shows the interval that will actually
-  be used, instead of silently ignoring the chosen one.
-- **Widening beats truncating** when the cap binds. Taking the first N frames
-  would cover only the opening stretch of a recording; widening keeps coverage
-  from start to finish and degrades resolution instead. What is lost is temporal
-  detail, which degrades gracefully — whole missing sections do not.
+  per frame), not money — 200 Full HD frames are about 12 cents on the default
+  gpt-5.4-nano (about 45 on mini; the old "5 cents" assumed 630 tokens per frame).
+- **When the cap binds, the screenshots are spread evenly** rather than truncated,
+  and the UI says so with both numbers ("One every 5 s would give 204 screenshots,
+  over the 200-screenshot limit, so 200 will be described, spread evenly…") instead
+  of silently ignoring the chosen interval. Taking the first N frames would cover
+  only the opening stretch; spreading keeps coverage from start to finish. The
+  scan-based selection no longer *widens the interval* to fit the cap *(2026-09-27,
+  review finding S2)*: grid frames are 5 s apart, so a widened 5.1 s snapped to the
+  next grid frame 10 s later and a 17-minute video at slider 5 got 122 screenshots
+  where the cap allowed 200, under a caption that still said "every 5 s". Widening
+  up front only made sense when frames were extracted per run; with the scan they
+  exist already. The rough no-scan estimate still widens.
 - **`FRAME_MAX_COUNT` is a Settings field, not a bare constant**, so it can be
   set per machine in `.env`. The module constant is only the default; call sites
   resolve it at call time, because a default argument would freeze the value at
@@ -367,11 +482,23 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **PRAGMA `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`** — better defaults
   for Streamlit's rerun model and multiple open sessions.
 - **Migration without a migration tool:** `init_db()` checks `PRAGMA table_info` and adds
-  any missing column — currently `provider` and `elapsed_seconds` — so existing
+  any missing column — currently `provider`, `elapsed_seconds`, `cost_usd` and
+  `usage_json` — so existing
   databases are not lost. New columns must be nullable, since existing rows have
   no value for them.
 - **Audio is NOT stored as a BLOB** — only the transcript and SRT text; `audio_path` is a
   best-effort reference that may disappear after a cleanup.
+- **Every run records what it actually used and cost** *(2026-09-25)* — per history row
+  `cost_usd` and `usage_json` (requests, audio seconds, input → output tokens for the
+  transcription and for the screenshots). Tokens are the ones the API reports in each
+  answer's `usage`; the cost is those tokens at the prices in `config.py` (checked on
+  OpenAI's pricing pages), or audio minutes for models billed per minute (whisper-1,
+  gpt-transcribe). When an answer carries no usage, the per-minute estimate is used and
+  the figure is shown with `≈`. Each record travels with its checkpointed result, so a
+  resumed run counts what its first attempt paid, and a capped answer that was split
+  counts too. The owner's question "how much does a clip cost?" had no answer before:
+  the app knew only its own pre-run estimate. The OpenAI dashboard (Usage) remains the
+  authority for billing; this is per transcript.
 - **Run time is measured in `app.py`, around the whole click**, not inside the
   pipeline: on-screen context can dominate the wait, and the number worth
   reporting is how long the user actually sat there. Stored per run in a new
@@ -428,16 +555,18 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **On-screen context** for video: key frames described by a vision model and placed
   in the transcript by time — exactly with whisper-1 or the local engine, at
   approximate `(~M:SS)` paragraphs with the default gpt-4o-transcribe *(2026-09-25)* —
-  with a selectable screenshot interval and a pre-run estimate of the screenshot count
-  and cost *(2026-07-20)*
+  with a selectable screenshot interval *(2026-07-20)* and an exact screenshot count
+  and cost before the run, from a one-pass scan of the video *(2026-09-27)*
 - **Reliable long runs** *(2026-09-25)*: 5-minute chunks cut in pauses (no silent
   truncation at the output cap), checkpoints so a failed or stopped run resumes without
   paying again, partial transcripts clearly marked, one-sentence errors for a bad key
   or an empty balance, controls locked during a run with a watchdog after Stop
-- **Serbian always in Latin script** *(2026-09-25)*; one-off backfill script for old records
+- **Original script kept by default**; Serbian → Latin is opt-in (`SERBIAN_LATIN=true`)
+  *(2026-09-25)*; one-off backfill script for saved records
 - **Playable previews** for AMR/WMA/AIFF, video and large files; fast History at 100+
   records *(2026-09-25)*
 - **Run time reported** next to the transcript and in history *(2026-07-28)*
+- **Actual tokens and cost of every run** next to the transcript and in history *(2026-09-25)*
 - **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
 - **Hybrid API key** (`.env` or sidebar); offline works with no key
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
@@ -445,7 +574,7 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 152 tests** (DB CRUD + PRAGMAs + schema migration, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 210 tests** (DB CRUD + PRAGMAs + schema migration, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -488,7 +617,9 @@ Reasons and measurements are in §3 and the journal.
 - [x] **Serbian script** (R02) — Latin in every new transcript; the 10 affected saved
       records converted with the owner's OK (backup
       `data/transcriptions.db-backup-2026-09-25-145853-serbian-latin`; the other 92 rows
-      byte-identical, integrity ok).
+      byte-identical, integrity ok). **Later reversed at the owner's request:**
+      `SERBIAN_LATIN` is off by default and the 10 rows were restored to their original
+      script (§3, journal 2026-09-25).
 - [x] **Paid work kept** (R03 + G01) — chunk, half-chunk and frame checkpoints; partial
       transcript with a marker; resume hint and notices counted from disk; pruned after
       14 days; clean-up refused while any run is live.
@@ -500,24 +631,62 @@ Reasons and measurements are in §3 and the journal.
 - [x] **AMR/WMA/AIFF play** (R22) — verified: AMR duration 56.4 s, previously NaN.
 - [x] **Notes placed by time with the default model** (R12) — approximate `(~M:SS)`
       paragraphs; help text and README say where it is exact.
+- [x] **Burst thinning keeps the settled frame** (R09) — found again while checking the
+      screenshot count; see §3.
 - [x] Partly: per-run scratch folders for chunks and frames (R07); CI `--locked` and a
       3.12 + 3.13 matrix (R33); the dead `default_model` setting removed and
       `SEGMENT_DURATION_MINUTES` wired (R46); fake-client tests for the paid pipeline
       (R52); automatic pruning of checkpoints (R48).
 
+### Done 2026-09-27 — scan review findings (S1–S4) and the second review
+
+The work after commit 46f3212 — real tokens and cost per record (`usage.py`, DB
+columns), the original script kept (`SERBIAN_LATIN` off), and the video scan with the
+exact screenshot count — was held back until the scan was reviewed. The first review
+(workflow `wf_6030706f-ea1`) stopped mid-run with 4 scan findings; the second covered
+scan, UI, cost and docs. Committed and pushed with the owner's approval ("komituj i
+pušuj"). Gate: 210 tests pass, ruff clean.
+
+- [x] **S1 (high, regression) — a described screenshot could show an earlier
+      screen.** Fixed 2026-09-27: shared frames are marked and re-extracted at their own
+      time before being described (§3); byte-identical to the scan's frame.
+- [x] **S2 (medium, regression) — the cap-widened interval snapped to the 5 s grid.**
+      Fixed 2026-09-27: no widening in the scan selection, the cap spreads evenly and
+      the caption gives both numbers (§3).
+- [x] **S3 (medium, pre-existing) — the 8×8 dhash calls different screens repeats.**
+      Studied 2026-09-27 and **not changed**: the candidate rules add mostly Teams UI
+      noise on the owner's real recordings (§3). The picture-sharing part is solved by
+      S1. Follow-up in P3.
+- [x] **S4 (low) — `extract_keyframes` defaulted to a shared `temp/frames`.** Fixed
+      2026-09-27: the function (no callers) is deleted, and a scan stores its threshold
+      and grid, so one made with other settings is redone.
+- [x] Regression tests for S1/S2/S4, each checked by putting its bug back (9 of 9 caught).
+- [x] Second adversarial review (4 lenses: scan, UI, cost, docs; a skeptic per finding):
+      26 confirmed, 1 refuted — all fixed (§3 entries of 2026-09-27; journal), each code
+      fix with a regression test that fails with its bug put back (17 of 17).
+- [x] Committed and pushed (code, then docs), CI on GitHub.
+
 ### Waiting for the owner
-- [ ] **OpenAI credit is not visible to the key.** After the owner's top-ups the API still
-      answered `429 credit_balance_exhausted` (2026-09-25 06:18, 07:10, and the owner's own
-      run on a 1:55 video in the afternoon). None of the agents' calls that day got through
-      (every paid request was rejected, so nothing was billed). The key is a project key
-      (`sk-proj-`): check in the dashboard that the credit went to the organization that
-      owns that project, that the payment completed, and that the project has no $0 budget.
-- [ ] **Live check of the OpenAI path once credit works** — only with the owner's OK for
-      that spend (a few cents, synthetic fixtures only): `usage.output_tokens` is present in gpt-4o-transcribe answers (the cap guard
-      depends on it), `(~M:SS)` + notes on `meeting.mp4`, and a resumed run after a forced
-      failure.
+- [x] **The key and the credit were on different accounts** — resolved 2026-09-25: the
+      old key belonged to another OpenAI login (balance $0); the owner put a key from the
+      funded marko2212 account into `.env`.
+- [x] **Live check of the OpenAI path** (with the owner's OK, synthetic 30 s video):
+      gpt-4o-transcribe + 3 screenshots on nano, $0.0023 in total; `usage` is returned
+      (300 input / 79 output tokens for 30 s — so the cap guard works on real answers),
+      `(~M:SS)` paragraphs with the notes in place, the cost saved with the row.
+      Still untested live: a resumed run after a real failure.
 
 ### P1 — transcript correctness
+- [ ] **Blind test of providers on real audio before 2027-02-26** (M). 10–15 min of real
+      Serbian and Macedonian meeting audio plus an AMR call, hand-corrected reference;
+      candidates: gpt-transcribe, ElevenLabs Scribe v2 (Data-use opt-out on), Gemini 3.5
+      Transcribe (paid tier), Deepgram Nova-3 (language sr/mk, `mip_opt_out`), Soniox;
+      compare WER and which script each returns. The winner gets a thin adapter at the
+      two call sites (`transcribe._request`, `vision._describe_frame`). Costs a few
+      dollars across vendors — the owner decides.
+- [ ] **Local default model** (S). `base` is weak for South Slavic; `large-v3-turbo`
+      (1.6 GB) or `medium` would be the honest default — measure CPU time on a real
+      meeting first.
 - [ ] **Migrate to `gpt-transcribe` before 2027-02-26** (deprecation + R26, M). WER check
       on the fixture and on one real Serbian meeting judged by the owner, then make it the
       default; `languages=["sr","en"]`, a Latin-script `prompt`, an optional keywords
@@ -540,16 +709,24 @@ Reasons and measurements are in §3 and the journal.
       Twice as many chunks since R01 make this more worthwhile.
 
 ### P3 — on-screen context quality
-- [ ] **Burst thinning keeps the wrong frame** (R09, S). `apply_min_interval` should keep the
-      last, settled frame of a burst, not the first.
 - [ ] **The caption prompt describes the call window** (R29, S). Describe only shared
       content; NONE for a participant grid (12–24% of notes are only about the call UI).
       Bump `vision._CACHE_VERSION` with it.
 - [ ] Smaller: a pixel-diff second opinion for panel-sized changes dHash misses (R28);
       repeated screens re-captioned (R40); downscale frames to 512 px, ~83% less upload
-      (R42); honest time/cost estimate and recorded usage (R39); faster scene scan (R41).
+      (R42); an honest time estimate — recorded usage is done, see §3 (R39); faster
+      scene scan (R41).
 - [ ] **Local OCR as a cheaper visual layer** — reads slide text for zero tokens and fixes
       the "slides differing only in text" dedup limit; adds a second system binary.
+- [ ] **A duplicate-screen rule that sees same-template slides but not the call UI**
+      (L; S3, §3). Thumbnail rules with motion masks were built and measured
+      2026-09-27; on real Teams recordings they counted the active-speaker border and
+      tile rearrangements as new screens. Needs a way to ignore the participant area
+      (avatars do not move) before it can replace the dHash. A cheap side finding:
+      comparing with the last three kept screens instead of one stops a screen that
+      toggles back and forth from being described each time (a real 29-minute call at
+      slider 5: 23 → 4 frames with the dHash alone) — not adopted, since it also drops
+      a genuine return to an earlier slide.
 
 ### P4 — hygiene
 - [ ] Rest of R07: transcript output files (`temp/transcript_<name>.txt`) and uploads are
@@ -589,6 +766,43 @@ Reasons and measurements are in §3 and the journal.
 ---
 
 ## 6. Journal
+
+### 2026-09-27 (part 2) — S1, S2, S4 fixed; S3 studied and left as it is
+
+**S1:** a frame whose JPEG the scan shares is now taken from the video again at its own
+time just before it is described (`frames.pictures`); on real ffmpeg the extracted
+JPEG was byte-identical to what the scan had written (80/80 frames, two synthetic
+videos), 0.2–0.3 s each. **S2:** the scan selection no longer widens the interval to
+fit the cap; the cap spreads the frames and the caption says so with both numbers.
+**S4:** `extract_keyframes` deleted; a scan records its threshold and grid. Each fix
+has a regression test that fails when its bug is put back (9 of 9). 192 tests pass.
+
+**Second review, then fixes.** Four lenses (scan, UI, cost, docs) with a skeptic
+per finding, each agent on its own copy of the code with no `.env` and a dead
+`OPENAI_BASE_URL`: 26 findings confirmed, 1 refuted. The four medium ones: MPEG-TS/PS
+seeks land late (C0), a Start clicked during a scan ran without screenshots (C4),
+reruns during a scan started parallel scans (C5), and a Stop during a scan locked the
+page (C6). All 26 are fixed or corrected in the docs; 17 regression tests, each shown
+to fail with its bug put back. 210 tests pass.
+
+**S3:** a study with 9 agents (synthetic corpus with exact ground truth, three rule
+families, two judges, cross-validation) produced two rules that were near-perfect on
+synthetic video. Measured on the owner's five real recordings (counts only, in an
+isolated folder, derivatives deleted afterwards; real folders verified unchanged),
+then — with the owner's explicit OK — 13 disputed frame pairs viewed: 12 were Teams
+UI changes, not content. Not shipped; reasons in §3, follow-up in §5 P3. The laptop
+slept for six hours in the middle of the study (Modern Standby), which is why it took
+most of the day.
+
+### 2026-09-27 — Scan review: two regressions found, commit held
+
+The adversarial review of the uncommitted scan work ran partly (the session ended
+mid-run; journal `wf_6030706f-ea1`). The scan lens found, and a skeptic per finding
+reproduced on synthetic videos, one high and one medium regression plus two smaller
+items — listed with the corrected fixes in §5 (Done 2026-09-27). The main one: sharing one JPEG
+across near-identical frames made the describer see an earlier screen than the time on
+the note (same-template slides collide at dhash distance 0–1). The UI lens did not
+finish. Nothing is committed yet; the owner's approval to commit and push stands.
 
 ### 2026-09-25 (part 2) — The owner's table: P0 plus the chosen P1–P3 items
 
@@ -638,8 +852,8 @@ uploads (a 150 MB WAV) to the player; the watchdog's first version cancelled eve
 because a fragment's body also runs inline when it is drawn (AppTest showed it at once);
 a heredoc turned `[\\/]` into `[\/]` in the upload-name regex.
 
-**Not verified live, because the account still has no credit:** the OpenAI API answered
-`429 credit_balance_exhausted` after the $10 purchase (06:18 and again 07:10). So the
+**Not verified live, because the key has no credit:** the OpenAI API answered
+`429 credit_balance_exhausted` after the owner's purchase (06:18 and again 07:10). So the
 gpt-4o path — `usage.output_tokens` in real answers, `(~M:SS)` with notes, resume after a
 real failure — is covered by fake-client tests only. §5 → "Waiting for the owner".
 
@@ -654,12 +868,41 @@ entries; Clean could delete a history folder placed inside TEMP_DIR. All fixed, 
 with a regression test that fails when the bug is put back (9 of 9), and the two-tab
 case checked in a browser. 152 tests.
 
+**Evening — costs, billing, script, screenshots.** Asked by the owner:
+- *Record real tokens and cost per run* — built (§3), reviewed by 2 reviewers + a
+  skeptic per finding (4 confirmed: a kept screenshot cache counted twice after a
+  saved run, a partial run's spend invisible, the audio length doubled on a split,
+  pre-change checkpoints counted as free / History dropping `≈`; all fixed with tests).
+- *Why "no credit" with $5 on the dashboard* — the key in `.env` belonged to a different
+  OpenAI login; read-only look at the dashboard (API keys, projects, organizations,
+  billing history). The owner swapped the key.
+- *Test with a small video* — a 30 s synthetic clip through the real API: $0.0023, all
+  paths working (§5). Three more one-frame requests measured image tokens ($0.003).
+- *Keep the original script, restore the old records* — `SERBIAN_LATIN` now defaults to
+  off; the 10 converted rows were restored from the pre-conversion copy after another
+  verified backup (only rows untouched since, 10 of 10; the other 92 identical).
+- *Is the screenshot estimate right, and are frames cut right?* — cutting: every kept
+  frame matches the slide on screen at its time; but the burst rule could stamp a new
+  slide a whole interval late (fixed, §3). The estimate counts only interval samples:
+  on the owner's longest real video (115 min, mostly static after minute 10) it said
+  29 at 245 s and 116 at 60 s while 10 were kept either way, because identical frames
+  are dropped; on a busy screen, scene changes add frames the estimate never counted.
+
+**Exact screenshot count** (approved by the owner after the measurements above). The
+video is scanned once when on-screen context is ticked; the caption's count comes
+from the scan and the run describes exactly those frames (checked in a browser with a
+fake client: 4 shown, 4 described). On the real recordings the scan-based counts match
+the old extraction within one frame (115 min: 11 vs 10; 16 min: 28 vs 28 at 245 s,
+45 vs 46 at 30 s), and the scan takes about what the extraction took.
+
 **Later the same day:** the owner approved the Serbian backfill — 10 records converted
 after a verified backup, the other 92 byte-identical — and the commit. The owner's own
 test on a 1:55 video hit the empty balance as well; a scan of every transcript of this
 session (main and all agents) found no successful paid request, so the missing credit
 is a billing question, not spending by the tests. From now on agents never use the
-owner's key for tests (fake clients only). Still open: where the credit went.
+owner's key for tests (fake clients only). The cause, found afterwards in the
+dashboard: the key in `.env` belongs to a different OpenAI account than the one the
+owner topped up (§5 → "Waiting for the owner").
 
 **Conclusions worth keeping:**
 - In Streamlit, "Stop" and every widget change stop a script only at its next Streamlit
@@ -740,7 +983,7 @@ app's own bugs (placeholder, click-abort, AMR, default all-interfaces bind, tele
 Verdict: upgrade with those fixes, as the first step of the fix series; no urgency.
 
 **Later the same day — P0 approved and started.** The owner approved the P0 group and
-the deletion of rows 48–49, and topped up the OpenAI account ($10; bought by the owner,
+the deletion of rows 48–49, and topped up an OpenAI account ($5, bought by the owner — to a different account than the key's, as it later turned out;
 not by the agent). Done so far:
 - Rows 48 and 49 deleted by a script that refused to act unless both rows still matched
   every test-artefact trait (2026-07-28 14:2x/14:3x, Local, `tiny`, < 0.01 s, 29 chars,
