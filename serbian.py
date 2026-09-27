@@ -3,8 +3,9 @@
 Serbian is written in both scripts, and the transcription API picks one per
 request: without a language hint, a long meeting sent in chunks came back as
 alternating blocks of Latin and Cyrillic, and a few phone calls entirely in
-Cyrillic. A deterministic 1:1 transliteration makes every transcript Latin
-regardless of what the model chose. It runs only on text that is recognisably
+Cyrillic. A deterministic 1:1 transliteration can make a transcript Latin
+regardless of what the model chose (opt-in via ``SERBIAN_LATIN``, off by default,
+so Macedonian stays Cyrillic). It runs only on text that is recognisably
 Serbian, so Russian or Bulgarian Cyrillic is never rewritten. Pure functions,
 no I/O.
 """

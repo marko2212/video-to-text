@@ -14,8 +14,8 @@ Streamlit call — possibly a minute later, after a paid request returns.
 """
 
 import importlib.util
+import json
 import shutil
-import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -29,6 +29,7 @@ import checkpoints
 import db
 import frames
 import transcribe
+import usage
 import vision
 from config import (
     AUDIO_FORMATS,
@@ -73,6 +74,7 @@ _RUN_STATE_KEYS = (
     "transcript_path",
     "srt_path",
     "elapsed_seconds",
+    "run_cost",
     "partial",
     "run_notices",
 )
@@ -85,6 +87,7 @@ _SESSION_KEYS = (
     "upload_id",
     "job",
     "uploader_generation",
+    "scan_failures",
 )
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -241,6 +244,7 @@ def save_to_history(
     transcript_path: Path | None = st.session_state.transcript_path
     if not transcript_path or not transcript_path.exists():
         return
+    cost: dict[str, Any] | None = st.session_state.get("run_cost")
 
     srt_path: Path | None = st.session_state.srt_path
     srt_text = srt_path.read_text(encoding="utf-8") if srt_path else None
@@ -261,6 +265,8 @@ def save_to_history(
         audio_path=str(audio_path) if audio_path else None,
         file_size_mb=file_size_mb,
         elapsed_seconds=st.session_state.elapsed_seconds,
+        cost_usd=cost["cost_usd"] if cost else None,
+        usage_json=json.dumps(cost) if cost else None,
     )
 
 
@@ -452,18 +458,103 @@ def _format_length(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
-def _screenshot_estimate(interval: float, model: str, detail: str) -> str:
-    """Describe how many screenshots the current settings are likely to take.
+def _scan_dir(video_path: Path) -> Path:
+    """Return where the scan of a video is kept (named after its content).
 
     Args:
+        video_path: The uploaded video.
+
+    Returns:
+        A folder under ``temp_dir``, removed by clean-up or after a day.
+    """
+    return get_settings().temp_dir / f"scan-{_digest(video_path)}"
+
+
+def _scan_video(video_path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Scan the video once (a stored scan is reused), remembering a failure.
+
+    A failed scan used to run again on every rerun — each slider move — and a
+    late failure costs a full decode each time.
+
+    Args:
+        video_path: The uploaded video.
+
+    Returns:
+        The scan from :func:`frames.scan_video`, or ``None`` and why it failed.
+    """
+    failures = st.session_state.get("scan_failures") or {}
+    key = _digest(video_path)
+    if key in failures:
+        return None, failures[key]
+    try:
+        with st.spinner(
+            "Scanning the video for screen changes — once per video, about a "
+            "minute and a half per hour of video…",
+            show_time=True,
+        ):
+            return frames.scan_video(video_path, _scan_dir(video_path)), None
+    except (AppError, OSError) as exc:
+        logger.warning("Video scan failed: %s", exc)
+        st.session_state.scan_failures = {**failures, key: str(exc)}
+        return None, str(exc)
+
+
+def _scanned_estimate(
+    scan: dict[str, Any], interval: float, model: str, detail: str
+) -> str:
+    """Say exactly how many screenshots a run will describe, and the cost.
+
+    Args:
+        scan: The video's scan.
         interval: Chosen maximum seconds between screenshots.
         model: Selected vision model.
         detail: Selected image fidelity.
 
     Returns:
-        A caption stating the expected count and cost, and saying so plainly
-        when the frame cap overrides the chosen interval.
+        A caption with the count the run will use — the same selection.
     """
+    cap = frames.max_frames_setting()
+    # select_from_scan is exactly these candidates capped; the run calls it.
+    candidates = frames.candidates_from_scan(scan, interval)
+    chosen = frames.cap_frame_count(candidates, cap)
+    tokens = (
+        vision.frame_tokens(scan["width"], scan["height"]) if scan["width"] else None
+    )
+    cost = _format_cost(vision.estimate_frame_cost(len(chosen), model, detail, tokens))
+    length = _format_length(scan["duration"])
+    if len(candidates) > len(chosen):
+        return (
+            f"One every {interval:.0f} s would give {len(candidates)} screenshots, "
+            f"over the {cap}-screenshot limit, so **{len(chosen)}** will be "
+            f"described, spread evenly over the video ({cost}) — counted from a "
+            f"scan of this {length} video."
+        )
+    used = frames.effective_interval(scan["duration"], interval, max_frames=0)
+    return (
+        f"**{len(chosen)}** screenshots will be described ({cost}) — counted from "
+        f"a scan of this {length} video: every screen change, plus a look every "
+        f"{used:.0f} s when nothing changed, with repeats of the same picture "
+        "left out."
+    )
+
+
+def _screenshot_estimate(
+    interval: float, model: str, detail: str, scan: dict[str, Any] | None = None
+) -> str:
+    """Describe how many screenshots the current settings will take.
+
+    Args:
+        interval: Chosen maximum seconds between screenshots.
+        model: Selected vision model.
+        detail: Selected image fidelity.
+        scan: The video's scan; exact when given, a rough guess otherwise.
+
+    Returns:
+        A caption stating the count and cost, and saying so plainly when the
+        frame cap overrides the chosen interval.
+    """
+    if scan is not None:
+        return _scanned_estimate(scan, interval, model, detail)
     video_path: Path | None = st.session_state.get("video_path")
     cap = frames.max_frames_setting()
 
@@ -526,11 +617,33 @@ def render_visual_options(
             "transcribing locally."
         ),
     )
+    video_path: Path | None = st.session_state.get("video_path")
+    ready = bool(video_path and video_path.exists())
     if not enabled:
+        failures = st.session_state.get("scan_failures")
+        if ready and failures:
+            # Unticking forgets a failed scan, so ticking again retries it.
+            failures.pop(_digest(video_path), None)
         return None
     if not resolve_openai_key():
         st.warning(
             "On-screen context needs an OpenAI API key — add one in the sidebar."
+        )
+        return None
+    scan: dict[str, Any] | None = None
+    failure: str | None = None
+    if ready and disabled:
+        # A job is running: never start a scan while drawing its page — a Stop
+        # there left every control locked. The job scans for itself.
+        scan = frames.load_scan(_scan_dir(video_path))
+        failures = st.session_state.get("scan_failures") or {}
+        failure = failures.get(_digest(video_path))
+    elif ready:
+        scan, failure = _scan_video(video_path)
+    if failure:
+        st.warning(
+            f"On-screen context is not available for this file: {failure} "
+            "Untick and tick the box to try again."
         )
         return None
 
@@ -547,7 +660,10 @@ def render_visual_options(
         index=FRAME_DETAIL_LEVELS.index(DEFAULT_FRAME_DETAIL),
         horizontal=True,
         disabled=disabled,
-        help="Use **high** only when you need to read small text off a slide.",
+        help=(
+            "Measured with the gpt-5.4 models: **low** and **high** use the same "
+            "number of tokens, so they cost the same."
+        ),
     )
     interval = st.slider(
         "Screenshot at least every (seconds)",
@@ -564,7 +680,7 @@ def render_visual_options(
         ),
     )
 
-    st.caption(_screenshot_estimate(float(interval), vision_model, detail))
+    st.caption(_screenshot_estimate(float(interval), vision_model, detail, scan))
     return {"model": vision_model, "detail": detail, "interval": float(interval)}
 
 
@@ -573,6 +689,8 @@ def collect_visual_notes(
     progress_callback: ProgressCallback,
     notices: list[tuple[str, str]],
     stop_on_account_error: bool,
+    spent: list[dict[str, Any]] | None = None,
+    used: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Extract key frames from the uploaded video and describe what they show.
 
@@ -587,6 +705,9 @@ def collect_visual_notes(
         progress_callback: Where to report per-frame progress.
         notices: Messages for the user are appended here.
         stop_on_account_error: Raise account errors instead of warning.
+        spent: Usage records of the descriptions are appended here.
+        used: The cache names of the selected frames are appended here, so
+            the caller can mark exactly those as counted.
 
     Returns:
         Notes with ``time`` and ``description`` (possibly empty), and whether
@@ -601,19 +722,17 @@ def collect_visual_notes(
     if not video_path or not api_key:
         return [], True
 
-    # A folder of its own per run: two tabs used to share temp/frames, so one
-    # run's extraction replaced the other's screenshots mid-run.
-    temp_dir = get_settings().temp_dir
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    frame_dir = Path(tempfile.mkdtemp(prefix="frames-", dir=temp_dir))
     failed: list[float] = []
     collected: list[dict[str, Any]] = []
     total = 0
     try:
         with st.spinner("Looking for scene changes in the video…", show_time=True):
-            keyframes = frames.extract_keyframes(
-                video_path, frame_dir, max_interval=visual["interval"]
-            )
+            # The same scan and selection the caption counted, so the number
+            # described is the number that was shown.
+            scan = frames.scan_video(video_path, _scan_dir(video_path))
+            keyframes = frames.select_from_scan(scan, visual["interval"])
+            if used is not None:
+                used.extend(vision.frame_name(frame["time"]) for frame in keyframes)
             cache = vision.cache_dir(
                 _digest(video_path), visual["model"], visual["detail"]
             )
@@ -623,7 +742,10 @@ def collect_visual_notes(
             )
             return [], True
         total = len(keyframes)
-        with st.spinner(f"Describing {total} screenshots…", show_time=True):
+        with (
+            st.spinner(f"Describing {total} screenshots…", show_time=True),
+            frames.pictures(video_path) as picture,
+        ):
             notes = vision.describe_keyframes(
                 keyframes,
                 api_key,
@@ -633,6 +755,8 @@ def collect_visual_notes(
                 cache=cache,
                 failed=failed,
                 collected=collected,
+                spent=spent,
+                picture=picture,
             )
         if failed:
             notices.append(
@@ -649,8 +773,6 @@ def collect_visual_notes(
         notices.append(("warning", _partial_context_notice(exc, collected, total)))
     except (AppError, OSError) as exc:
         notices.append(("warning", _partial_context_notice(exc, collected, total)))
-    finally:
-        shutil.rmtree(frame_dir, ignore_errors=True)
     return sorted(collected, key=lambda note: note["time"]), False
 
 
@@ -682,8 +804,8 @@ def _run_pipeline(
     paths: tuple[Path, Path | None],
     progress: ProgressCallback,
     visual_notes: list[dict[str, Any]] | None,
-) -> bool:
-    """Run the chosen engine; return False if it could not start.
+) -> tuple[bool, dict[str, Any] | None]:
+    """Run the chosen engine.
 
     Args:
         provider: OpenAI API or local provider.
@@ -694,7 +816,8 @@ def _run_pipeline(
         visual_notes: On-screen notes to place into the transcript.
 
     Returns:
-        True when the pipeline ran; False when no API key was available.
+        Whether the pipeline ran (False when no API key was available), and
+        what its OpenAI requests used (``None`` for the local engine).
     """
     transcript_path, srt_path = paths
     if provider == PROVIDER_LOCAL:
@@ -721,13 +844,13 @@ def _run_pipeline(
                 progress_callback=progress,
                 visual_notes=visual_notes,
             )
-        return True
+        return True, None
 
     api_key = resolve_openai_key()
     if not api_key:
-        return False
+        return False, None
     with st.spinner("Transcribing with the OpenAI API…", show_time=True):
-        transcribe.transcribe_openai(
+        spent = transcribe.transcribe_openai(
             st.session_state.audio_path,
             transcript_path,
             api_key,
@@ -737,7 +860,65 @@ def _run_pipeline(
             progress_callback=progress,
             visual_notes=visual_notes,
         )
-    return True
+    return True, spent
+
+
+def _run_cost(
+    provider: str,
+    transcription: dict[str, Any] | None,
+    vision_records: list[dict[str, Any]],
+    transcription_ran: bool = True,
+) -> dict[str, Any]:
+    """Put a run's transcription and screenshot usage together.
+
+    Args:
+        provider: The engine used (local transcription costs nothing).
+        transcription: :func:`usage.summarize` of the transcription requests,
+            or ``None`` when the pipeline did not report it.
+        vision_records: Usage records of the screenshot descriptions.
+        transcription_ran: False when the run stopped before transcribing.
+
+    Returns:
+        ``transcription`` and ``vision`` summaries (``None`` when unused), the
+        total ``cost_usd`` and whether any part of it is ``estimated``.
+    """
+    vision = usage.summarize(vision_records) if vision_records else None
+    unknown = (
+        provider == PROVIDER_OPENAI and transcription_ran and transcription is None
+    )
+    parts = [part for part in (transcription, vision) if part]
+    return {
+        "provider": provider,
+        "transcription": transcription,
+        "vision": vision,
+        "cost_usd": sum(part["cost_usd"] for part in parts),
+        "estimated": unknown or any(part["estimated"] for part in parts),
+    }
+
+
+def _note_spent_before_failure(
+    provider: str,
+    vision_spent: list[dict[str, Any]],
+    notices: list[tuple[str, str]],
+    transcription_spent: dict[str, Any] | None = None,
+) -> None:
+    """Say what a failed run already paid for (nothing is saved).
+
+    Args:
+        provider: The engine of the run.
+        vision_spent: Usage records of the descriptions made before the failure.
+        notices: Messages for the user are appended here.
+        transcription_spent: Usage summary of transcription requests paid before
+            the failure (halves of a split first chunk), if any.
+    """
+    if vision_spent or transcription_spent:
+        cost = _run_cost(
+            provider,
+            transcription_spent,
+            vision_spent,
+            transcription_ran=transcription_spent is not None,
+        )
+        notices.append(("info", _describe_cost({**cost, "partial": True})))
 
 
 def run_transcription(
@@ -768,6 +949,9 @@ def run_transcription(
     # that fails or returns early leaves the old figure on screen, so the result
     # panel claims "Finished in …" for a run that never finished.
     st.session_state.elapsed_seconds = None
+    st.session_state.run_cost = None
+    vision_spent: list[dict[str, Any]] = []
+    used_frames: list[str] = []
     progress = make_progress_callback(st.empty())
     # Timed from here so the reported figure matches the wait the user actually
     # sits through, on-screen context included.
@@ -784,9 +968,11 @@ def run_transcription(
                 progress,
                 notices,
                 stop_on_account_error=provider == PROVIDER_OPENAI,
+                spent=vision_spent,
+                used=used_frames,
             )
 
-        ran = _run_pipeline(
+        ran, transcription_spent = _run_pipeline(
             provider,
             model,
             with_timestamps,
@@ -811,6 +997,23 @@ def run_transcription(
             # Cleared only now: a retry that fails before writing anything still
             # shows the earlier partial transcript, and must still say so.
             st.session_state.partial = None
+            cache = None
+            if visual and st.session_state.video_path:
+                cache = vision.cache_dir(
+                    _digest(st.session_state.video_path),
+                    visual["model"],
+                    visual["detail"],
+                )
+                if visual_complete:
+                    # The cache is discarded below. Descriptions an earlier,
+                    # unsaved attempt paid for outside this selection would then
+                    # count in no row, so this one takes them.
+                    vision_spent += vision.unbilled_usage(
+                        cache, visual["model"], used_frames
+                    )
+            st.session_state.run_cost = _run_cost(
+                provider, transcription_spent, vision_spent
+            )
             save_to_history(source_type, provider, model, with_timestamps)
             # Only now: a run stopped after its last chunk has already written
             # the transcript but not saved it, and must be able to resume free.
@@ -820,19 +1023,21 @@ def run_transcription(
                         _digest(st.session_state.audio_path), model
                     )
                 )
-            if visual and visual_complete and st.session_state.video_path:
-                # Kept only so a failed run need not pay for them again.
-                checkpoints.discard(
-                    vision.cache_dir(
-                        _digest(st.session_state.video_path),
-                        visual["model"],
-                        visual["detail"],
-                    )
-                )
+            if cache is not None:
+                if visual_complete:
+                    checkpoints.discard(cache)
+                else:
+                    # Kept so a rerun pays only for the missing screenshots;
+                    # this row has counted the ones it used.
+                    vision.mark_billed(cache, used_frames)
     except IncompleteTranscriptionError as exc:
         st.session_state.transcript_path = transcript_path
         st.session_state.srt_path = None
         st.session_state.partial = f"{exc.completed} of {exc.total}"
+        st.session_state.run_cost = {
+            **_run_cost(provider, exc.spent, vision_spent),
+            "partial": True,
+        }
         hint = (
             " The Local engine needs no key or credit."
             if isinstance(exc.__cause__, OpenAIAccountError) and LOCAL_AVAILABLE
@@ -848,8 +1053,10 @@ def run_transcription(
     except OpenAIAccountError as exc:
         hint = " The Local engine needs no key or credit." if LOCAL_AVAILABLE else ""
         notices.append(("error", f"{exc}{hint}"))
+        _note_spent_before_failure(provider, vision_spent, notices, exc.spent)
     except AppError as exc:
         notices.append(("error", f"Transcription error: {exc}"))
+        _note_spent_before_failure(provider, vision_spent, notices, exc.spent)
     st.session_state.run_notices = notices
 
 
@@ -859,17 +1066,17 @@ def render_run_notices() -> None:
         getattr(st, level)(message)
 
 
-def _request_job(params: dict[str, Any]) -> None:
+def _request_job() -> None:
     """Record a job; the run this click triggers draws the page locked and runs it.
 
     A callback rather than ``if st.button(...): st.rerun()``: a rerun from the
     middle of the script dropped the state of every widget drawn after Start,
-    closing any open History entry.
-
-    Args:
-        params: Keyword arguments for :func:`run_transcription`.
+    closing any open History entry. The settings are not captured here: a
+    Start clicked while the page was still busy (scanning the video) carried
+    the settings of the run before, without on-screen context. The job run
+    reads them from the widgets it draws itself.
     """
-    st.session_state.job = {"params": params, "worker": None}
+    st.session_state.job = {"params": None, "worker": None}
     st.session_state.run_notices = None
 
 
@@ -909,7 +1116,7 @@ def _stopped_notice(job: dict[str, Any]) -> list[tuple[str, str]]:
         The notices to show under Start.
     """
     params = job["params"]
-    if params["provider"] == PROVIDER_OPENAI:
+    if params and params["provider"] == PROVIDER_OPENAI:
         hint = _saved_parts_hint(params["model"])
     else:
         hint = "Press Start to run it again."
@@ -937,7 +1144,8 @@ def _settle_job() -> None:
 def _job_watchdog() -> None:
     """Unlock the page once a stopped job's thread has really ended.
 
-    Drawn only once a job has a worker thread. Its body runs inline when drawn
+    Drawn only once a job has a worker thread (see :func:`_claim_job`). Its
+    body runs inline when drawn
     (the worker is alive then, so it does nothing) and then every couple of
     seconds as a fragment rerun — but a fragment rerun waits while the full
     script is running, so those only happen once the job's run was stopped.
@@ -949,7 +1157,24 @@ def _job_watchdog() -> None:
         st.rerun()
 
 
-def _execute_job(area: Any | None) -> None:
+def _claim_job() -> None:
+    """Make this run the owner of a newly requested job, from its first line.
+
+    The owner used to be recorded only when the job started, at the end of the
+    page. A Stop pressed while the page above it was still being drawn left a
+    job with no owner: nothing ever unlocked the page, and the next rerun ran
+    the stopped job. Owned from the start, a stopped run leaves a dead worker,
+    which the watchdog and :func:`_settle_job` clean up.
+    """
+    job = st.session_state.job
+    if job is None:
+        return
+    if job["worker"] is None:
+        job["worker"] = threading.current_thread()
+    _job_watchdog()
+
+
+def _execute_job(area: Any | None, params: dict[str, Any] | None) -> None:
     """Run the requested job, then rerun so the controls come back.
 
     Called at the very end of the script, after the whole page — History
@@ -958,32 +1183,81 @@ def _execute_job(area: Any | None) -> None:
     Args:
         area: The container under the Start button, or ``None`` when the
             upload the job was for is gone.
+        params: Keyword arguments for :func:`run_transcription`, read from the
+            widgets this run drew, or ``None`` with ``area``.
     """
     job = st.session_state.job
     if job is None:
         return
-    if job["worker"] is not None:
+    if job["worker"] is not threading.current_thread():
         # A stopped run's thread is still finishing its request; never start
         # the job a second time — wait for it instead.
         if area is not None:
             area.info("Stopping — waiting for the request in progress to finish…")
-        _job_watchdog()
         return
-    if area is None:
+    if area is None or params is None:
         # Nothing to run it on; do not leave every control disabled.
         st.session_state.job = None
         st.rerun()
-    job["worker"] = threading.current_thread()
-    _job_watchdog()
+    job["params"] = params
     with area, checkpoints.active_run():
         try:
-            run_transcription(**job["params"])
+            run_transcription(**params)
         except Exception as exc:
             # Anything unexpected still has to release the disabled controls.
             logger.exception("Run failed")
             st.session_state.run_notices = [("error", f"Unexpected error: {exc}")]
     st.session_state.job = None
     st.rerun()
+
+
+def _describe_cost(cost: dict[str, Any]) -> str:
+    """Phrase what a run cost and what it used, for a caption.
+
+    Args:
+        cost: The run's cost from :func:`_run_cost`.
+
+    Returns:
+        E.g. ``💵 $0.0071 — transcription 1 request, 0:56 of audio, 1,210 → 240
+        tokens; screenshots 4 described, 2,580 → 190 tokens``.
+    """
+    parts = []
+    transcription = cost.get("transcription")
+    if transcription:
+        tokens = ""
+        if transcription["input_tokens"] or transcription["output_tokens"]:
+            tokens = (
+                f", {transcription['input_tokens']:,} → "
+                f"{transcription['output_tokens']:,} tokens"
+            )
+        audio_seconds = transcription.get("audio_seconds", transcription["seconds"])
+        parts.append(
+            f"transcription {transcription['requests']} request(s), "
+            f"{_format_length(audio_seconds)} of audio{tokens}"
+        )
+    elif cost.get("provider") == PROVIDER_LOCAL:
+        parts.append("transcription free (local)")
+    vision = cost.get("vision")
+    if vision:
+        parts.append(
+            f"screenshots {vision['requests']} described, "
+            f"{vision['input_tokens']:,} → {vision['output_tokens']:,} tokens"
+        )
+    total = usage.format_usd(cost["cost_usd"], cost.get("estimated", False))
+    text = f"💵 {total} — " + "; ".join(parts) if parts else f"💵 {total}"
+    if cost.get("partial"):
+        text += " — spent so far, not saved to history."
+        if transcription:
+            text += (
+                " Start again with the same model to transcribe only the rest; "
+                "that run counts this in its total."
+            )
+        if vision:
+            text += (
+                " The screenshot descriptions are kept: the next run with the same "
+                "screenshot model and detail reuses them and counts them in its total."
+            )
+    return text
 
 
 def render_results(disabled: bool = False) -> None:
@@ -1008,6 +1282,9 @@ def render_results(disabled: bool = False) -> None:
     elapsed: float | None = st.session_state.elapsed_seconds
     if elapsed is not None:
         st.caption(f"⏱️ Finished in {_format_length(elapsed)}")
+    cost: dict[str, Any] | None = st.session_state.get("run_cost")
+    if cost is not None:
+        st.caption(_describe_cost(cost))
 
     st.text_area(
         "Transcript preview:",
@@ -1130,16 +1407,18 @@ def render_resume_hint(provider: str, model: str) -> None:
         )
 
 
-def render_transcribe_tab() -> Any | None:
+def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
     """Render the main transcription workflow: upload, prepare, transcribe.
 
     Returns:
         The container under the Start button, where a requested job draws its
-        progress, or ``None`` when no file is ready.
+        progress, and the settings shown on the page (the job's parameters);
+        both ``None`` when no file is ready.
     """
     _uploader_label_css()
     running = st.session_state.job is not None
     job_area = None
+    params = None
     left, right = st.columns([2, 3])
 
     with left:
@@ -1193,21 +1472,19 @@ def render_transcribe_tab() -> Any | None:
                 provider, model, with_timestamps = render_engine_options(running)
                 visual = render_visual_options(source_type, disabled=running)
                 render_resume_hint(provider, model)
+                params = {
+                    "provider": provider,
+                    "model": model,
+                    "with_timestamps": with_timestamps,
+                    "source_type": source_type,
+                    "visual": visual,
+                }
 
                 st.button(
                     "Start Transcription",
                     type="primary",
                     disabled=running,
                     on_click=_request_job,
-                    args=(
-                        {
-                            "provider": provider,
-                            "model": model,
-                            "with_timestamps": with_timestamps,
-                            "source_type": source_type,
-                            "visual": visual,
-                        },
-                    ),
                 )
                 job_area = st.container()
                 render_run_notices()
@@ -1229,7 +1506,32 @@ def render_transcribe_tab() -> Any | None:
 
     with right:
         render_results(disabled=running)
-    return job_area
+    return job_area, params
+
+
+def _history_cost(record: Any) -> str | None:
+    """Phrase a history row's cost, keeping the estimate mark.
+
+    Args:
+        record: A row from :func:`db.list_transcriptions`.
+
+    Returns:
+        E.g. ``$0.07``, ``≈ $0.03`` or ``free (local)``; ``None`` for rows
+        saved before costs were recorded.
+    """
+    if record["cost_usd"] is None:
+        return None
+    try:
+        details = json.loads(record["usage_json"] or "{}")
+    except ValueError:
+        details = {}
+    if (
+        not record["cost_usd"]
+        and details.get("provider") == PROVIDER_LOCAL
+        and not details.get("estimated")
+    ):
+        return "free (local)"
+    return usage.format_usd(record["cost_usd"], bool(details.get("estimated")))
 
 
 @st.fragment
@@ -1263,6 +1565,9 @@ def render_history_tab() -> None:
                 meta_parts.append(f"{record['file_size_mb']} MB")
             if record["elapsed_seconds"]:
                 meta_parts.append(f"took {_format_length(record['elapsed_seconds'])}")
+            cost_text = _history_cost(record)
+            if cost_text:
+                meta_parts.append(cost_text)
             st.caption(" · ".join(meta_parts))
 
             full = db.get_transcription(record["id"])
@@ -1331,6 +1636,7 @@ def main() -> None:
         checkpoints.prune_scratch(SCRATCH_MAX_AGE_HOURS)
         st.session_state.checkpoints_pruned = True
     _settle_job()
+    _claim_job()
     render_sidebar(disabled=st.session_state.job is not None)
 
     st.title("📝 Video & Audio Transcription")
@@ -1338,13 +1644,13 @@ def main() -> None:
 
     tab_transcribe, tab_history = st.tabs(["🎙️ Transcribe", "📚 History"])
     with tab_transcribe:
-        job_area = render_transcribe_tab()
+        job_area, params = render_transcribe_tab()
     with tab_history:
         render_history_tab()
 
     st.markdown("---")
     st.markdown("Made with ❤️ by Marko A")
-    _execute_job(job_area)
+    _execute_job(job_area, params)
 
 
 if __name__ == "__main__":

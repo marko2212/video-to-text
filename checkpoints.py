@@ -31,8 +31,8 @@ _READ_BLOCK_BYTES = 1024 * 1024
 # Enough of the SHA-256 to make an accidental collision irrelevant, short enough
 # to keep directory names readable.
 _DIGEST_CHARS = 16
-# Per-run scratch folders (chunk MP3s, screenshots) created by the pipeline.
-_SCRATCH_PATTERNS = ("segments-*", "frames-*")
+# Per-run scratch folders (chunk MP3s, screenshots) and video scans.
+_SCRATCH_PATTERNS = ("segments-*", "frames-*", "scan-*")
 
 # Runs in progress in this process, across every browser tab. Kept here, in an
 # imported module, because Streamlit re-executes app.py from scratch each run.

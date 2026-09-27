@@ -99,6 +99,7 @@ def test_init_db_migrates_a_database_without_the_newer_columns():
     rows = db.list_transcriptions()
     assert len(rows) == 1, "pre-existing history must survive the migration"
     assert rows[0]["elapsed_seconds"] is None
+    assert rows[0]["cost_usd"] is None
     assert db.get_transcription(rows[0]["id"])["transcript"] == "existing history"
     # And the migrated database still accepts new rows with the new columns.
     new_id = db.add_transcription(
@@ -116,3 +117,18 @@ def test_pragmas_are_applied():
         conn.close()
     assert journal_mode.lower() == "wal"
     assert foreign_keys == 1
+
+
+def test_cost_and_usage_roundtrip():
+    db.init_db()
+    record_id = db.add_transcription(
+        "call.amr",
+        "audio",
+        "gpt-4o-transcribe",
+        False,
+        "text",
+        cost_usd=0.0123,
+        usage_json='{"cost_usd": 0.0123}',
+    )
+    assert db.get_transcription(record_id)["usage_json"] == '{"cost_usd": 0.0123}'
+    assert db.list_transcriptions()[0]["cost_usd"] == 0.0123

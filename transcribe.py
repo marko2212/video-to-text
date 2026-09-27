@@ -24,6 +24,7 @@ from pydub import AudioSegment
 import checkpoints
 import openai_api
 import serbian
+import usage
 from audio import to_wav
 from config import (
     CUT_SEARCH_SECONDS,
@@ -515,7 +516,8 @@ def _transcribe_span(
     Returns:
         Pieces with ``start`` and ``duration`` (seconds) and ``text``, plus
         ``segments`` on the recording's timeline when ``want_segments`` is set,
-        and ``capped`` when the answer may still be cut off.
+        ``capped`` when the answer may still be cut off, and ``usage``: the
+        records of the requests paid for it (see :mod:`usage`).
     """
     start_ms, end_ms = span
     temp_folder, checkpoint = work
@@ -525,6 +527,11 @@ def _transcribe_span(
         if "pieces" in saved:
             return saved["pieces"]
         middle = saved["split"]
+        # A marker saved before costs were recorded has no usage: the capped
+        # request was still paid for, so it counts as an estimate, not as free.
+        spent = saved.get("usage") or [
+            usage.transcription_record(None, model, (end_ms - start_ms) / 1000)
+        ]
     else:
         path = _export_chunk(audio[start_ms:end_ms], temp_folder, f"chunk_{name}")
         try:
@@ -534,6 +541,7 @@ def _transcribe_span(
 
         tokens = _output_tokens(result)
         span_ms = end_ms - start_ms
+        spent = [usage.transcription_record(result, model, span_ms / 1000)]
         capped = tokens is not None and tokens >= OUTPUT_TOKEN_CAP_GUARD
         if not (capped and may_split and span_ms >= 2 * MIN_SPLIT_SECONDS * 1000):
             if capped:
@@ -541,6 +549,7 @@ def _transcribe_span(
                     "Part %s still hit the output cap (%d tokens)", name, tokens
                 )
             piece = _piece(result, start_ms, end_ms, want_segments, capped)
+            piece["usage"] = spent
             checkpoints.save(
                 checkpoint, part, {"bounds": [start_ms, end_ms], "pieces": [piece]}
             )
@@ -556,18 +565,27 @@ def _transcribe_span(
             (start_ms + end_ms) // 2,
             min(span_ms // 4, int(CUT_SEARCH_SECONDS * 1000)),
         )
+        # The capped answer was paid for too; it is kept with the split marker
+        # so a resumed run still counts it.
         checkpoints.save(
-            checkpoint, part, {"bounds": [start_ms, end_ms], "split": middle}
+            checkpoint,
+            part,
+            {"bounds": [start_ms, end_ms], "split": middle, "usage": spent},
         )
 
     halves = ((start_ms, middle, f"{name}a"), (middle, end_ms, f"{name}b"))
-    return [
+    pieces = [
         piece
         for low, high, half in halves
         for piece in _transcribe_span(
             audio, (low, high), client, model, want_segments, work, half, False
         )
     ]
+    if pieces:
+        first = pieces[0]
+        own = _usage_records([first], model)
+        pieces[0] = {**first, "usage": spent + own}
+    return pieces
 
 
 def _piece(
@@ -734,6 +752,52 @@ def _transcribe_all(
     return pieces, None
 
 
+def _usage_records(pieces: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    """Collect the usage records behind a list of pieces.
+
+    Args:
+        pieces: Transcribed pieces, some possibly restored from checkpoints.
+        model: Transcription model name.
+
+    Returns:
+        Every record; a piece saved before cost recording existed gets a
+        per-minute estimate, so it counts as roughly paid rather than free.
+    """
+    records: list[dict[str, Any]] = []
+    for piece in pieces:
+        if "usage" in piece:
+            records += piece["usage"]
+        else:
+            records.append(usage.transcription_record(None, model, piece["duration"]))
+    return records
+
+
+def _unfinished_chunk_usage(
+    checkpoint: Path, index: int, model: str
+) -> list[dict[str, Any]]:
+    """Collect what the failed chunk already paid for (a split and its halves).
+
+    Args:
+        checkpoint: The checkpoint directory.
+        index: The chunk that failed.
+        model: Transcription model name, for estimating parts saved before
+            costs were recorded.
+
+    Returns:
+        Usage records of its saved split marker and finished halves.
+    """
+    records: list[dict[str, Any]] = []
+    for path in sorted(checkpoint.glob(f"part_{index:03d}*.json")):
+        saved = checkpoints.load(checkpoint, path.stem) or {}
+        if "split" in saved:
+            start_ms, end_ms = saved.get("bounds", (0, 0))
+            records += saved.get("usage") or [
+                usage.transcription_record(None, model, (end_ms - start_ms) / 1000)
+            ]
+        records += _usage_records(saved.get("pieces", []), model)
+    return records
+
+
 def _reusable_chunks(checkpoint: Path, bounds: list[tuple[int, int]]) -> int:
     """Count saved chunks that match the planned boundaries and will be reused.
 
@@ -761,7 +825,7 @@ def transcribe_openai(
     srt_output_file: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
     visual_notes: list[dict[str, Any]] | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Transcribe an audio/video file with the OpenAI API, chunk by chunk.
 
     Args:
@@ -773,6 +837,10 @@ def transcribe_openai(
         srt_output_file: Destination ``.srt`` path; written only with timestamps.
         progress_callback: Optional callback receiving status payloads.
         visual_notes: Optional on-screen notes to place into the transcript.
+
+    Returns:
+        What the requests used and cost (:func:`usage.summarize`), counting
+        chunks paid for by an earlier, unfinished attempt too.
 
     Raises:
         OpenAIAccountError: If the key or account is refused before any chunk
@@ -830,7 +898,21 @@ def transcribe_openai(
         if failure:
             index, cause = failure
             if index == 0:
+                # Nothing to show, but halves of a split first chunk may have
+                # been paid for; the caller says so.
+                leftover = _unfinished_chunk_usage(checkpoint, 0, model)
+                if leftover:
+                    cause.spent = usage.summarize(leftover)
                 raise cause
+            spent = {
+                **usage.summarize(
+                    _usage_records(pieces, model)
+                    + _unfinished_chunk_usage(checkpoint, index, model)
+                ),
+                # The length the partial transcript covers, not the audio sent
+                # (a split chunk is sent more than once).
+                "audio_seconds": round(bounds[index][0] / 1000, 3),
+            }
             # Keep what was paid for: the finished chunks stay checkpointed, and
             # a partial transcript says plainly where it stops and why.
             _write_outputs(
@@ -842,7 +924,7 @@ def transcribe_openai(
                 missing=(bounds[index][0] / 1000, len(audio) / 1000, str(cause)),
             )
             raise IncompleteTranscriptionError(
-                str(cause), completed=index, total=len(bounds)
+                str(cause), completed=index, total=len(bounds), spent=spent
             ) from cause
 
         _write_outputs(
@@ -865,6 +947,12 @@ def transcribe_openai(
             ),
         )
         logger.info("Transcription saved to %s", output_file)
+        # `seconds` in the summary is audio *sent*, which a split chunk exceeds;
+        # the recording's own length is reported alongside it.
+        return {
+            **usage.summarize(_usage_records(pieces, model)),
+            "audio_seconds": round(len(audio) / 1000, 3),
+        }
 
     except AppError as exc:
         _report(progress_callback, status="error", message=str(exc))

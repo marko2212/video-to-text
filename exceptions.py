@@ -7,7 +7,14 @@ error messages meaningful in the UI.
 
 
 class AppError(Exception):
-    """Base class for all application-specific errors."""
+    """Base class for all application-specific errors.
+
+    Attributes:
+        spent: What the failed step had already paid for (a usage summary, see
+            :mod:`usage`), when known; ``None`` otherwise.
+    """
+
+    spent: dict | None = None
 
 
 class AudioProcessingError(AppError):
@@ -28,27 +35,43 @@ class IncompleteTranscriptionError(TranscriptionError):
     Attributes:
         completed: Chunks transcribed (in this run or restored from checkpoints).
         total: Chunks in the recording.
+        spent: What the saved parts cost (a usage summary), or ``None``.
     """
 
-    def __init__(self, message: str, completed: int, total: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        completed: int,
+        total: int,
+        spent: dict | None = None,
+    ) -> None:
         """Store the progress reached alongside the message.
 
         Args:
             message: The cause, phrased for the user.
             completed: Chunks transcribed before the failure.
             total: Chunks in the recording.
+            spent: Usage summary of the requests paid for so far.
         """
         super().__init__(message)
         self.completed = completed
         self.total = total
+        self.spent = spent
 
 
 class VisualContextError(AppError):
-    """Raised when extracting or describing video key frames fails."""
+    """Raised when extracting or describing video key frames fails.
+
+    Attributes:
+        usage_record: The usage record of a request that was paid for although
+            it produced no description (an answer without choices), else ``None``.
+    """
+
+    usage_record: dict | None = None
 
 
 class OpenAIAccountError(AppError):
-    """Raised when OpenAI refuses the account itself: bad key, no access, no credit.
+    """Raised when OpenAI refuses the account itself: bad key, no credit, no billing.
 
     Deliberately not a subclass of :class:`TranscriptionError` or
     :class:`VisualContextError`: code that tolerates one failed chunk or frame

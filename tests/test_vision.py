@@ -1,5 +1,7 @@
 """Tests for the vision step: cost estimates and describing frames (no network)."""
 
+import base64
+
 import httpx
 import openai
 import pytest
@@ -16,8 +18,10 @@ def test_estimate_frame_tokens_scales_with_frames():
     assert vision.estimate_frame_tokens(10, "low") == single * 10
 
 
-def test_estimate_frame_tokens_high_detail_costs_more():
-    assert vision.estimate_frame_tokens(5, "high") > vision.estimate_frame_tokens(
+def test_estimate_frame_tokens_uses_the_measured_full_hd_figure():
+    # Measured on gpt-5.4: a Full HD frame is 2,519 input tokens, low or high.
+    assert vision.estimate_frame_tokens(5, "low") == 5 * 2519
+    assert vision.estimate_frame_tokens(5, "high") == vision.estimate_frame_tokens(
         5, "low"
     )
 
@@ -66,7 +70,8 @@ class FakeVisionClient:
             return type("Response", (), {"choices": []})()
         message = type("Message", (), {"content": result})()
         choice = type("Choice", (), {"message": message})()
-        return type("Response", (), {"choices": [choice]})()
+        tokens = {"prompt_tokens": 630, "completion_tokens": 40}
+        return type("Response", (), {"choices": [choice], "usage": tokens})()
 
     def close(self):
         pass
@@ -231,3 +236,132 @@ def test_notes_made_before_an_account_error_are_handed_back(tmp_path, monkeypatc
     with pytest.raises(OpenAIAccountError):
         vision.describe_keyframes(_frames(tmp_path, 5), "test-key", collected=collected)
     assert [note["description"] for note in collected] == ["Slide 1", "Slide 2"]
+
+
+def test_every_description_used_is_accounted_for_including_cached_ones(
+    tmp_path, monkeypatch
+):
+    cache = checkpoints.run_dir("video123", "frames", "gpt-5.4-nano", "low")
+    frames = _frames(tmp_path, 3)
+    _use(monkeypatch, FakeVisionClient(lambda n: f"Slide {n}"))
+    first = []
+    vision.describe_keyframes(frames, "test-key", cache=cache, spent=first)
+
+    _use(monkeypatch, FakeVisionClient(lambda n: "never asked"))
+    second = []
+    vision.describe_keyframes(frames, "test-key", cache=cache, spent=second)
+
+    assert len(first) == 3 and all(r["input_tokens"] == 630 for r in first)
+    # Reused descriptions were paid for by the first attempt; they still count.
+    assert second == first
+
+
+def test_descriptions_counted_by_a_saved_run_are_not_counted_again(
+    tmp_path, monkeypatch
+):
+    cache = checkpoints.run_dir("video123", "frames", "gpt-5.4-nano", "low")
+    frames = _frames(tmp_path, 3)
+
+    def answer(n):
+        if n == 2:
+            return _status_error(openai.BadRequestError, 400, {"message": "bad"})
+        return f"Slide {n}"
+
+    _use(monkeypatch, FakeVisionClient(answer))
+    first = []
+    vision.describe_keyframes(frames, "test-key", cache=cache, spent=first)
+    # The app does this after saving the history row.
+    vision.mark_billed(cache, [vision.frame_name(f["time"]) for f in frames])
+
+    retry = FakeVisionClient(lambda n: "Slide now")
+    _use(monkeypatch, retry)
+    second = []
+    vision.describe_keyframes(frames, "test-key", cache=cache, spent=second)
+
+    assert len(first) == 2
+    # Only the screenshot that was missing is paid for, and counted, again.
+    assert retry.calls == 1 and len(second) == 1
+
+
+def test_a_cached_description_from_before_cost_recording_counts_as_unknown(
+    tmp_path, monkeypatch
+):
+    cache = checkpoints.run_dir("video123", "frames", "gpt-5.4-nano", "low")
+    checkpoints.save(cache, "frame_000000000", {"description": "Old slide"})
+    _use(monkeypatch, FakeVisionClient(lambda n: "never asked"))
+    spent = []
+    vision.describe_keyframes(
+        _frames(tmp_path, 1), "test-key", cache=cache, spent=spent
+    )
+
+    assert len(spent) == 1
+    assert spent[0]["cost_usd"] is None and spent[0]["estimated"] is True
+
+
+def test_frame_tokens_follow_the_measured_sizes():
+    # Measured: 1920x1080 -> 2,519 tokens, 1280x720 -> 1,175.
+    assert abs(vision.frame_tokens(1920, 1080) - 2519) <= 5
+    assert abs(vision.frame_tokens(1280, 720) - 1175) <= 5
+
+
+def test_each_frame_is_sent_as_its_own_picture_and_cached_ones_are_not_fetched(
+    tmp_path, monkeypatch
+):
+    cache = checkpoints.run_dir("video123", "frames", "gpt-5.4-nano", "low")
+    frames = _frames(tmp_path, 3)
+    checkpoints.save(cache, "frame_000000000", {"description": "Seen before"})
+    fetched = []
+
+    def picture(frame):
+        fetched.append(frame["time"])
+        own = tmp_path / f"own_{frame['time']:.0f}.jpg"
+        own.write_bytes(f"picture at {frame['time']:.0f} s".encode())
+        return own
+
+    sent = []
+    client = FakeVisionClient(lambda n: f"Slide {n}")
+    original = client.create
+
+    def create(**kwargs):
+        url = kwargs["messages"][0]["content"][1]["image_url"]["url"]
+        sent.append(base64.b64decode(url.split(",", 1)[1]))
+        return original(**kwargs)
+
+    client.chat.completions.create = create
+    _use(monkeypatch, client)
+    vision.describe_keyframes(frames, "test-key", cache=cache, picture=picture)
+
+    assert fetched == [10.0, 20.0]  # the cached frame is not extracted again
+    assert sent == [b"picture at 10 s", b"picture at 20 s"]
+
+
+def test_only_the_frames_a_saved_row_used_are_marked_as_counted(tmp_path, monkeypatch):
+    # An unsaved attempt at one interval paid for frames at 0, 10 and 20 s; the
+    # saved row used another interval and only the frame at 0 s.
+    cache = checkpoints.run_dir("video123", "frames", "gpt-5.4-nano", "low")
+    frames = _frames(tmp_path, 3)
+    _use(monkeypatch, FakeVisionClient(lambda n: f"Slide {n}"))
+    vision.describe_keyframes(frames, "test-key", cache=cache, spent=[])
+
+    vision.mark_billed(cache, [vision.frame_name(0.0)])
+    leftover = vision.unbilled_usage(cache, "gpt-5.4-nano", [vision.frame_name(0.0)])
+
+    # The two frames no row has counted are still owed to a total.
+    assert len(leftover) == 2
+    assert all(record["input_tokens"] == 630 for record in leftover)
+    again = []
+    _use(monkeypatch, FakeVisionClient(lambda n: "never asked"))
+    vision.describe_keyframes(frames[1:], "test-key", cache=cache, spent=again)
+    assert len(again) == 2  # counted by the first saved row that uses them
+
+
+def test_an_answer_without_choices_is_still_counted_as_paid(tmp_path, monkeypatch):
+    _use(monkeypatch, FakeVisionClient(lambda n: None if n == 1 else f"Slide {n}"))
+    spent = []
+    failed = []
+    vision.describe_keyframes(
+        _frames(tmp_path, 2), "test-key", failed=failed, spent=spent
+    )
+
+    assert failed == [0.0]
+    assert len(spent) == 2  # the empty answer's tokens were billed too

@@ -21,12 +21,15 @@ from openai import OpenAI, OpenAIError
 
 import checkpoints
 import openai_api
+import usage
 from config import (
     DEFAULT_FRAME_DETAIL,
     DEFAULT_VISION_MODEL,
     VISION_OUTPUT_TOKENS_PER_FRAME,
     VISION_PRICE_PER_MTOK,
+    VISION_TOKENS_FIXED,
     VISION_TOKENS_PER_FRAME,
+    VISION_TOKENS_PER_MEGAPIXEL,
 )
 from exceptions import VisualContextError
 from logger import get_logger
@@ -68,10 +71,25 @@ def estimate_frame_tokens(frame_count: int, detail: str = DEFAULT_FRAME_DETAIL) 
     return frame_count * per_frame
 
 
+def frame_tokens(width: int, height: int) -> int:
+    """Estimate the input tokens of one frame of a given size.
+
+    Args:
+        width: Frame width in pixels.
+        height: Frame height in pixels.
+
+    Returns:
+        Tokens per request (image plus prompt), from measured values.
+    """
+    megapixels = width * height / 1_000_000
+    return round(VISION_TOKENS_FIXED + VISION_TOKENS_PER_MEGAPIXEL * megapixels)
+
+
 def estimate_frame_cost(
     frame_count: int,
     model: str = DEFAULT_VISION_MODEL,
     detail: str = DEFAULT_FRAME_DETAIL,
+    tokens_per_frame: int | None = None,
 ) -> float | None:
     """Estimate what describing a number of frames would cost, in USD.
 
@@ -79,6 +97,8 @@ def estimate_frame_cost(
         frame_count: Number of frames that would be described.
         model: Vision model name.
         detail: Image fidelity, ``"low"`` or ``"high"``.
+        tokens_per_frame: Input tokens per frame when the frame size is known
+            (see :func:`frame_tokens`); otherwise a Full HD figure is assumed.
 
     Returns:
         The approximate cost, or ``None`` if no price is known for the model.
@@ -87,7 +107,11 @@ def estimate_frame_cost(
     if prices is None:
         return None
     input_price, output_price = prices
-    input_cost = estimate_frame_tokens(frame_count, detail) * input_price
+    if tokens_per_frame is None:
+        input_tokens = estimate_frame_tokens(frame_count, detail)
+    else:
+        input_tokens = frame_count * tokens_per_frame
+    input_cost = input_tokens * input_price
     output_cost = frame_count * VISION_OUTPUT_TOKENS_PER_FRAME * output_price
     return (input_cost + output_cost) / 1_000_000
 
@@ -113,7 +137,7 @@ def _encode_frame(frame_path: Path) -> str:
 
 def _describe_frame(
     client: OpenAI, frame_path: Path, model: str, detail: str
-) -> str | None:
+) -> tuple[str | None, dict[str, Any]]:
     """Describe a single frame.
 
     Args:
@@ -123,7 +147,8 @@ def _describe_frame(
         detail: Image fidelity, ``"low"`` or ``"high"``.
 
     Returns:
-        The description, or ``None`` when the frame holds nothing worth noting.
+        The description (``None`` when the frame holds nothing worth noting),
+        and the usage record of the request — paid for either way.
 
     Raises:
         OpenAIAccountError: If the key or the account is refused.
@@ -153,12 +178,16 @@ def _describe_frame(
     except OpenAIError as exc:
         raise openai_api.translate_error(exc, VisualContextError) from exc
 
+    spent = usage.vision_record(response, model)
     if not response.choices:
-        raise VisualContextError("OpenAI returned no answer for this frame")
+        # Paid for all the same; the caller counts it with the failed frame.
+        error = VisualContextError("OpenAI returned no answer for this frame")
+        error.usage_record = spent
+        raise error
     description = (response.choices[0].message.content or "").strip()
     if not description or description.upper().startswith(_SKIP_MARKER):
-        return None
-    return description
+        return None, spent
+    return description, spent
 
 
 def _report(progress_callback: ProgressCallback | None, **payload: Any) -> None:
@@ -189,6 +218,57 @@ def cache_dir(video_digest: str, model: str, detail: str) -> Path:
     return checkpoints.run_dir(video_digest, "frames", model, detail, _CACHE_VERSION)
 
 
+def frame_name(time: float) -> str:
+    """Return the cache name of the frame at ``time`` seconds."""
+    return f"frame_{round(time * 1000):09d}"
+
+
+def mark_billed(cache: Path, names: list[str]) -> None:
+    """Mark cached descriptions as counted by a saved history row.
+
+    A run that saves with some screenshots missing keeps the cache, so a rerun
+    pays only for the missing ones — and must not count the reused ones again.
+    Only the frames this row used are marked: marking the whole cache also
+    marked descriptions paid by an unsaved attempt with another interval, which
+    then counted in no row at all.
+
+    Args:
+        cache: Directory from :func:`cache_dir`.
+        names: :func:`frame_name` of each frame the row used.
+    """
+    for name in names:
+        saved = checkpoints.load(cache, name)
+        if isinstance(saved, dict) and not saved.get("billed"):
+            checkpoints.save(cache, name, {**saved, "billed": True})
+
+
+def unbilled_usage(cache: Path, model: str, used: list[str]) -> list[dict[str, Any]]:
+    """Return what cached descriptions outside this run cost, if no row has yet.
+
+    Called before a complete run discards the cache: descriptions paid by an
+    earlier, unsaved attempt with other settings would otherwise vanish from
+    every total.
+
+    Args:
+        cache: Directory from :func:`cache_dir`.
+        model: Vision model name, for descriptions saved without usage.
+        used: :func:`frame_name` of each frame this run used (already counted).
+
+    Returns:
+        One usage record per such description.
+    """
+    if not cache.is_dir():
+        return []
+    skip = set(used)
+    records = []
+    for path in sorted(cache.glob("frame_*.json")):
+        saved = checkpoints.load(cache, path.stem)
+        if path.stem in skip or not isinstance(saved, dict) or saved.get("billed"):
+            continue
+        records.append(saved.get("usage") or usage.vision_record(None, model))
+    return records
+
+
 def describe_keyframes(
     frames: list[dict[str, Any]],
     api_key: str,
@@ -198,6 +278,8 @@ def describe_keyframes(
     cache: Path | None = None,
     failed: list[float] | None = None,
     collected: list[dict[str, Any]] | None = None,
+    spent: list[dict[str, Any]] | None = None,
+    picture: Callable[[dict[str, Any]], Path] | None = None,
 ) -> list[dict[str, Any]]:
     """Describe every extracted key frame, keeping only the informative ones.
 
@@ -217,6 +299,12 @@ def describe_keyframes(
             are appended to it, so the caller can say how many were lost.
         collected: When given, each note is appended to it as it is made, so
             the notes already paid for survive an early stop.
+        spent: When given, the usage record of every description used —
+            including ones reused from the cache, paid by an earlier attempt —
+            is appended to it.
+        picture: Returns the image to send for a frame (the scan's
+            :func:`frames.pictures`); called only for frames not already in the
+            cache. Defaults to the frame's ``path``.
 
     Returns:
         Notes with ``time`` and ``description``, ordered by time. Frames the
@@ -239,10 +327,15 @@ def describe_keyframes(
 
     try:
         for index, frame in enumerate(frames):
-            name = f"frame_{round(frame['time'] * 1000):09d}"
+            name = frame_name(frame["time"])
             saved = checkpoints.load(cache, name) if cache else None
             if saved is not None:
                 description = saved.get("description")
+                # Reused descriptions count once: in the first saved run that
+                # used them. One without usage predates cost recording, so it
+                # counts as unknown rather than free.
+                if spent is not None and not saved.get("billed"):
+                    spent.append(saved.get("usage") or usage.vision_record(None, model))
                 # A frame described earlier is a success: it ends a run of
                 # failures, or a resumed step would stop at old bad frames.
                 consecutive = 0
@@ -255,13 +348,14 @@ def describe_keyframes(
                 )
                 client = client or openai_api.make_client(api_key)
                 try:
-                    description = _describe_frame(
-                        client, Path(frame["path"]), model, detail
-                    )
+                    image = picture(frame) if picture else Path(frame["path"])
+                    description, record = _describe_frame(client, image, model, detail)
                 except VisualContextError as exc:
                     # One unreadable frame should not cost the user the whole run.
                     # An OpenAIAccountError is not a VisualContextError, so a bad
                     # key or an empty balance passes straight through.
+                    if spent is not None and exc.usage_record:
+                        spent.append(exc.usage_record)
                     failures += 1
                     consecutive += 1
                     if failed is not None:
@@ -273,8 +367,12 @@ def describe_keyframes(
                         ) from exc
                     continue
                 consecutive = 0
+                if spent is not None:
+                    spent.append(record)
                 if cache:
-                    checkpoints.save(cache, name, {"description": description})
+                    checkpoints.save(
+                        cache, name, {"description": description, "usage": record}
+                    )
             if description:
                 notes.append({"time": frame["time"], "description": description})
     finally:

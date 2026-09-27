@@ -1,7 +1,8 @@
 """Rewrite Serbian Cyrillic in saved transcripts as Latin (opt-in, one-off).
 
-New transcripts are transliterated as they are written. This fixes the ones
-saved before that, where a meeting switched script from chunk to chunk.
+New transcripts are transliterated only when SERBIAN_LATIN=true (off by
+default). This converts transcripts already saved, where a meeting switched
+script from chunk to chunk.
 
     uv run python scripts/serbian_latin_backfill.py           # report only
     uv run python scripts/serbian_latin_backfill.py --apply   # back up, then fix

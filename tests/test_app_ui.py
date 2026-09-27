@@ -3,6 +3,7 @@
 from streamlit.testing.v1 import AppTest
 
 import config
+from exceptions import VisualContextError
 
 _SCRIPT = """
 import streamlit as st
@@ -57,6 +58,22 @@ def test_the_caption_shows_the_ceiling_when_the_video_length_is_unknown():
     assert f"At most {config.DEFAULT_FRAME_MAX_COUNT}" in caption
 
 
+_GUESS_SCRIPT = """
+import streamlit as st
+import app
+
+st.caption(app._screenshot_estimate(st.session_state.interval, "gpt-5.4-nano", "low"))
+"""
+
+
+def _guess(video, interval: float) -> str:
+    """The rough caption, used while a job runs and no scan is stored yet."""
+    test = AppTest.from_string(_GUESS_SCRIPT)
+    test.session_state["video_path"] = video
+    test.session_state["interval"] = interval
+    return test.run().caption[0].value
+
+
 def test_the_caption_estimates_the_screenshot_count_from_the_video_length(
     monkeypatch, tmp_path
 ):
@@ -68,10 +85,7 @@ def test_the_caption_estimates_the_screenshot_count_from_the_video_length(
     # 10 minutes, sampled every 30 s: one at the start plus 20 more.
     monkeypatch.setattr(app, "_video_length", lambda path, size: 600.0)
 
-    test = _run("video", video_path=video)
-    test.checkbox[0].set_value(True).run()
-
-    caption = test.caption[0].value
+    caption = _guess(video, 30.0)
     assert "About **21** screenshots" in caption
     assert "10:00 video" in caption
 
@@ -84,12 +98,8 @@ def test_the_estimate_follows_the_interval_slider(monkeypatch, tmp_path):
     # 83:12 — the length that exposed the estimate being pinned to the cap.
     monkeypatch.setattr(app, "_video_length", lambda path, size: 4992.0)
 
-    test = _run("video", video_path=video)
-    test.checkbox[0].set_value(True).run()
-    at_default = test.caption[0].value
-
-    test.slider[0].set_value(120).run()
-    at_120 = test.caption[0].value
+    at_default = _guess(video, 30.0)
+    at_120 = _guess(video, 120.0)
 
     assert "About **167** screenshots" in at_default
     assert "About **42** screenshots" in at_120
@@ -104,11 +114,7 @@ def test_a_binding_cap_is_stated_rather_than_silently_applied(monkeypatch, tmp_p
     # 10 hours every 5 s is far past the cap, so the interval cannot be honoured.
     monkeypatch.setattr(app, "_video_length", lambda path, size: 36000.0)
 
-    test = _run("video", video_path=video)
-    test.checkbox[0].set_value(True).run()
-    test.slider[0].set_value(5).run()
-
-    caption = test.caption[0].value
+    caption = _guess(video, 5.0)
     assert f"{config.DEFAULT_FRAME_MAX_COUNT}-screenshot limit" in caption
     assert "one about every 180 s" in caption
     # The substitution must be stated, not just the fact that a cap exists.
@@ -125,11 +131,7 @@ def test_a_raised_cap_from_the_environment_reaches_the_caption(monkeypatch, tmp_
     video.write_bytes(b"not really a video")
     monkeypatch.setattr(app, "_video_length", lambda path, size: 4992.0)
 
-    test = _run("video", video_path=video)
-    test.checkbox[0].set_value(True).run()
-    test.slider[0].set_value(5).run()
-
-    caption = test.caption[0].value
+    caption = _guess(video, 5.0)
     # 4992 s over 300 screenshots is one every ~17 s, not the default's ~25 s.
     assert "300-screenshot limit" in caption
     assert "**300** screenshots" in caption
@@ -264,3 +266,109 @@ def test_no_api_key_warns_instead_of_offering_the_feature(monkeypatch):
         assert not test.selectbox
     finally:
         config.get_settings.cache_clear()
+
+
+def test_a_video_that_cannot_be_scanned_says_so_once_instead_of_guessing(
+    monkeypatch, tmp_path
+):
+    import frames
+
+    video = tmp_path / "voice.mp4"
+    video.write_bytes(b"audio only")
+    scans = []
+
+    def no_picture(*args, **kwargs):
+        scans.append(1)
+        raise VisualContextError(
+            "This file has no picture, so there is nothing to describe."
+        )
+
+    monkeypatch.setattr(frames, "scan_video", no_picture)
+    test = _run("video", video_path=video)
+    test.checkbox[0].set_value(True).run()
+    test.run()
+    test.run()
+
+    assert scans == [1]  # remembered, not rescanned on every rerun
+    assert any("no picture" in w.value for w in test.warning)
+    assert not any("screenshots" in c.value for c in test.caption)
+    assert test.session_state.result is None  # nothing will be described
+
+    test.checkbox[0].set_value(False).run()
+    test.checkbox[0].set_value(True).run()
+    assert scans == [1, 1]  # unticking and ticking tries again
+
+
+_JOB_SCRIPT = """
+import streamlit as st
+import app
+
+st.session_state.result = app.render_visual_options(
+    "video", disabled=st.session_state.get("disabled", False)
+)
+"""
+
+
+def test_a_running_job_never_starts_a_scan_while_its_page_is_drawn(
+    monkeypatch, tmp_path
+):
+    # A Stop pressed during such a scan left every control locked.
+    import frames
+
+    video = tmp_path / "meeting.mkv"
+    video.write_bytes(b"not decoded: the scan is faked")
+    scans = []
+    fake = {"duration": 60.0, "width": 0, "height": 0, "frames": []}
+    monkeypatch.setattr(frames, "scan_video", lambda *a, **k: scans.append(1) or fake)
+    test = AppTest.from_string(_JOB_SCRIPT)
+    test.session_state["video_path"] = video
+    test.run()
+    test.checkbox[0].set_value(True).run()
+    assert scans == [1]
+
+    test.session_state["disabled"] = True
+    test.run()
+
+    assert scans == [1]
+    assert test.session_state.result is not None  # the job still gets its settings
+
+
+def test_a_stopped_local_run_does_not_point_to_an_openai_rerun():
+    import app
+
+    text = app._describe_cost(
+        {
+            "provider": config.PROVIDER_LOCAL,
+            "transcription": None,
+            "vision": {
+                "requests": 3,
+                "seconds": 0.0,
+                "input_tokens": 7_500,
+                "output_tokens": 120,
+                "cost_usd": 0.0017,
+                "estimated": False,
+            },
+            "cost_usd": 0.0017,
+            "estimated": False,
+            "partial": True,
+        }
+    )
+
+    assert "screenshot descriptions are kept" in text
+    assert "OpenAI" not in text
+
+
+def test_a_local_row_with_an_unknown_screenshot_cost_is_not_called_free():
+    import json
+
+    import app
+
+    row = {
+        "cost_usd": 0.0,
+        "usage_json": json.dumps(
+            {"provider": config.PROVIDER_LOCAL, "estimated": True}
+        ),
+    }
+    assert app._history_cost(row) == "≈ $0"
+    exact = {**row, "usage_json": json.dumps({"provider": config.PROVIDER_LOCAL})}
+    assert app._history_cost(exact) == "free (local)"

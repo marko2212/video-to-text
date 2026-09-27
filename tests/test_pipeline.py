@@ -78,7 +78,9 @@ class FakeClient:
 
 def _text(text: str, tokens: int = 100, segments=None):
     return SimpleNamespace(
-        text=text, usage={"output_tokens": tokens}, segments=segments or []
+        text=text,
+        usage={"input_tokens": 1_000, "output_tokens": tokens},
+        segments=segments or [],
     )
 
 
@@ -90,13 +92,15 @@ def pipeline(monkeypatch, tmp_path):
     output = tmp_path / "out.txt"
     monkeypatch.setattr(transcribe, "_export_chunk", _fake_export)
 
+    spent = []
+
     def run(audio: AudioSegment, client: FakeClient, **kwargs):
         monkeypatch.setattr(transcribe, "_load_audio", lambda path, folder: audio)
         monkeypatch.setattr(openai_api, "make_client", lambda key: client)
-        transcribe.transcribe_openai(source, output, "test-key", **kwargs)
+        spent.append(transcribe.transcribe_openai(source, output, "test-key", **kwargs))
         return output.read_text(encoding="utf-8")
 
-    return SimpleNamespace(run=run, source=source, output=output)
+    return SimpleNamespace(run=run, source=source, output=output, spent=spent)
 
 
 def _saved_chunks(source: Path, model: str = config.DEFAULT_MODEL) -> int:
@@ -397,3 +401,174 @@ def test_progress_counts_finished_chunks(pipeline):
     # Reported before each request: nothing is finished when part 1 starts.
     assert progress == [0.0, 1 / 3, 2 / 3]
     assert reports[-1]["status"] == "complete"
+
+
+def test_a_run_reports_the_tokens_and_cost_it_used(pipeline):
+    pipeline.run(
+        _tone(12 * MINUTE), FakeClient(lambda n, ms: _text("Said.", tokens=200))
+    )
+    spent = pipeline.spent[-1]
+
+    assert spent["requests"] == 3
+    assert (spent["input_tokens"], spent["output_tokens"]) == (3_000, 600)
+    # gpt-4o-transcribe: $2.50 / 1M input, $10 / 1M output.
+    assert spent["cost_usd"] == pytest.approx((3_000 * 2.5 + 600 * 10) / 1e6)
+    assert spent["estimated"] is False
+    assert spent["seconds"] == pytest.approx(12 * 60, abs=1)
+
+
+def test_the_capped_answer_that_was_split_is_counted_too(pipeline):
+    def answer(name, ms):
+        if name == "chunk_000":
+            return _text("Truncated", tokens=2048)
+        return _text("Complete.", tokens=500)
+
+    pipeline.run(_tone(5 * MINUTE), FakeClient(answer))
+    spent = pipeline.spent[-1]
+
+    assert spent["requests"] == 3
+    assert spent["output_tokens"] == 2048 + 500 + 500
+
+
+def test_a_resumed_run_counts_what_its_first_attempt_paid(pipeline):
+    audio = _tone(12 * MINUTE)
+
+    def failing(name, ms):
+        if name == "chunk_002":
+            raise _server_error()
+        return _text("Said.", tokens=100)
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(audio, FakeClient(failing))
+    pipeline.run(audio, FakeClient(lambda n, ms: _text("Said.", tokens=100)))
+
+    # Two chunks paid in the first attempt, one in the second: the transcript
+    # cost all three.
+    assert pipeline.spent[-1]["requests"] == 3
+    assert pipeline.spent[-1]["output_tokens"] == 300
+
+
+def test_the_recording_length_is_reported_even_when_a_chunk_is_resent(pipeline):
+    def answer(name, ms):
+        return _text("Capped", tokens=2048) if name == "chunk_000" else _text("Ok.")
+
+    pipeline.run(_tone(5 * MINUTE), FakeClient(answer))
+    spent = pipeline.spent[-1]
+
+    assert spent["audio_seconds"] == pytest.approx(300, abs=1)
+    assert spent["seconds"] == pytest.approx(600, abs=2)  # audio sent: 5:00 + 2 halves
+
+
+def test_a_chunk_saved_before_cost_recording_is_estimated_not_free(pipeline):
+    audio = _tone(12 * MINUTE)
+
+    def failing(name, ms):
+        if name == "chunk_002":
+            raise _server_error()
+        return _text("Said.")
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(audio, FakeClient(failing))
+    # Strip the usage from the saved chunks, as an older version wrote them.
+    checkpoint = transcribe.checkpoint_dir(
+        checkpoints.file_digest(pipeline.source), config.DEFAULT_MODEL
+    )
+    for path in checkpoint.glob("chunk_*.json"):
+        saved = checkpoints.load(checkpoint, path.stem)
+        for piece in saved["pieces"]:
+            piece.pop("usage", None)
+        checkpoints.save(checkpoint, path.stem, saved)
+
+    pipeline.run(audio, FakeClient(lambda n, ms: _text("Said.")))
+    spent = pipeline.spent[-1]
+
+    assert spent["requests"] == 3
+    assert spent["estimated"] is True
+    assert spent["cost_usd"] > 0.02  # two restored 5-minute chunks at ~$0.006/min
+
+
+def test_a_partial_run_reports_what_it_paid_including_a_split_chunk(pipeline):
+    def answer(name, ms):
+        if name == "chunk_001":
+            return _text("Capped", tokens=2048)
+        if name == "chunk_001b":
+            raise _server_error()
+        return _text("Said.", tokens=100)
+
+    with pytest.raises(IncompleteTranscriptionError) as stopped:
+        pipeline.run(_tone(12 * MINUTE), FakeClient(answer))
+
+    # chunk_000, the capped chunk_001 and its finished first half were paid.
+    assert stopped.value.spent["requests"] == 3
+    assert stopped.value.spent["output_tokens"] == 100 + 2048 + 100
+
+
+def test_the_script_the_model_returned_is_kept_by_default(monkeypatch):
+    # Macedonian colleagues use the app too; their Cyrillic must not be
+    # rewritten in Serbian Latin unless someone asks for it.
+    monkeypatch.delenv("SERBIAN_LATIN", raising=False)
+    config.get_settings.cache_clear()
+    assert config.get_settings().serbian_latin is False
+
+
+def test_a_split_saved_before_cost_recording_is_estimated_on_resume(pipeline):
+    audio = _tone(12 * MINUTE)
+
+    def first_try(name, ms):
+        if name == "chunk_001":
+            return _text("Capped", tokens=2048)
+        if name == "chunk_001b":
+            raise _server_error()
+        return _text("Said.")
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(audio, FakeClient(first_try))
+    # Strip the usage from the split marker and its finished half, as the
+    # version before cost recording wrote them.
+    checkpoint = transcribe.checkpoint_dir(
+        checkpoints.file_digest(pipeline.source), config.DEFAULT_MODEL
+    )
+    for name in ("part_001", "part_001a"):
+        saved = checkpoints.load(checkpoint, name)
+        saved.pop("usage", None)
+        for piece in saved.get("pieces", []):
+            piece.pop("usage", None)
+        checkpoints.save(checkpoint, name, saved)
+
+    pipeline.run(audio, FakeClient(lambda n, ms: _text("Said.")))
+    spent = pipeline.spent[-1]
+
+    # chunk_000, the capped chunk_001 and half a (both estimated), then half b
+    # and chunk_002.
+    assert spent["requests"] == 5
+    assert spent["estimated"] is True
+
+
+def test_a_partial_run_reports_the_length_it_covers_not_the_audio_sent(pipeline):
+    def answer(name, ms):
+        if name == "chunk_001":
+            return _text("Capped", tokens=2048)
+        if name == "chunk_001b":
+            raise _server_error()
+        return _text("Said.")
+
+    with pytest.raises(IncompleteTranscriptionError) as stopped:
+        pipeline.run(_tone(12 * MINUTE), FakeClient(answer))
+
+    # The partial transcript ends where chunk_001 starts, at 5:00.
+    assert stopped.value.spent["audio_seconds"] == pytest.approx(300, abs=1)
+
+
+def test_a_first_chunk_that_fails_after_a_split_still_reports_what_it_paid(pipeline):
+    def answer(name, ms):
+        if name == "chunk_000":
+            return _text("Capped", tokens=2048)
+        if name == "chunk_000b":
+            raise _server_error()
+        return _text("Said.")
+
+    with pytest.raises(TranscriptionError) as stopped:
+        pipeline.run(_tone(5 * MINUTE), FakeClient(answer))
+
+    assert not isinstance(stopped.value, IncompleteTranscriptionError)
+    assert stopped.value.spent["requests"] == 2  # the capped answer and half a

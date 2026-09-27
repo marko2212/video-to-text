@@ -62,7 +62,8 @@ MAX_SEGMENT_SIZE_MB: float = 25.0
 # writing at about 2,000 output tokens per request, and dense Serbian speech
 # reaches 2,450-2,920 tokens per 10 minutes, so 10-minute chunks silently lost
 # their last minute or so (measured 2026-09-25). Five minutes stays well under
-# the cap; whisper-1 has no such cap. Billing is per audio minute either way.
+# the cap; whisper-1 has no such cap. The price follows the audio length either
+# way (per minute, or audio tokens), so chunk length does not change it.
 SEGMENT_MINUTES_BY_MODEL: dict[str, int] = {"gpt-4o-transcribe": 5, "whisper-1": 10}
 # Used for any model not listed above, until its output cap is known.
 DEFAULT_SEGMENT_MINUTES: int = 5
@@ -121,7 +122,8 @@ FRAME_MIN_INTERVAL_SECONDS: float = 2.0
 # well clear of ordinary use or it silently overrides the interval the user
 # chose — at 40 an 83-minute meeting was pinned to the cap at every slider
 # position. The binding constraint is wall-clock, not money: frames are captioned
-# one request at a time, so 200 is a few minutes of waiting and roughly 5 cents.
+# one request at a time, so 200 is a few minutes of waiting and about 12 cents
+# on gpt-5.4-nano for Full HD frames (about 45 on gpt-5.4-mini).
 # Override per-machine with FRAME_MAX_COUNT in .env.
 DEFAULT_FRAME_MAX_COUNT: int = 200
 # Edge length of the difference hash; 8 yields the usual 64-bit hash. A bigger
@@ -137,21 +139,52 @@ HASH_SIZE: int = 8
 FRAME_DUPLICATE_DISTANCE: int = 2
 # JPEG quality for extracted frames (ffmpeg -qscale:v, 2 = best, 31 = worst).
 FRAME_QUALITY: int = 4
-# Image fidelity sent to the vision model. "low" downsamples server-side to
-# 512x512 for a flat, predictable token cost — enough to read slide headings.
+# Containers without an index (ffprobe format names): seeking in them lands up
+# to a keyframe interval late, so a frame cannot be re-extracted exactly and the
+# scan keeps every frame's own JPEG (.ts/.mts/.m2ts, .mpg/.mpeg/.vob).
+FRAME_UNINDEXED_FORMATS: tuple[str, ...] = ("mpegts", "mpeg", "vob")
+# Image fidelity sent to the vision model as `detail`. On the gpt-5.4 models it
+# does not change the token count (measured 2026-09-25, see
+# VISION_TOKENS_PER_FRAME); the cost follows the frame's pixel count.
 FRAME_DETAIL_LEVELS: list[str] = ["low", "high"]
 DEFAULT_FRAME_DETAIL: str = "low"
-# Approximate image tokens charged per frame, for the pre-run cost estimate.
-VISION_TOKENS_PER_FRAME: dict[str, int] = {"low": 630, "high": 2300}
+# Input tokens charged per frame (image + prompt), for the pre-run estimate.
+# Measured 2026-09-25 with gpt-5.4-nano and -mini: a 1920x1080 frame costs 2,519
+# tokens and a 1280x720 one 1,175 — roughly proportional to the pixel count —
+# and `detail` makes no difference. Screen recordings are usually Full HD, so
+# that figure is used; the old 630 understated the cost by half or more.
+VISION_TOKENS_PER_FRAME: dict[str, int] = {"low": 2519, "high": 2519}
+# The same two measurements as a line, for frames whose size is known (from the
+# video scan): tokens ≈ fixed part + per-megapixel part × megapixels.
+VISION_TOKENS_FIXED: float = 100.0
+VISION_TOKENS_PER_MEGAPIXEL: float = 1166.7
 # A caption is short, but output tokens cost several times more than input ones,
 # so leaving them out understated the estimate by roughly half.
 VISION_OUTPUT_TOKENS_PER_FRAME: int = 80
-# Indicative (input, output) price in USD per million tokens, for that estimate
-# only. Checked 2026-07-20 — re-check OpenAI's pricing page if it looks wrong.
+# (input, output) price in USD per million tokens — used for the pre-run
+# estimate and for the recorded cost of each run. Checked 2026-09-25 on
+# developers.openai.com/api/docs/pricing; re-check if a figure looks wrong.
 VISION_PRICE_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-5.4-nano": (0.20, 1.25),
     "gpt-5.4-mini": (0.75, 4.50),
 }
+# Transcription prices, same source and date. Token-billed models: (input,
+# output) USD per million tokens, the input price covering the audio tokens.
+TRANSCRIPTION_PRICE_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gpt-4o-transcribe": (2.50, 10.00),
+    "gpt-4o-mini-transcribe": (1.25, 5.00),
+}
+# Per-minute prices: how whisper-1 and gpt-transcribe are billed, and OpenAI's
+# own estimate for the token-billed models when an answer carries no usage.
+TRANSCRIPTION_PRICE_PER_MINUTE: dict[str, float] = {
+    "whisper-1": 0.006,
+    "gpt-transcribe": 0.0045,
+    "gpt-4o-transcribe": 0.006,
+    "gpt-4o-mini-transcribe": 0.003,
+}
+# Used for a transcription model missing from both tables, so its cost is at
+# least in the right range; the record is marked as an estimate.
+TRANSCRIPTION_FALLBACK_PRICE_PER_MINUTE: float = 0.006
 
 # Saved parts of unfinished runs hold transcript text; they are deleted after
 # this many days without use, even if nobody cleans temporary files.
@@ -205,7 +238,7 @@ class Settings(BaseSettings):
         local_device: Device for local Whisper ("auto", "cpu" or "cuda").
         local_compute_type: Quantization for local Whisper (e.g. "int8").
         frame_max_count: Hard cap on screenshots described per video.
-        serbian_latin: Rewrite Serbian Cyrillic in transcripts as Latin.
+        serbian_latin: Rewrite Serbian Cyrillic in transcripts as Latin (off).
     """
 
     openai_api_key: str | None = Field(
@@ -223,9 +256,12 @@ class Settings(BaseSettings):
     local_compute_type: str = Field(default="int8")
     # Raising this costs mostly time: frames are described one request at a time.
     frame_max_count: int = Field(default=DEFAULT_FRAME_MAX_COUNT, ge=1)
-    # Without a language hint the API picks the script per chunk, so one Serbian
-    # meeting came back in alternating Latin and Cyrillic blocks.
-    serbian_latin: bool = Field(default=True)
+    # Off by default: the app keeps the script the model returned. Macedonian
+    # shares the letters that identify Serbian Cyrillic and would be rewritten in
+    # Serbian Latin, and a transcript read by another AI needs no single script.
+    # On, Serbian Cyrillic is rewritten in Latin (the API picks the script per
+    # chunk, so a long Serbian meeting can alternate between the two).
+    serbian_latin: bool = Field(default=False)
 
     model_config = SettingsConfigDict(
         env_file=".env",
