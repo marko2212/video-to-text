@@ -161,10 +161,11 @@ VISION_TOKENS_PER_MEGAPIXEL: float = 1166.7
 # A caption is short, but output tokens cost several times more than input ones,
 # so leaving them out understated the estimate by roughly half.
 VISION_OUTPUT_TOKENS_PER_FRAME: int = 80
-# (input, output) price in USD per million tokens — used for the pre-run
-# estimate and for the recorded cost of each run. Checked 2026-09-25 on
-# developers.openai.com/api/docs/pricing; re-check if a figure looks wrong.
-VISION_PRICE_PER_MTOK: dict[str, tuple[float, float]] = {
+# (input, output) price in USD per million tokens of the chat models used for
+# screenshots and titles — used for the pre-run estimate and for the recorded
+# cost of each run. Checked 2026-09-25 on developers.openai.com/api/docs/pricing;
+# re-check if a figure looks wrong.
+CHAT_PRICE_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-5.4-nano": (0.20, 1.25),
     "gpt-5.4-mini": (0.75, 4.50),
 }
@@ -185,6 +186,30 @@ TRANSCRIPTION_PRICE_PER_MINUTE: dict[str, float] = {
 # Used for a transcription model missing from both tables, so its cost is at
 # least in the right range; the record is marked as an estimate.
 TRANSCRIPTION_FALLBACK_PRICE_PER_MINUTE: float = 0.006
+
+# AI title: after a run, a chat model names the transcript, and the name is used
+# in History and for downloaded files. A preference kept in the history
+# database, off by default. The title is stored beside the original file name,
+# never over it, so the mode only decides how the two are shown.
+TITLE_MODE_OFF: str = "off"
+TITLE_MODE_REPLACE: str = "replace"
+TITLE_MODE_APPEND: str = "append"
+TITLE_MODES: dict[str, str] = {
+    TITLE_MODE_OFF: "Off",
+    TITLE_MODE_REPLACE: "Replace the file name",
+    TITLE_MODE_APPEND: "Add to the end of the file name",
+}
+DEFAULT_TITLE_MODEL: str = "gpt-5.4-nano"
+TITLE_MODELS: list[str] = [DEFAULT_TITLE_MODEL, "gpt-5.4-mini"]
+# A title is a few words; anything longer is cut at a word boundary.
+TITLE_MAX_CHARS: int = 80
+# Transcript characters sent for a title: about four hours of speech, roughly
+# 60k tokens — about a cent on gpt-5.4-nano. A longer transcript is sent as its
+# beginning and its end.
+TITLE_MAX_TRANSCRIPT_CHARS: int = 200_000
+# Text tokens in an hour of transcript, for the cost hint next to the setting:
+# dense Serbian speech measured 2,450-2,920 tokens per 10 minutes (2026-09-25).
+TITLE_TOKENS_PER_HOUR: int = 17_000
 
 # Saved parts of unfinished runs hold transcript text; they are deleted after
 # this many days without use, even if nobody cleans temporary files.

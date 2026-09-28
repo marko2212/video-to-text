@@ -70,6 +70,17 @@ class VisualContextError(AppError):
     usage_record: dict | None = None
 
 
+class TitleError(AppError):
+    """Raised when the AI title of a finished transcript cannot be made.
+
+    Attributes:
+        usage_record: The usage record of a request that was paid for although
+            it produced no title (an empty answer), else ``None``.
+    """
+
+    usage_record: dict | None = None
+
+
 class OpenAIAccountError(AppError):
     """Raised when OpenAI refuses the account itself: bad key, no credit, no billing.
 

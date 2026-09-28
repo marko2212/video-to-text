@@ -1,4 +1,4 @@
-"""SQLite persistence layer for transcription history.
+"""SQLite persistence layer for transcription history and preferences.
 
 Uses the stdlib ``sqlite3`` module with short-lived connections (one per
 operation), which is safe for Streamlit's rerun model. The database lives in the
@@ -37,8 +37,20 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create the data directory and ``transcriptions`` table if needed."""
+    """Create the data directory and the database tables if needed."""
     with closing(_connect()) as conn, conn:
+        # Settings the owner chooses once in the sidebar (the AI title mode and
+        # model). Kept here rather than in .env so the page can change them, and
+        # here rather than in a new file so they live, and are backed up, with
+        # the history they apply to.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS preferences (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transcriptions (
@@ -56,6 +68,7 @@ def init_db() -> None:
                 elapsed_seconds  REAL,
                 cost_usd         REAL,
                 usage_json       TEXT,
+                title            TEXT,
                 created_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
             )
             """
@@ -67,6 +80,7 @@ def init_db() -> None:
             ("elapsed_seconds", "REAL"),
             ("cost_usd", "REAL"),
             ("usage_json", "TEXT"),
+            ("title", "TEXT"),
         ):
             if name not in columns:
                 # Both values are literals from the tuple above, never user input.
@@ -89,6 +103,7 @@ def add_transcription(
     elapsed_seconds: float | None = None,
     cost_usd: float | None = None,
     usage_json: str | None = None,
+    title: str | None = None,
 ) -> int:
     """Insert a transcription record.
 
@@ -106,6 +121,7 @@ def add_transcription(
         elapsed_seconds: Optional wall-clock time the run took.
         cost_usd: Optional cost of the run's OpenAI requests, in USD.
         usage_json: Optional JSON with the tokens and requests behind the cost.
+        title: Optional AI title of the transcript (shown per the title mode).
 
     Returns:
         The id of the newly inserted row.
@@ -116,8 +132,8 @@ def add_transcription(
             INSERT INTO transcriptions (
                 filename, source_type, model, provider, with_timestamps,
                 transcript, srt, audio_path, file_size_mb, duration_minutes,
-                elapsed_seconds, cost_usd, usage_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                elapsed_seconds, cost_usd, usage_json, title
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 filename,
@@ -133,6 +149,7 @@ def add_transcription(
                 elapsed_seconds,
                 cost_usd,
                 usage_json,
+                title,
             ),
         )
         return cursor.lastrowid
@@ -149,7 +166,7 @@ def list_transcriptions() -> list[sqlite3.Row]:
             """
             SELECT id, filename, source_type, model, provider, with_timestamps,
                    file_size_mb, duration_minutes, elapsed_seconds, cost_usd,
-                   usage_json, created_at
+                   usage_json, title, created_at
             FROM transcriptions
             ORDER BY created_at DESC, id DESC
             """
@@ -169,6 +186,32 @@ def get_transcription(record_id: int) -> sqlite3.Row | None:
         return conn.execute(
             "SELECT * FROM transcriptions WHERE id = ?", (record_id,)
         ).fetchone()
+
+
+def get_preferences() -> dict[str, str]:
+    """Return every stored preference.
+
+    Returns:
+        A mapping of preference names to their values (empty when none is set).
+    """
+    with closing(_connect()) as conn:
+        rows = conn.execute("SELECT key, value FROM preferences").fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def set_preference(key: str, value: str) -> None:
+    """Store one preference, replacing its previous value.
+
+    Args:
+        key: Preference name.
+        value: Its new value.
+    """
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO preferences (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
 
 def delete_transcription(record_id: int) -> None:

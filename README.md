@@ -17,6 +17,7 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 * **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`); it downloads on first use.
 * **Readable transcripts** — time markers and automatic paragraph breaks instead of one wall of text: exact `(M:SS)` with `whisper-1` and the local engine, approximate `(~M:SS)` per paragraph with `gpt-4o-transcribe`.
 * **On-screen context (video):** optionally pull the frames where the picture changed, have a vision model describe them, and place those notes in the transcript at their time — so slides, diagrams and shared screens are captured, not just speech.
+* **AI title (optional):** after each run a chat model names the transcript from its content, and History and downloaded files use that name — instead of the file name, or after it (see [AI title](#ai-title-)).
 * **Optional timestamps & subtitle export** (`.srt`) — with `whisper-1` and with any local model.
 * **Flexible API key:** read from `.env` if present, otherwise entered in the sidebar (kept only for the session).
 * **Long recordings:** audio is sent in chunks of a few minutes, cut in pauses rather than mid-word, and short enough that the model never runs out of room to write (see [Configuration](#configuration-)).
@@ -174,7 +175,7 @@ Work in the **Transcribe** tab:
     If an OpenAI run stops part-way (no credit left, no connection), you see the **partial transcript** instead, ending with a `⚠️` line that says where it stops and why; it is not saved to history. The finished parts are kept on disk, so **Start** again transcribes only the rest — the app says so under the button when it finds saved parts for your file.
 5. **Clean Up:** "Clean temporary files" removes working files from `temp/` and `uploads/`, including saved parts of unfinished runs, and empties the uploader. It is unavailable while a transcription is running — in any tab — so it can never delete a live run's saved parts. Those saved parts contain transcript text, so they are also deleted automatically after 14 days without use. Your transcription **history is kept** (see below).
 
-In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions, each showing how long it took to produce and what it cost. An entry's text is loaded only when you open it, so a long history does not slow the page down. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts. Entries recorded before this was added simply omit the timing.
+In the **History** tab you can browse, re-download (TXT/SRT), and delete past transcriptions, each showing how long it took to produce and what it cost — listed under their AI title when that setting is on. An entry's text is loaded only when you open it, so a long history does not slow the page down. History is stored in a local SQLite database at `data/transcriptions.db`, so it persists across cleanups and restarts. Entries recorded before this was added simply omit the timing.
 
 ## On-screen context (video) 🖥️
 
@@ -202,6 +203,18 @@ Frames that look alike share one image on disk during the scan; each screenshot 
 
 Frames that show nothing useful — a face, a blank desktop — are dropped automatically, and near-identical frames are deduplicated. Note that two slides differing only in a word or a number may be treated as duplicates, since the deduplication compares layout rather than text.
 
+## AI title 🏷️
+
+Recordings often arrive with names like `Meeting in General-20260915_140312-Meeting Recording.mp4`. With **AI title** on, a chat model reads each finished transcript and names it in a few words, in the language the speakers use. The setting lives in the sidebar, is set once and kept across sessions (in the history database):
+
+* **Off** (default) — nothing is sent; names stay as they were.
+* **Replace the file name** — History and downloads use the title: `Database migration plan.txt`.
+* **Add to the end of the file name** — `Meeting in General-20260915_140312-Meeting Recording - Database migration plan.txt`.
+
+Pick the model next to it (`gpt-5.4-nano` by default, `gpt-5.4-mini` for a stronger one). A title costs about $0.004 per hour of recording on nano and about $0.014 on mini, and is counted in the run's cost. It uses your **OpenAI API key** after both engines, so with the setting on, a **Local** run's transcript is sent to OpenAI for its title. If the title cannot be made (no key, no credit, no connection), the transcript is still saved, without one, and a note says why.
+
+The title is stored beside the original file name, never over it: switching the mode renames earlier titled transcripts too, the original name stays visible in the entry, and **Off** brings the old names back. Transcripts made before the setting was on have no title and keep their names.
+
 ## Offline mode (no API key) 🔒
 
 You can transcribe entirely on your machine with a local Whisper model — free, private, and offline. Install the optional backend:
@@ -212,11 +225,11 @@ uv sync --extra local
 
 (or `make sync-local`). **A later plain `uv sync` removes it again**, because `uv sync` installs exactly what it is asked for — add `--extra local` every time, or use `make sync`, which keeps the backend when it is installed. If the **Local (offline)** engine disappears from the app, this is why.
 
-Then in the app choose the **Local (offline)** engine and a model size (`base` is a good default). The model downloads from Hugging Face on first use into `models/` and is cached afterwards. Local transcription runs on the **CPU** by default; if you have a working CUDA setup, set `LOCAL_DEVICE=cuda` in `.env`.
+Then in the app choose the **Local (offline)** engine and a model size (`base` is a good default). The model downloads from Hugging Face on first use into `models/` and is cached afterwards. Local transcription runs on the **CPU** by default; if you have a working CUDA setup, set `LOCAL_DEVICE=cuda` in `.env`. The audio never leaves your machine; only [on-screen context](#on-screen-context-video-) and the [AI title](#ai-title-), when turned on, send screenshots or the transcript to OpenAI.
 
 ## Configuration 🔑
 
-* **OpenAI API Key (only for the OpenAI engine):** set it in the `.env` file as `OPENAI_API_KEY`, **or** type it into the sidebar at runtime (kept only for the session, never written to disk). The local offline engine needs no key.
+* **OpenAI API Key (for the OpenAI engine, on-screen context and the AI title):** set it in the `.env` file as `OPENAI_API_KEY`, **or** type it into the sidebar at runtime (kept only for the session, never written to disk). The local offline engine needs no key.
 * **Optional `.env` overrides:**
     * `LOCAL_DEVICE` (`cpu`/`cuda`) and `WHISPER_MODEL_DIR` (model cache location) for the local engine.
     * `FRAME_MAX_COUNT` — screenshot ceiling for on-screen context (default 200).

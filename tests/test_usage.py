@@ -97,3 +97,14 @@ def test_costs_read_well_at_every_scale():
 def test_zero_and_tiny_costs_do_not_read_as_a_rounding_error():
     assert usage.format_usd(0) == "$0"
     assert usage.format_usd(0.00004) == "<$0.0001"
+
+
+def test_a_title_is_priced_like_a_chat_answer_and_marked_as_a_title():
+    response = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=17_000, completion_tokens=10)
+    )
+    record = usage.title_record(response, "gpt-5.4-mini")
+
+    # $0.75 per 1M input tokens, $4.50 per 1M output tokens.
+    assert record["cost_usd"] == pytest.approx((17_000 * 0.75 + 10 * 4.50) / 1e6)
+    assert record["kind"] == "title"

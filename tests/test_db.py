@@ -100,6 +100,7 @@ def test_init_db_migrates_a_database_without_the_newer_columns():
     assert len(rows) == 1, "pre-existing history must survive the migration"
     assert rows[0]["elapsed_seconds"] is None
     assert rows[0]["cost_usd"] is None
+    assert rows[0]["title"] is None
     assert db.get_transcription(rows[0]["id"])["transcript"] == "existing history"
     # And the migrated database still accepts new rows with the new columns.
     new_id = db.add_transcription(
@@ -132,3 +133,28 @@ def test_cost_and_usage_roundtrip():
     )
     assert db.get_transcription(record_id)["usage_json"] == '{"cost_usd": 0.0123}'
     assert db.list_transcriptions()[0]["cost_usd"] == 0.0123
+
+
+def test_preferences_roundtrip_and_overwrite():
+    db.init_db()
+    assert db.get_preferences() == {}
+
+    db.set_preference("title_mode", "append")
+    db.set_preference("title_mode", "replace")
+    db.set_preference("title_model", "gpt-5.4-mini")
+
+    assert db.get_preferences() == {
+        "title_mode": "replace",
+        "title_model": "gpt-5.4-mini",
+    }
+
+
+def test_a_title_is_stored_beside_the_file_name():
+    db.init_db()
+    record_id = db.add_transcription(
+        "Meeting Recording.mp4", "video", "whisper-1", False, "t", title="Budget"
+    )
+
+    assert db.get_transcription(record_id)["filename"] == "Meeting Recording.mp4"
+    # History labels are built from the lightweight list.
+    assert db.list_transcriptions()[0]["title"] == "Budget"

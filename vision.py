@@ -23,10 +23,10 @@ import checkpoints
 import openai_api
 import usage
 from config import (
+    CHAT_PRICE_PER_MTOK,
     DEFAULT_FRAME_DETAIL,
     DEFAULT_VISION_MODEL,
     VISION_OUTPUT_TOKENS_PER_FRAME,
-    VISION_PRICE_PER_MTOK,
     VISION_TOKENS_FIXED,
     VISION_TOKENS_PER_FRAME,
     VISION_TOKENS_PER_MEGAPIXEL,
@@ -103,7 +103,7 @@ def estimate_frame_cost(
     Returns:
         The approximate cost, or ``None`` if no price is known for the model.
     """
-    prices = VISION_PRICE_PER_MTOK.get(model)
+    prices = CHAT_PRICE_PER_MTOK.get(model)
     if prices is None:
         return None
     input_price, output_price = prices

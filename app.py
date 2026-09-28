@@ -28,6 +28,7 @@ import audio
 import checkpoints
 import db
 import frames
+import titles
 import transcribe
 import usage
 import vision
@@ -37,6 +38,7 @@ from config import (
     CHECKPOINT_MAX_AGE_DAYS,
     DEFAULT_FRAME_DETAIL,
     DEFAULT_LOCAL_MODEL,
+    DEFAULT_TITLE_MODEL,
     FRAME_DETAIL_LEVELS,
     FRAME_INTERVAL_MAX_SECONDS,
     FRAME_INTERVAL_MIN_SECONDS,
@@ -51,6 +53,9 @@ from config import (
     PROVIDERS,
     SCRATCH_MAX_AGE_HOURS,
     TIMESTAMP_MODELS,
+    TITLE_MODE_OFF,
+    TITLE_MODELS,
+    TITLE_MODES,
     TRANSCRIPTION_MODELS,
     VIDEO_FORMATS,
     VISION_MODELS,
@@ -77,6 +82,7 @@ _RUN_STATE_KEYS = (
     "run_cost",
     "partial",
     "run_notices",
+    "run_title",
 )
 # Keys that live alongside the run state but are not reset by a new upload:
 # ``upload_id`` is what detects the new upload, ``job`` is the run request, and
@@ -194,6 +200,85 @@ def render_sidebar(disabled: bool) -> None:
                 "Tip: set `OPENAI_API_KEY` in a `.env` file to load it "
                 "automatically every run."
             )
+        render_title_settings(disabled)
+
+
+# The AI title preferences: session-state key → (offered values, default).
+_TITLE_PREFERENCES = {
+    "title_mode": (list(TITLE_MODES), TITLE_MODE_OFF),
+    "title_model": (TITLE_MODELS, DEFAULT_TITLE_MODEL),
+}
+
+
+def _title_preferences() -> tuple[str, str]:
+    """Return the AI title mode and model, loading the stored ones once a session.
+
+    Returns:
+        The mode (a ``TITLE_MODES`` key) and the chat model. A stored value no
+        longer offered (a model since removed) falls back to the default.
+    """
+    stored: dict[str, str] | None = None
+    for key, (options, default) in _TITLE_PREFERENCES.items():
+        if st.session_state.get(key) not in options:
+            stored = db.get_preferences() if stored is None else stored
+            value = stored.get(key)
+            st.session_state[key] = value if value in options else default
+    return st.session_state.title_mode, st.session_state.title_model
+
+
+def _save_preference(key: str) -> None:
+    """Store a sidebar preference as soon as it changes (a widget callback).
+
+    Args:
+        key: The widget's session-state key, also the preference name.
+    """
+    db.set_preference(key, st.session_state[key])
+
+
+def render_title_settings(disabled: bool) -> None:
+    """Offer the AI title mode and model; both are kept across sessions.
+
+    Args:
+        disabled: True while a job runs, so a change cannot stop it.
+    """
+    _title_preferences()
+    st.subheader("🏷️ AI title")
+    mode = st.radio(
+        "Name each transcript from its content",
+        options=list(TITLE_MODES),
+        format_func=TITLE_MODES.get,
+        key="title_mode",
+        on_change=_save_preference,
+        args=("title_mode",),
+        disabled=disabled,
+        help=(
+            "After each run a chat model reads the transcript and writes a short "
+            "title. **Replace** shows the title instead of the file name; **Add** "
+            "shows `file name - title`. Used in History and for downloaded files; "
+            "the original file name is kept, so changing this applies to earlier "
+            "transcripts too."
+        ),
+    )
+    model = st.selectbox(
+        "Title model",
+        options=TITLE_MODELS,
+        key="title_model",
+        on_change=_save_preference,
+        args=("title_model",),
+        disabled=disabled or mode == TITLE_MODE_OFF,
+    )
+    if mode == TITLE_MODE_OFF:
+        return
+    per_hour = titles.estimate_cost_per_hour(model)
+    cost = ""
+    if per_hour:
+        cost = f" About {usage.format_usd(per_hour)} per hour of recording."
+    st.caption(
+        f"Uses your OpenAI key, after OpenAI and Local runs alike.{cost} Counted "
+        "in the run's cost."
+    )
+    if not resolve_openai_key():
+        st.warning("An AI title needs an OpenAI API key.")
 
 
 def make_progress_callback(container: Any) -> ProgressCallback:
@@ -267,6 +352,7 @@ def save_to_history(
         elapsed_seconds=st.session_state.elapsed_seconds,
         cost_usd=cost["cost_usd"] if cost else None,
         usage_json=json.dumps(cost) if cost else None,
+        title=st.session_state.get("run_title"),
     )
 
 
@@ -868,8 +954,9 @@ def _run_cost(
     transcription: dict[str, Any] | None,
     vision_records: list[dict[str, Any]],
     transcription_ran: bool = True,
+    title_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Put a run's transcription and screenshot usage together.
+    """Put a run's transcription, screenshot and title usage together.
 
     Args:
         provider: The engine used (local transcription costs nothing).
@@ -877,20 +964,24 @@ def _run_cost(
             or ``None`` when the pipeline did not report it.
         vision_records: Usage records of the screenshot descriptions.
         transcription_ran: False when the run stopped before transcribing.
+        title_records: Usage records of the AI title request, if one was made.
 
     Returns:
-        ``transcription`` and ``vision`` summaries (``None`` when unused), the
-        total ``cost_usd`` and whether any part of it is ``estimated``.
+        ``transcription``, ``vision`` and ``title`` summaries (``None`` when
+        unused), the total ``cost_usd`` and whether any part of it is
+        ``estimated``.
     """
     vision = usage.summarize(vision_records) if vision_records else None
+    title = usage.summarize(title_records) if title_records else None
     unknown = (
         provider == PROVIDER_OPENAI and transcription_ran and transcription is None
     )
-    parts = [part for part in (transcription, vision) if part]
+    parts = [part for part in (transcription, vision, title) if part]
     return {
         "provider": provider,
         "transcription": transcription,
         "vision": vision,
+        "title": title,
         "cost_usd": sum(part["cost_usd"] for part in parts),
         "estimated": unknown or any(part["estimated"] for part in parts),
     }
@@ -919,6 +1010,47 @@ def _note_spent_before_failure(
             transcription_ran=transcription_spent is not None,
         )
         notices.append(("info", _describe_cost({**cost, "partial": True})))
+
+
+def _make_title(
+    transcript_path: Path,
+    progress: ProgressCallback,
+    notices: list[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Name a finished transcript when the AI title setting asks for it.
+
+    Runs after either engine: a Local run sends its transcript too. A title
+    that cannot be made costs the run only a warning — the transcript is
+    already paid for and is saved without one.
+
+    Args:
+        transcript_path: The finished transcript.
+        progress: Progress callback of the run.
+        notices: Messages for the user are appended here.
+
+    Returns:
+        The usage records of the title request (empty when none was sent).
+    """
+    mode, model = _title_preferences()
+    if mode == TITLE_MODE_OFF:
+        return []
+    api_key = resolve_openai_key()
+    if not api_key:
+        notices.append(
+            ("info", "No AI title: it needs an OpenAI API key (sidebar or `.env`).")
+        )
+        return []
+    progress({"status": "info", "message": "Writing a title…"})
+    try:
+        title, record = titles.make_title(
+            transcript_path.read_text(encoding="utf-8"), api_key, model
+        )
+    except AppError as exc:
+        notices.append(("warning", f"No AI title: {exc}"))
+        paid = getattr(exc, "usage_record", None)
+        return [paid] if paid else []
+    st.session_state.run_title = title
+    return [record]
 
 
 def run_transcription(
@@ -950,6 +1082,7 @@ def run_transcription(
     # panel claims "Finished in …" for a run that never finished.
     st.session_state.elapsed_seconds = None
     st.session_state.run_cost = None
+    st.session_state.run_title = None
     vision_spent: list[dict[str, Any]] = []
     used_frames: list[str] = []
     progress = make_progress_callback(st.empty())
@@ -993,6 +1126,7 @@ def run_transcription(
             st.session_state.srt_path = (
                 srt_path if with_timestamps and srt_path.exists() else None
             )
+            title_spent = _make_title(transcript_path, progress, notices)
             st.session_state.elapsed_seconds = time.monotonic() - started
             # Cleared only now: a retry that fails before writing anything still
             # shows the earlier partial transcript, and must still say so.
@@ -1012,7 +1146,7 @@ def run_transcription(
                         cache, visual["model"], used_frames
                     )
             st.session_state.run_cost = _run_cost(
-                provider, transcription_spent, vision_spent
+                provider, transcription_spent, vision_spent, title_records=title_spent
             )
             save_to_history(source_type, provider, model, with_timestamps)
             # Only now: a run stopped after its last chunk has already written
@@ -1243,6 +1377,11 @@ def _describe_cost(cost: dict[str, Any]) -> str:
             f"screenshots {vision['requests']} described, "
             f"{vision['input_tokens']:,} → {vision['output_tokens']:,} tokens"
         )
+    title = cost.get("title")
+    if title:
+        parts.append(
+            f"title {title['input_tokens']:,} → {title['output_tokens']:,} tokens"
+        )
     total = usage.format_usd(cost["cost_usd"], cost.get("estimated", False))
     text = f"💵 {total} — " + "; ".join(parts) if parts else f"💵 {total}"
     if cost.get("partial"):
@@ -1285,6 +1424,9 @@ def render_results(disabled: bool = False) -> None:
     cost: dict[str, Any] | None = st.session_state.get("run_cost")
     if cost is not None:
         st.caption(_describe_cost(cost))
+    title: str | None = st.session_state.get("run_title")
+    if title:
+        st.caption(f"🏷️ AI title: {title}")
 
     st.text_area(
         "Transcript preview:",
@@ -1292,10 +1434,12 @@ def render_results(disabled: bool = False) -> None:
         height=420,
         disabled=disabled,
     )
+    filename: str | None = st.session_state.original_filename
+    stem = _download_stem(filename, title) if filename else transcript_path.stem
     st.download_button(
         label="📥 Download Transcript",
         data=transcript_path.read_bytes,
-        file_name=transcript_path.name,
+        file_name=f"{stem}.txt",
         mime="text/plain",
         on_click="ignore",
     )
@@ -1305,10 +1449,26 @@ def render_results(disabled: bool = False) -> None:
         st.download_button(
             label="📥 Download Subtitles (.srt)",
             data=srt_path.read_bytes,
-            file_name=srt_path.name,
+            file_name=f"{stem}.srt",
             mime="text/plain",
             on_click="ignore",
         )
+
+
+def _download_stem(filename: str, title: str | None) -> str:
+    """Return the name, without extension, a transcript is downloaded under.
+
+    Args:
+        filename: The uploaded file's original name.
+        title: The transcript's AI title, if it has one.
+
+    Returns:
+        Per the title mode, the title or ``file name - title``; otherwise
+        ``transcript_<file name>``, as before titles existed.
+    """
+    stem = _safe_stem(filename)
+    mode, _ = _title_preferences()
+    return titles.display_name(stem, title, mode) or f"transcript_{stem}"
 
 
 def _uploader_label_css() -> None:
@@ -1549,16 +1709,22 @@ def render_history_tab() -> None:
         st.info("No transcriptions yet. Run one in the Transcribe tab.")
         return
 
+    mode, _ = _title_preferences()
     for record in records:
         flag = "⏱️ " if record["with_timestamps"] else ""
-        label = (
-            f"{flag}{record['filename']} · {record['model']} · {record['created_at']}"
+        name = (
+            titles.display_name(_safe_stem(record["filename"]), record["title"], mode)
+            or record["filename"]
         )
+        label = f"{flag}{name} · {record['model']} · {record['created_at']}"
         entry = st.expander(label, key=f"hist_{record['id']}", on_change="rerun")
         if not entry.open:
             continue
         with entry:
             meta_parts = [record["source_type"]]
+            if name != record["filename"]:
+                # The label shows the title; the file it came from stays findable.
+                meta_parts.insert(0, record["filename"])
             if record["provider"]:
                 meta_parts.append(record["provider"])
             if record["file_size_mb"]:
@@ -1576,7 +1742,7 @@ def render_history_tab() -> None:
                 # fetch; skip the row rather than blanking the whole tab.
                 st.info("This entry was deleted in another session.")
                 continue
-            base_name = Path(full["filename"]).stem
+            base_name = _download_stem(full["filename"], full["title"])
 
             st.text_area(
                 "Transcript",
@@ -1587,7 +1753,7 @@ def render_history_tab() -> None:
             st.download_button(
                 label="📥 Download Transcript",
                 data=full["transcript"],
-                file_name=f"transcript_{base_name}.txt",
+                file_name=f"{base_name}.txt",
                 mime="text/plain",
                 key=f"hist_dl_txt_{record['id']}",
                 on_click="ignore",
@@ -1596,7 +1762,7 @@ def render_history_tab() -> None:
                 st.download_button(
                     label="📥 Download Subtitles (.srt)",
                     data=full["srt"],
-                    file_name=f"transcript_{base_name}.srt",
+                    file_name=f"{base_name}.srt",
                     mime="text/plain",
                     key=f"hist_dl_srt_{record['id']}",
                     on_click="ignore",

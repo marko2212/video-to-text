@@ -1,6 +1,6 @@
 """What each paid OpenAI request actually used, and what it cost.
 
-Every transcription chunk and every described screenshot leaves one record:
+Every transcription chunk, described screenshot and title leaves one record:
 the model, the tokens the API reported (or the audio seconds, for models billed
 per minute), and the cost at the prices in :mod:`config`. Records travel with
 checkpointed results, so a run that resumes still counts what its earlier
@@ -10,10 +10,10 @@ attempt paid for. Pure functions, no I/O.
 from typing import Any
 
 from config import (
+    CHAT_PRICE_PER_MTOK,
     TRANSCRIPTION_FALLBACK_PRICE_PER_MINUTE,
     TRANSCRIPTION_PRICE_PER_MINUTE,
     TRANSCRIPTION_PRICE_PER_MTOK,
-    VISION_PRICE_PER_MTOK,
 )
 
 _MILLION = 1_000_000
@@ -74,12 +74,13 @@ def transcription_record(result: Any, model: str, seconds: float) -> dict[str, A
     }
 
 
-def vision_record(response: Any, model: str) -> dict[str, Any]:
-    """Describe what one screenshot description used and cost.
+def _chat_record(response: Any, model: str, kind: str) -> dict[str, Any]:
+    """Describe what one chat completion used and cost.
 
     Args:
         response: The chat completion (its ``usage`` is read when present).
-        model: Vision model name.
+        model: Chat model name.
+        kind: What the request was for, e.g. ``"vision"`` or ``"title"``.
 
     Returns:
         A record like :func:`transcription_record`'s, without ``seconds``;
@@ -88,18 +89,44 @@ def vision_record(response: Any, model: str) -> dict[str, Any]:
     usage = _field(response, "usage")
     input_tokens = _int(_field(usage, "prompt_tokens"))
     output_tokens = _int(_field(usage, "completion_tokens"))
-    prices = VISION_PRICE_PER_MTOK.get(model)
+    prices = CHAT_PRICE_PER_MTOK.get(model)
     cost = None
     if prices and input_tokens is not None and output_tokens is not None:
         cost = (input_tokens * prices[0] + output_tokens * prices[1]) / _MILLION
     return {
-        "kind": "vision",
+        "kind": kind,
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost,
         "estimated": cost is None,
     }
+
+
+def vision_record(response: Any, model: str) -> dict[str, Any]:
+    """Describe what one screenshot description used and cost.
+
+    Args:
+        response: The chat completion (its ``usage`` is read when present).
+        model: Vision model name.
+
+    Returns:
+        See :func:`_chat_record`.
+    """
+    return _chat_record(response, model, "vision")
+
+
+def title_record(response: Any, model: str) -> dict[str, Any]:
+    """Describe what one title request used and cost.
+
+    Args:
+        response: The chat completion (its ``usage`` is read when present).
+        model: Title model name.
+
+    Returns:
+        See :func:`_chat_record`.
+    """
+    return _chat_record(response, model, "title")
 
 
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:

@@ -46,7 +46,7 @@ def test_estimate_frame_cost_is_none_for_an_unpriced_model():
 def test_every_offered_vision_model_has_a_price():
     # The UI shows a cost hint per model; a missing price silently hides it.
     for model in config.VISION_MODELS:
-        assert model in config.VISION_PRICE_PER_MTOK
+        assert model in config.CHAT_PRICE_PER_MTOK
 
 
 # --- describe_keyframes with a fake client ----------------------------------
