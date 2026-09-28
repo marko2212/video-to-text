@@ -44,9 +44,10 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
 | `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume |
 | `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions; opt-in) |
-| `usage.py` | Per-request token and cost records (transcription, vision), totals, USD formatting; pure functions |
-| `db.py` | SQLite history (`data/transcriptions.db`) |
-| `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `OpenAIAccountError`) |
+| `titles.py` | AI title of a finished transcript: the chat request, cleaning the answer into a safe file name, how a title is shown per mode |
+| `usage.py` | Per-request token and cost records (transcription, vision, title), totals, USD formatting; pure functions |
+| `db.py` | SQLite history (`data/transcriptions.db`) and the sidebar preferences stored with it |
+| `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `TitleError`, `OpenAIAccountError`) |
 | `logger.py` | `get_logger()` — stdlib logging (never `print()`) |
 | `scripts/` | Launchers: `run.bat` (Windows), `run.sh` (Linux/macOS), `create-shortcut.ps1`; one-off `serbian_latin_backfill.py` |
 | `tests/` | pytest — pure functions, SQLite, the pipeline with a fake client, headless UI (AppTest); no network, no ffmpeg |
@@ -66,6 +67,8 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
           OR  local (whole file at once)
        → rendering: (M:SS) or (~M:SS) + paragraphs, on-screen notes placed by time,
           Serbian Cyrillic → Latin only with SERBIAN_LATIN=true → .txt (+ .srt if requested)
+       → (AI title, if on: a chat model names the finished transcript — after either
+          engine; a failure only warns)
        → write to SQLite history (a partial run is shown, marked, and not saved)
 ```
 
@@ -375,6 +378,40 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   missing ones. A cached frame counts as a success, so old bad frames cannot trip the
   "3 in a row" stop on a resume. *(2026-09-25)*
 
+### AI title
+- **A title is stored beside the file name, never over it; the mode is applied when
+  shown** *(2026-09-29)*. The owner asked for a setting, chosen once, that names each
+  transcript from its content and either replaces the file name or is added after it
+  (Teams names recordings `Meeting in General-<date>-Meeting Recording.mp4`). The
+  title goes into its own nullable `title` column; History labels and download names
+  are built from file name + title + the current mode (`titles.display_name`). So
+  switching the mode renames earlier titled rows too, Off brings back the old names,
+  and a title is never paid for twice. Download names without a title keep the old
+  `transcript_<name>` form. The entry's caption keeps the original file name visible
+  when the label shows the title.
+- **The preferences live in the history database** (`preferences` table), not in
+  `.env` and not in the session: the page must be able to change them, and they
+  belong with the history they rename (backed up with it, no new file to gitignore).
+  Read once per session; a stored model no longer offered falls back to the default.
+- **Titles after Local runs too — the owner's call** (2026-09-29, "neko ko lokalno
+  pravi transcript slobodno može isto da generiše naslov"). The Local engine keeps the
+  audio on the machine, but with titles on, its transcript is sent to OpenAI; the
+  README says so. Same key as transcription (`.env` or sidebar); without a key the run
+  is saved untitled with a note.
+- **A title never fails a run.** It is requested after the transcript is written and
+  before the row is saved; any error (no credit, network, an empty answer) becomes a
+  warning and the row is saved without a title. Its tokens go into the run's cost
+  (`title` part of `usage_json`), including an empty answer, which is paid too.
+- **Models and cost:** `gpt-5.4-nano` by default, `gpt-5.4-mini` offered — the same
+  price table as screenshots (`CHAT_PRICE_PER_MTOK`, renamed from
+  `VISION_PRICE_PER_MTOK`). About 17k tokens per hour of speech (measured on dense
+  Serbian, 2026-09-25): ≈ $0.004 per hour on nano, ≈ $0.014 on mini. Up to 200,000
+  characters are sent (about four hours); a longer transcript is sent as its beginning
+  and end.
+- **The answer is cleaned into a safe file name** — first line only, a `Title:` /
+  `Naslov:` label and quotes removed, `:` → ` -`, characters Windows forbids replaced,
+  at most 80 characters cut at a word, reserved names (`CON`, `COM1`…) extended.
+
 ### Offline engine
 - **`faster-whisper`** (not `openai-whisper`, not `whisper.cpp`) — the best fit for Python
   and CPU in 2026 (CTranslate2, int8), easy to install, native timestamps.
@@ -482,8 +519,8 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **PRAGMA `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`** — better defaults
   for Streamlit's rerun model and multiple open sessions.
 - **Migration without a migration tool:** `init_db()` checks `PRAGMA table_info` and adds
-  any missing column — currently `provider`, `elapsed_seconds`, `cost_usd` and
-  `usage_json` — so existing
+  any missing column — currently `provider`, `elapsed_seconds`, `cost_usd`,
+  `usage_json` and `title` — and creates the `preferences` table, so existing
   databases are not lost. New columns must be nullable, since existing rows have
   no value for them.
 - **Audio is NOT stored as a BLOB** — only the transcript and SRT text; `audio_path` is a
@@ -567,6 +604,9 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   records *(2026-09-25)*
 - **Run time reported** next to the transcript and in history *(2026-07-28)*
 - **Actual tokens and cost of every run** next to the transcript and in history *(2026-09-25)*
+- **AI title** *(2026-09-29)*: an optional sidebar setting, kept across sessions, that
+  names each transcript from its content (nano or mini) and uses the title instead of,
+  or after, the file name in History and in downloaded file names
 - **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
 - **Hybrid API key** (`.env` or sidebar); offline works with no key
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
@@ -574,7 +614,7 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 210 tests** (DB CRUD + PRAGMAs + schema migration, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 242 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -675,6 +715,11 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       (300 input / 79 output tokens for 30 s — so the cap guard works on real answers),
       `(~M:SS)` paragraphs with the notes in place, the cost saved with the row.
       Still untested live: a resumed run after a real failure.
+- [x] **Live check of the AI title** — done by the owner 2026-09-29 ("radi okej"): a
+      7:30 English meeting (MKV) on gpt-4o-transcribe, title on nano in Replace mode:
+      "Validation and Release Blockers Coordination", 1,146 → 9 tokens, so nano's answer
+      fits the 200-token limit with room to spare. Whole run $0.02, 18 s. Still unseen
+      live: a Serbian title, and a Local run with a title.
 
 ### P1 — transcript correctness
 - [ ] **Blind test of providers on real audio before 2027-02-26** (M). 10–15 min of real
@@ -758,7 +803,10 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ### P5 — features and later
 - [ ] **Meeting summary and action items** (R38, M). An explicit button, gpt-5.4-mini, stored
-      in a new nullable `summary` column; hidden for very short transcripts.
+      in a new nullable `summary` column; hidden for very short transcripts. `titles.py`
+      is the pattern (one chat request, usage record, failure only warns).
+- [ ] **AI titles for older rows** (S). A "Make a title" button in a History entry
+      (only when the mode is on and the row has none); today only new runs get one.
 - [ ] **Hosting** *(researched)* — Hugging Face Spaces or an Oracle Always Free VM; users
       must bring their own OpenAI key. Needs a **concurrency limit + queue** if the offline
       engine is ever public.
@@ -766,6 +814,22 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-09-29 — AI title for transcripts
+
+The owner asked for a setting, chosen once, that has AI name each transcript from its
+content, replacing the file name or added after it, with a choice of model, the same
+key, and an Off option; after the proposal, "kreni", adding that Local runs may be
+titled too. Built as `titles.py` (request, cleaning, display), a `title` column and a
+`preferences` table in the history database, a sidebar section, the title's tokens in
+the run cost, and History labels and download names per mode (decisions in §3 "AI
+title"). 32 new tests (242 in total); 18 of 18 bugs put back were caught. Checked by
+eye on an isolated instance (seeded rows, OpenAI pointed at a dead address): the
+sidebar setting, the append and replace labels and the original name in the entry's
+caption; the mode change was stored. The real database was not touched (hash
+unchanged). The owner then ran it live and approved it (§5 "Waiting for the owner":
+an English meeting got a fitting title for 1,146 → 9 tokens); at the owner's request
+the title under the result is labelled "AI title:".
 
 ### 2026-09-27 (part 2) — S1, S2, S4 fixed; S3 studied and left as it is
 
