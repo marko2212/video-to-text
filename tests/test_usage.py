@@ -108,3 +108,14 @@ def test_a_title_is_priced_like_a_chat_answer_and_marked_as_a_title():
     # $0.75 per 1M input tokens, $4.50 per 1M output tokens.
     assert record["cost_usd"] == pytest.approx((17_000 * 0.75 + 10 * 4.50) / 1e6)
     assert record["kind"] == "title"
+
+
+def test_every_offered_transcription_model_has_a_hint_with_its_price():
+    import config
+
+    for model in config.TRANSCRIPTION_MODELS:
+        assert model in config.TRANSCRIPTION_MODEL_NOTES
+        per_minute = config.TRANSCRIPTION_PRICE_PER_MINUTE.get(model)
+        if model not in config.TRANSCRIPTION_PRICE_PER_MTOK:
+            # Billed per minute: the dropdown must show the price it is billed at.
+            assert f"${per_minute}/min" in config.TRANSCRIPTION_MODEL_NOTES[model]

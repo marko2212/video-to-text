@@ -53,6 +53,17 @@ AUDIO_FORMATS: list[str] = [
 # Transcription models. The first entry is the default shown in the UI.
 DEFAULT_MODEL: str = "gpt-4o-transcribe"
 TRANSCRIPTION_MODELS: list[str] = [DEFAULT_MODEL, "whisper-1"]
+# A short hint per model for the UI dropdown: release year, strength, price.
+# At most ~360 px of text (about 55 characters) shows in the dropdown on a
+# 1860 px wide window before it is cut off. gpt-4o-transcribe is billed per
+# token: $0.0027-0.0033 per minute was recorded on the owner's first 4 runs
+# (2026-09-29), and dense Serbian speech (more output tokens) works out near
+# $0.0045 — hence ~$0.004. whisper-1's figure is its per-minute price below; a
+# test keeps the two in step.
+TRANSCRIPTION_MODEL_NOTES: dict[str, str] = {
+    "gpt-4o-transcribe": "2025, more accurate · ~$0.004/min",
+    "whisper-1": "2023, exact timestamps & .srt · $0.006/min",
+}
 # Models that can return per-segment timestamps (verbose_json) for SRT export.
 TIMESTAMP_MODELS: set[str] = {"whisper-1"}
 
@@ -235,7 +246,7 @@ LOCAL_MODELS: dict[str, str] = {
     "small": "~480 MB · balanced",
     "medium": "~1.5 GB · slower, more accurate",
     "large-v3": "~3 GB · slowest, best accuracy",
-    "large-v3-turbo": "~1.5 GB · accurate, 2–5× faster than large-v3",
+    "large-v3-turbo": "~1.5 GB · near large-v3, 2–5× faster",
 }
 DEFAULT_LOCAL_MODEL: str = "base"
 # Approximate download sizes (MB), used to drive the download progress bar.

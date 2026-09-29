@@ -14,7 +14,8 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 * **Automatic preparation:** audio from a video is extracted automatically on upload (no manual step); audio files are used as-is.
 * **Built-in audio player** to listen to the uploaded/extracted audio before transcribing — including phone recordings (AMR) that browsers cannot play natively; videos and large files get a small MP3 preview so the page stays fast.
 * **Two engines:** the **OpenAI API** (`gpt-4o-transcribe` / `whisper-1`) or a **local, offline Whisper** model (`faster-whisper`) that runs on your machine — free, private, no API key.
-* **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`); it downloads on first use.
+* **Pick the offline model size** in the UI (`tiny` … `large-v3-turbo`, all OpenAI's open-source Whisper); it downloads on first use.
+* **Model hints in the dropdowns:** each OpenAI model shows its release year, what it is good at and its price per minute — `gpt-4o-transcribe` (2025) is the more accurate one and, billed per token, usually the cheaper (~$0.004/min measured on real meetings, against `whisper-1`'s fixed $0.006/min).
 * **Readable transcripts** — time markers and automatic paragraph breaks instead of one wall of text: exact `(M:SS)` with `whisper-1` and the local engine, approximate `(~M:SS)` per paragraph with `gpt-4o-transcribe`.
 * **On-screen context (video):** optionally pull the frames where the picture changed, have a vision model describe them, and place those notes in the transcript at their time — so slides, diagrams and shared screens are captured, not just speech.
 * **AI title (optional):** after each run a chat model names the transcript from its content, and History and downloaded files use that name — instead of the file name, or after it (see [AI title](#ai-title-)).

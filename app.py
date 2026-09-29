@@ -56,6 +56,7 @@ from config import (
     TITLE_MODE_OFF,
     TITLE_MODELS,
     TITLE_MODES,
+    TRANSCRIPTION_MODEL_NOTES,
     TRANSCRIPTION_MODELS,
     VIDEO_FORMATS,
     VISION_MODELS,
@@ -1508,12 +1509,17 @@ def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
 
     if provider == PROVIDER_LOCAL:
         model = st.selectbox(
-            "Local model",
+            "Local Whisper model",
             options=list(LOCAL_MODELS),
             index=list(LOCAL_MODELS).index(DEFAULT_LOCAL_MODEL),
             format_func=lambda name: f"{name} · {LOCAL_MODELS[name]}",
             disabled=disabled,
-            help="Downloaded on first use; runs fully offline, no key.",
+            help=(
+                "Every option is OpenAI's open-source **Whisper**, run on this "
+                "computer by faster-whisper; they differ in size. Bigger is more "
+                "accurate but slower. Downloaded on first use; runs fully offline, "
+                "no key, no cost."
+            ),
         )
         # Local models all return native timestamps.
         with_timestamps = st.checkbox(
@@ -1527,11 +1533,14 @@ def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
         "Transcription model",
         options=TRANSCRIPTION_MODELS,
         index=0,
+        format_func=lambda name: f"{name} · {TRANSCRIPTION_MODEL_NOTES[name]}",
         disabled=disabled,
         help=(
-            "**gpt-4o-transcribe** — newer, more accurate; paragraphs get "
-            "approximate (~M:SS) times.\n\n"
-            "**whisper-1** — exact timestamps & subtitles (.srt)."
+            "**gpt-4o-transcribe** — newer (2025), more accurate and usually "
+            "cheaper: billed per token, about $0.003–0.005 per minute of speech. "
+            "Paragraphs get approximate (~M:SS) times.\n\n"
+            "**whisper-1** — older (2023), a fixed $0.006 per minute; exact "
+            "timestamps & subtitles (.srt)."
         ),
     )
     if model in TIMESTAMP_MODELS:

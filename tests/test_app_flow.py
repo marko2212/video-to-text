@@ -746,7 +746,7 @@ def test_start_uses_the_settings_on_the_page_not_those_of_the_run_before(monkeyp
     test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
     _upload(test, "talk.wav", b"talk audio")
 
-    [model] = [s for s in test.selectbox if "whisper-1" in s.options]
+    [model] = [s for s in test.selectbox if s.label == "Transcription model"]
     model.set_value("whisper-1")
     _start_button(test).click().run()
 
