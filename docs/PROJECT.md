@@ -509,6 +509,15 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   open one is read from SQLite. Every rerun used to fetch and render all transcripts
   (1.6 MB of text at 104 rows). Measured with 104 synthetic rows: **281 ms → 14 ms per
   rerun** server-side, and 0 instead of 104 text boxes sent to the browser.
+- **Model dropdowns say what each option is** *(2026-09-29, the owner's request)*: the
+  OpenAI models show release year, strength and price per minute
+  (`TRANSCRIPTION_MODEL_NOTES`), and the local list is labelled "Local Whisper
+  model" — its options are sizes of one model, which the owner could not tell. The
+  gpt-4o-transcribe figure (~$0.004/min) comes from the recorded cost of the owner's
+  first 4 runs ($0.0027–0.0033) and the dense-Serbian estimate (~$0.0045); whisper-1's
+  is its list price, kept in step with `TRANSCRIPTION_PRICE_PER_MINUTE` by a test. A
+  hint must stay under ~360 px (about 55 characters): on a 1860 px window the
+  dropdown cut the old large-v3-turbo hint mid-word.
 - **CSS hack for the uploader label** — Streamlit prints the full list of 27 extensions; it
   is hidden and replaced with short text. The element to target is a **`<span>`** (not
   `<small>` — established by inspecting the DOM).
@@ -614,7 +623,7 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 242 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 243 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -814,6 +823,16 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-09-29 (part 2) — Model dropdowns explain their options
+
+The owner asked which model the Local sizes are, and for a note on the two OpenAI
+models (which is newer, which costs more). The recorded costs of their 4 runs so far
+(read-only aggregate) put gpt-4o-transcribe at $0.0027–0.0033 per minute — cheaper
+than whisper-1's $0.006 — so the dropdown now reads "2025, more accurate · ~$0.004/min"
+against "2023, exact timestamps & .srt · $0.006/min"; the local list is labelled
+"Local Whisper model" with a help line. Hints were measured to fit the dropdown at
+the owner's window width (§3 UI). 243 tests pass.
 
 ### 2026-09-29 — AI title for transcripts
 
