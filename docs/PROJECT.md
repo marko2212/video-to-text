@@ -38,13 +38,14 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job). No ffmpeg/IO logic inline. |
 | `config.py` | **Pydantic Settings + every constant** (single source of truth): formats, models, paths, limits |
 | `audio.py` | ffmpeg helpers: `save_uploaded_file`, `to_wav` (mono 16 kHz), `to_preview` (small MP3 for the player) — UI-agnostic |
+| `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, stable list labels, a file's identity — UI-agnostic |
 | `frames.py` | One-pass video scan (scene changes + 5 s grid, dHash), selection from the scan, single-frame extraction |
 | `vision.py` | Describes those frames with a vision model (cached per frame); cost estimates for the UI |
 | `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed) and `transcribe_local`; transcript rendering |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
 | `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume |
 | `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions; opt-in) |
-| `titles.py` | AI title of a finished transcript: the chat request, cleaning the answer into a safe file name, how a title is shown per mode |
+| `titles.py` | AI title of a finished transcript: the chat request (with the transcript's script named, and one retry for a title in a foreign script), cleaning the answer into a safe file name, how a title is shown per mode |
 | `usage.py` | Per-request token and cost records (transcription, vision, title), totals, USD formatting; pure functions |
 | `db.py` | SQLite history (`data/transcriptions.db`) and the sidebar preferences stored with it |
 | `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `TitleError`, `OpenAIAccountError`) |
@@ -54,7 +55,9 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 
 ### Data flow
 ```
-upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file as-is)
+upload (identified by file_id, saved to uploads/)
+  OR a recording from a folder on this computer (path + size + mtime; read in place)
+       → (video? ffmpeg to_wav mono-16k : use the file as-is)
        → audio player (MP3 preview for video, AMR/WMA/AIFF and files > 25 MB)
        → pick engine + model  [+ optional on-screen context, video only]
        → Start: request stored, page redrawn with every control locked, job runs
@@ -68,7 +71,8 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
        → rendering: (M:SS) or (~M:SS) + paragraphs, on-screen notes placed by time,
           Serbian Cyrillic → Latin only with SERBIAN_LATIN=true → .txt (+ .srt if requested)
        → (AI title, if on: a chat model names the finished transcript — after either
-          engine; a failure only warns)
+          engine; a title in a script the transcript never uses is sent back once;
+          a failure only warns. History can title a saved row later.)
        → write to SQLite history (a partial run is shown, marked, and not saved)
 ```
 
@@ -393,6 +397,8 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   `.env` and not in the session: the page must be able to change them, and they
   belong with the history they rename (backed up with it, no new file to gitignore).
   Read once per session; a stored model no longer offered falls back to the default.
+  The same table keeps the file source and the recordings folder (`source`,
+  `recordings_folder`; `app._PREFERENCES`).
 - **Titles after Local runs too — the owner's call** (2026-09-29, "neko ko lokalno
   pravi transcript slobodno može isto da generiše naslov"). The Local engine keeps the
   audio on the machine, but with titles on, its transcript is sent to OpenAI; the
@@ -411,6 +417,63 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **The answer is cleaned into a safe file name** — first line only, a `Title:` /
   `Naslov:` label and quotes removed, `:` → ` -`, characters Windows forbids replaced,
   at most 80 characters cut at a word, reserved names (`CON`, `COM1`…) extended.
+- **The title must be in a script the transcript uses; one retry, then no title**
+  *(2026-09-29)*. nano titled the owner's English Teams meeting
+  `部署自动化与TIS订阅环境选型讨论` — right content, wrong language; the transcript had
+  30,375 letters, all Latin (counted by script, read-only). The prompt already said "in
+  the language and script the speakers use". Now the transcript's letters are counted by
+  script (`titles.letter_scripts`); the user message ends, after the transcript, with a
+  reminder naming the main script (a small model follows what it read last); and a
+  title that does not fit goes back once, as the assistant's answer plus a correction.
+  A second misfit → no title with a warning ("wrote it in CJK script twice"), since a
+  third try would mostly pay for the same mistake. The retry re-sends the transcript,
+  so it doubles that title's cost (≈ $0.002 for the owner's 53-minute meeting); every
+  paid request is counted, also when the title fails (`TitleError.usage_records`).
+  - *What fits:* the title's **main** script must hold at least **10 %** of the
+    transcript's letters, and its other letters must occur in the transcript at all.
+    The first version only asked for presence; the review showed one line of the
+    Chinese subtitle credits Whisper hallucinates into silence would then let a Chinese
+    title through. The share lets either script of a Serbian meeting that alternates by
+    chunk pass (while it is a tenth of the text), and presence keeps "Azure" in a
+    Cyrillic title.
+  - *Counting:* NFKC first and modifier letters (Lm) skipped — the first version, which
+    took the first word of each letter's Unicode name, called `º`, `ª`, `µ`, `ＡＩ` and
+    `ʼ` scripts of their own (MASCULINE, FEMININE, FULLWIDTH…) and would have sent good
+    titles back; hiragana and katakana count as CJK, so Japanese is one script. No
+    `regex` dependency for the Script property: NFKC + the name covers the owner's
+    languages.
+  - *Timeout:* a title request waits at most 60 s (`TITLE_TIMEOUT_SECONDS`), not the
+    5 minutes a transcription chunk may take.
+  - Rejected: detecting the *language* (English vs Serbian share the Latin script) —
+    it needs a language model or a dictionary, and the observed failure was the script.
+    Not caught: a Latin title in the wrong Latin language.
+- **Titles for saved rows come from a History button, and cost is added to the row**
+  *(2026-09-29)*. "🏷️ Make a title" / "🏷️ New title" in an open entry, only while the
+  mode is on (Off shows no titles), disabled without a key. The request's usage joins
+  the row's `title` part of `usage_json` and `cost_usd` (`usage.add_to_cost`) — also
+  when no title came back, since it was paid. Rows saved before costs were recorded
+  keep no cost: the title's alone would read as the price of the whole transcript. The
+  owner can fix the Chinese title of their row this way (their click, ≈ $0.002). How it
+  runs, each point a finding of the review:
+  - The click only marks the entry; the request is made while the list is drawn, under
+    a spinner in the entry's place. Done in the callback, it blocked the page with no
+    sign of life.
+  - **Streamlit 1.56 identifies an expander by its label too** (`key_as_main_identity`
+    is False for `st.expander`), so a new title made a new, closed entry and its message
+    was never seen. The entry is drawn with `expanded=True` for `(id, new label)`
+    (`hist_reopen`). The AppTest that opened entries through
+    `session_state["hist_<id>"]` passed anyway — that value survives the identity
+    change; the tests now send the expander's state the way a browser does
+    (`_run_as_browser`, AppTest internals).
+  - A second click within 2 s of the last title of that entry is ignored
+    (`TITLE_REPEAT_GUARD_SECONDS`): the second half of a double click would pay again.
+    A token drawn into the button's arguments would not help: Streamlit 1.56 keeps one
+    set of callback arguments per widget, from the latest run that drew it
+    (`SessionState._set_widget_metadata`, read in the code). Checked live against a
+    fake OpenAI server: a JS double click sent one pair of requests. The outcome
+    message stays while the entry is open, so the ignored click's rerun does not wipe it.
+  - A new title for the row just transcribed also renames the Result's downloads
+    (`run_row_id`).
 
 ### Offline engine
 - **`faster-whisper`** (not `openai-whisper`, not `whisper.cpp`) — the best fit for Python
@@ -470,6 +533,31 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   unlocked ~2 s later, the restart re-sent nothing already finished. A background
   worker thread (the "M" option for R05) was not needed: with checkpoints, a stopped
   or reloaded run costs only the chunk in flight.
+- **A visible ⏹ Stop button, the same mechanism as the toolbar's Stop**
+  *(2026-09-30)*. The owner did not notice the toolbar's Stop. The button, under
+  Start, is the one control left enabled during a run (only in the run that owns the
+  job — not while an earlier run's thread is already stopping), with a caption that it
+  stops after the part in progress. Its click is an ordinary rerun request, which
+  stops the job's script at its next Streamlit call — **session-state reads and writes
+  count too**, not only drawing. How the rerun then runs depends on
+  `runner.fastReruns`:
+  - *On (Streamlit's default):* the rerun starts at once in a **new** thread while the
+    old one finishes its request; the page stays locked and says "Stopping — waiting for
+    the request in progress to finish…" within about a second, and the watchdog
+    retires the job when the old thread ends — the toolbar Stop's path. This was found
+    live, not assumed: the first live test seemed to send one part too many, until the
+    fake server's log showed that part had started before the click.
+  - *Off (and in AppTest, which has no AppSession):* the rerun runs in the job's
+    **own** thread, which would start the job again; the callback sets
+    `stop_requested`, and `_settle_job` retires the job when the current thread is
+    its worker.
+  An instant stop was not built: it needs a background worker, and the part in flight
+  is paid either way. A video scan still running (it reports no progress) finishes
+  before the stop.
+- **Between the history row and discarding the checkpoints there is no Streamlit
+  call** *(2026-09-30)*: `run_row_id` is stored after the discard. A Stop landing
+  between the two (with session state as a stop point) would have kept the parts of a
+  saved transcript, and the next Start would have saved it a second time.
 - **Transcription checkpoints are deleted only after the history row is written** —
   in the app, not in the pipeline, for the same reason: a run stopped between writing
   the transcript and saving it must be able to finish without paying again.
@@ -518,6 +606,77 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
   is its list price, kept in step with `TRANSCRIPTION_PRICE_PER_MINUTE` by a test. A
   hint must stay under ~360 px (about 55 characters): on a 1860 px window the
   dropdown cut the old large-v3-turbo hint mid-word.
+- **Recordings can come from a folder on this computer, read where they lie**
+  *(2026-09-29)*. A 372.6 MB video upload failed: `MemoryError` in Tornado's
+  `parse_multipart_form_data`, then `Invalid multipart/form-data`, HTTP 500, the file
+  red in the uploader. Streamlit receives an upload as one request body in memory, and
+  Tornado copies it while parsing (the slice and the split: roughly 3–4× the file for a
+  moment); measured soon after, the machine had **1.1 GB of commit free of 47.5 GB**
+  (Claude 11.3 GB, Edge 9.6 GB), and the app held 834 MB, partly the previous 437.6 MB
+  upload still in the uploader. Streamlit 1.56 has no chunked or on-disk upload, so the fix is
+  not to upload: the app runs on the machine that has the file. A source choice
+  ("Upload a file" / "From a folder on this computer") above the uploader; the folder
+  is typed or pasted once — a pasted recording path (Explorer's *Copy as path*, with
+  quotes) means its folder with that file chosen — and kept with the source in the
+  `preferences` table; the list shows the folder's video and audio files (not
+  subfolders), newest first, and starts empty so opening the page never starts an
+  extraction. The file is used in place: no copy in `uploads/`, ffmpeg reads the
+  original, on-screen context scans the original, clean-up never touches it (only
+  `temp/` and `uploads/`).
+- **A folder recording is identified by its path; a change on disk is reported, not
+  acted on** (a review finding). The first version keyed it on path + size + mtime,
+  like an upload's `file_id`; a recording still being written (OBS, a OneDrive sync)
+  then had a new identity on every click, which wiped a finished transcript from the
+  page and extracted the video again. Now the size and mtime at the moment of choosing
+  are kept (`source_version`), and a later change shows a warning with "↻ Load it
+  again". The checkpoint and screenshot-cache digests are taken when the run starts
+  and reused at its end, so a file that grows during the run does not leave its saved
+  parts behind.
+- **The folder field takes full paths only, and not the app's own folders**
+  (review findings): a relative path or a bare `C:` was read against the app's working
+  directory, whose `temp/` and `uploads/` hold its working copies — and "Clean temporary
+  files" would have deleted a recording picked there. `temp/`, `uploads/`, `data/` and
+  `models/` (and folders inside them) are refused with a warning. A folder that cannot be
+  read says so ("cannot be read: Access is denied") instead of "no video or audio files";
+  a chosen file that disappeared says so instead of being forgotten silently (a Start at
+  that moment did nothing); a path pasted in another letter case finds its file
+  (`os.path.normcase`).
+- **📂 Browse… opens the computer's own file window, in a process of its own**
+  *(2026-09-30, the owner: recordings live in different folders, and pasting paths is
+  clumsy)*. The app runs on the owner's machine, so the server can show Windows' *Open*
+  window (tkinter's `askopenfilename`, which is the native dialog); the chosen file's
+  folder becomes the recordings folder and the file is chosen. Decisions:
+  - **A child process** (`sys.executable -c <script>`), not a thread: Tk must not be used
+    from Streamlit's script threads (a Tk object collected in another thread aborts the
+    whole process with `Tcl_AsyncDelete`), and each rerun may be a different thread. The
+    child prints the path; `PYTHONUTF8=1` keeps č, ć, š intact in the pipe.
+  - **Topmost, not foreground:** measured on the owner's machine, the window appears in
+    0.7 s, 960×540, on top of the browser — but Windows does not let a background process
+    take the keyboard focus, so the owner clicks into it. The spinner says where to look.
+  - One window at a time for the whole app (a process-wide lock: a second click or tab
+    gets "already open — it may be behind the browser"), opened in the last folder, and
+    given up after 10 minutes (`FILE_PICKER_TIMEOUT_SECONDS`), since the page waits.
+  - A native picker, not a file tree drawn in the page (a component) or a list of
+    several fixed folders: it goes anywhere, looks like every other program, and needs
+    no dependency (tkinter ships with the uv Python). Only where the folder source is
+    offered (loopback), since the window opens on the machine that runs the app.
+  - Labelled "📂 Browse…": "Choose file…" wrapped onto two lines at a 1440 px window.
+- **The folder list's labels must not change while a file grows.** Streamlit 1.56 keeps a
+  keyed selectbox's value as the *formatted label*, so a label with the size or the
+  modification time would lose the choice whenever the file grew — e.g. OBS recording
+  the next meeting into the same folder while the previous one is transcribed. Labels
+  are `name · creation time` (`st_birthtime`, Windows/macOS; Linux falls back to mtime),
+  the list is ordered by creation time for the same reason, and the size and last save
+  are a caption under the list.
+- **The folder source is offered only while the app listens on loopback, and
+  `ALLOW_LOCAL_FILES=false` turns it off anyway.** The page can list and read any
+  folder of its machine; that is the point locally, and a leak to anyone else who can
+  open it — including someone on the LAN after `--server.address=0.0.0.0`, the way
+  `.streamlit/config.toml` suggests for reaching it from another device (they would also
+  transcribe with the owner's key; a UNC path they type would make the machine connect
+  to their SMB host). So `server.address` must be `localhost`, `127.0.0.1` or `::1`;
+  Docker (which binds `0.0.0.0` inside the container) gets only the uploader. See
+  Hosting in §5.
 - **CSS hack for the uploader label** — Streamlit prints the full list of 27 extensions; it
   is hidden and replaced with short text. The element to target is a **`<span>`** (not
   `<small>` — established by inspecting the DOM).
@@ -525,6 +684,32 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 ### Data
 - **SQLite lives in `data/`, not `temp/`** — history **survives** "Clean temporary files"
   (which wipes `temp/` and `uploads/`). That is the whole point of having it.
+- **Working copies of recordings are deleted after a day, each time the page is
+  opened; transcripts are not — yet** *(2026-09-30, the owner's choice)*. Nothing but
+  the "Clean temporary files" button removed uploads and extracted audio: `uploads/`
+  held 11 MKVs back to 2026-09-14 (2.67 GB) and `temp/` 794 MB, mostly WAVs.
+  `checkpoints.prune_working_copies` now deletes files directly in `uploads/`, and
+  `.wav` / `.mp3` files directly in `temp/`, whose modification time is over 24 h
+  (`WORKING_COPY_MAX_AGE_HOURS`), once per page opened — next to the existing 24 h
+  scratch rule and the 14-day rule for saved parts, whose folders it does not touch.
+  - *Rejected by the owner:* also deleting the previous file's copies whenever a new
+    file is chosen. The age rule alone is simpler and bounds the pile to one day.
+  - *Transcripts (`.txt`, `.srt` in `temp/`) are kept for now* — the owner's call
+    ("to ćemo kasnije"); they are small (18 files, 0.3 MB) and the Result panel reads
+    them. See §5.
+  - *Safe by construction:* nothing while a run is active in this process; nothing in
+    a folder that holds the history or the models (with `DATA_DIR` = `UPLOAD_DIR`
+    nothing there is deleted at all); a file another program holds open is skipped and
+    logged. The guard is per process — a second app instance does not see this one's
+    run — but a run reads its WAV at the start and digests it then, so a copy deleted
+    under it costs nothing.
+  - *A page that outlived its copy prepares it again* (`prepare_audio` checks that the
+    prepared file still exists): an upload is re-saved from the browser's copy in the
+    session, a folder recording re-read, a video's audio re-extracted. Re-extraction is
+    byte-identical (checked: two extractions of the same video a moment apart gave the
+    same checkpoint digest), so the saved parts of an unfinished run are still used.
+  - When introduced it frees about 1.9 GB on the owner's machine at the first page
+    opened (12 uploads, 1.5 GB; 15 WAV/MP3, 0.4 GB — sizes read, nothing opened).
 - **PRAGMA `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`** — better defaults
   for Streamlit's rerun model and multiple open sessions.
 - **Migration without a migration tool:** `init_db()` checks `PRAGMA table_info` and adds
@@ -594,6 +779,9 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 
 **Features**
 - Upload **video** (16 formats) and **audio** (11 formats, incl. AMR); video audio is extracted automatically
+- **Or pick a recording from a folder on this computer** — read in place, no upload, no
+  copy; for large files that an upload cannot hold in memory *(2026-09-29)*; found with
+  **📂 Browse…** in Windows' own file window, in any folder *(2026-09-30)*
 - **Audio player** before and after transcription
 - **Two engines**: OpenAI API (`gpt-4o-transcribe` / `whisper-1`) and **Local offline** (faster-whisper, selectable model size)
 - **Timestamps + `.srt`** export (whisper-1 and every local model)
@@ -606,7 +794,8 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **Reliable long runs** *(2026-09-25)*: 5-minute chunks cut in pauses (no silent
   truncation at the output cap), checkpoints so a failed or stopped run resumes without
   paying again, partial transcripts clearly marked, one-sentence errors for a bad key
-  or an empty balance, controls locked during a run with a watchdog after Stop
+  or an empty balance, controls locked during a run with a watchdog after Stop, and a
+  visible ⏹ Stop button that stops after the part in progress *(2026-09-30)*
 - **Original script kept by default**; Serbian → Latin is opt-in (`SERBIAN_LATIN=true`)
   *(2026-09-25)*; one-off backfill script for saved records
 - **Playable previews** for AMR/WMA/AIFF, video and large files; fast History at 100+
@@ -615,15 +804,18 @@ upload (identified by file_id) → (video? ffmpeg to_wav mono-16k : use the file
 - **Actual tokens and cost of every run** next to the transcript and in history *(2026-09-25)*
 - **AI title** *(2026-09-29)*: an optional sidebar setting, kept across sessions, that
   names each transcript from its content (nano or mini) and uses the title instead of,
-  or after, the file name in History and in downloaded file names
+  or after, the file name in History and in downloaded file names; the title keeps to
+  the transcript's script (one retry), and saved rows can be (re)titled from History
 - **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
+- **Working copies clear themselves** — uploads and extracted audio over a day old are
+  deleted when the page is opened *(2026-09-30)*
 - **Hybrid API key** (`.env` or sidebar); offline works with no key
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
 
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 243 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 317 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -716,6 +908,26 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 - [x] Committed and pushed (code, then docs), CI on GitHub.
 
 ### Waiting for the owner
+**Next step: the owner opens the app** — that runs the first real cleanup — **and tries
+the live checks below**; then the sidebar question.
+- [x] **Commit and push** — done 2026-10-03 ("komituj i pušuj"): the title's script
+      check and the History title button, the folder source with 📂 Browse…, the ⏹ Stop
+      button and the one-day cleanup, after a last review of Stop, Browse and the cleanup
+      (journal 2026-10-03). One feat commit and one docs commit: `app.py` carries all
+      four features, so commits per feature would have left states that do not pass.
+- [ ] **Move "Clean temporary files" to the sidebar?** Proposed 2026-09-30, the owner
+      has not decided: at the bottom of the sidebar, in a small "🧹 Working files"
+      section with one line saying how much space those files take. With the one-day
+      cleanup it is rarely needed, it is maintenance rather than a transcription step,
+      and it sits right under Start/Stop although it also deletes the saved parts of
+      unfinished runs.
+- [ ] **First real run of the one-day cleanup.** On 2026-10-03 it had not run yet: the
+      owner's app last worked on 2026-09-30 16:32, just before the cleanup was added, and
+      was not running. `uploads/` held 16 files (2.67 GB, back to 2026-09-14) and `temp/`
+      45 (880 MB: 13 WAV, 14 MP3, 18 TXT). The first page opened should remove everything
+      but the TXT files older than a day — check the sizes afterwards (totals only).
+- [ ] **Live check of 📂 Browse… with a real choice** — the window was opened and
+      cancelled from scripts only; choosing a file in it is the owner's to try.
 - [x] **The key and the credit were on different accounts** — resolved 2026-09-25: the
       old key belonged to another OpenAI login (balance $0); the owner put a key from the
       funded marko2212 account into `.env`.
@@ -729,6 +941,16 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       "Validation and Release Blockers Coordination", 1,146 → 9 tokens, so nano's answer
       fits the 200-token limit with room to spare. Whole run $0.02, 18 s. Still unseen
       live: a Serbian title, and a Local run with a title.
+- [ ] **Live check of the script guard and the History title** (the owner's credit,
+      ≈ $0.002): open the 2026-09-29 "Venki join us" entry, whose title nano wrote in
+      Chinese, and press 🏷️ New title — it should come back in English, and the entry's
+      cost grow by the title. Checked only without OpenAI: on an isolated copy with
+      OpenAI unreachable (the warning, the unchanged row) and against a local fake chat
+      server (Chinese answer → correction → English title, entry kept open), and in
+      AppTest.
+- [ ] **Live check of a large recording from a folder** — e.g. the 372.6 MB "Cisco"
+      MKV whose upload failed. The isolated check used a 4 MB synthetic MKV and a
+      synthetic M4A (extraction, player, a Local run, clean-up leaving the originals).
 
 ### P1 — transcript correctness
 - [ ] **Blind test of providers on real audio before 2027-02-26** (M). 10–15 min of real
@@ -753,6 +975,9 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       shorter loop.
 
 ### P2 — responsiveness and UI
+- [x] **A visible Stop button next to the progress** — done 2026-09-30 (the owner's
+      "uradi sada dugme stop"): "⏹ Stop" under Start while a run works, the same
+      mechanism as the toolbar's Stop (§3 UI).
 - [ ] **Transcript box** (R20, S). `st.code(text, language=None, wrap_lines=True, height=…)`:
       read-only, scrolls, has a copy button (the editable text_area silently drops edits).
 - [ ] **Delete needs a confirmation** (R11, S). `st.popover` with "Delete permanently",
@@ -797,8 +1022,12 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       setup-uv (R33 rest); Docker cache, non-root user, `.env` passing and a `temp/` volume
       so checkpoints survive a recreated container (R53); openai SDK bump and jiter for
       Python 3.14 (R27); drop pydub (R17); refresh the README screenshots (R35); privacy
-      wording and README fixes (R47, R55); auto-clean old uploads (R48 rest); Host
-      allow-list (R30).
+      wording and README fixes (R47, R55); Host allow-list (R30). (Auto-clean of old
+      uploads, R48 rest, was done 2026-09-30 — §3 Data.)
+- [ ] **Transcript files in `temp/` (`transcript_*.txt` / `.srt`)** — left out of the
+      one-day cleanup by the owner (2026-09-30, "to ćemo kasnije"). They are small and the
+      Result panel reads them; decide whether they follow the same rule (the history
+      keeps the text anyway) or a longer one.
 - [ ] **A committed live-check harness.** Today's browser checks used a copy of the app
       with a fake, slow OpenAI client (every request logged with its thread) and
       puppeteer scenarios, kept only in the session scratchpad. Committing them (e.g.
@@ -809,20 +1038,221 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       the developer menu's "Clear cache" stays usable during a run and clears session
       state; a Stop landing in the tens of milliseconds between Start and the job leaves
       it to run on the next rerun.
+- [ ] Review leftovers of 2026-10-03 (low, from reading): **a Stop that lands in the
+      milliseconds after the history row is saved** (between the insert and the next
+      session-state access) retires the job with "stopped before it finished … Start
+      transcribes it from the beginning" although the row is saved — pressing Start would
+      pay again and save a second row. Suggested fix: record the row on the job dict right
+      after the insert (a dict write is no stop point) and let `_settle_job` say the run
+      finished. Smaller: a Stop during the title request loses that paid title (it is
+      bought again on the next Start). Two tabs titling one row at once can lose one cost
+      update (2026-09-29 review).
 
 ### P5 — features and later
 - [ ] **Meeting summary and action items** (R38, M). An explicit button, gpt-5.4-mini, stored
       in a new nullable `summary` column; hidden for very short transcripts. `titles.py`
       is the pattern (one chat request, usage record, failure only warns).
-- [ ] **AI titles for older rows** (S). A "Make a title" button in a History entry
-      (only when the mode is on and the row has none); today only new runs get one.
+- [x] **AI titles for older rows** — done 2026-09-29: "🏷️ Make a title" in a History
+      entry, and "🏷️ New title" for a row that has one (to replace a bad title), while
+      the mode is on; its cost is added to the row (§3 AI title).
 - [ ] **Hosting** *(researched)* — Hugging Face Spaces or an Oracle Always Free VM; users
       must bring their own OpenAI key. Needs a **concurrency limit + queue** if the offline
-      engine is ever public.
+      engine is ever public. The folder source switches itself off when the server does
+      not listen on loopback only; `ALLOW_LOCAL_FILES=false` makes that explicit.
 
 ---
 
 ## 6. Journal
+
+### 2026-10-03 — Last review, two fixes, commit
+
+Status first: 314 tests passed and ruff was clean on the uncommitted work; the owner's
+app was not running, and its last run (2026-09-30 16:32) predates the cleanup, so
+`uploads/` still held 2.67 GB and `temp/` 880 MB.
+
+On "komituj i pušuj", the parts no review had seen yet — Stop, Browse… and the cleanup —
+went to one reviewer subagent first (isolated, no real data, no file window). No serious
+bug; three low-probability ones, two fixed before the commit:
+- A Browse click handled in the same moment as Start opened the file window in the
+  job's own run, blocking the job; and one overtaken by a switch to Upload came back
+  later. The pending click is now dropped on every run and acted on only while nothing
+  runs.
+- An upload is saved a little before its WAV, so the one-day cleanup can delete the
+  video and keep the WAV; the page did not prepare it again (on-screen context would
+  then fail with a warning). `prepare_audio` now also checks the video's copy.
+- Left, recorded in §5 P4: a Stop in the milliseconds right after the history row is
+  saved gives a misleading "start from the beginning" notice.
+
+317 tests (3 new); the three new tests each failed with their fix undone (in a copy of
+the repo). Committed as one feat and one docs commit — see §5.
+
+Done on 2026-09-29/30, in order (details in the entries below and in §3): the AI
+title keeps to the transcript's script and can be (re)made from History; recordings
+can be picked from a folder on this computer (no upload, no memory copy), with an
+adversarial review whose nine findings were fixed; a visible ⏹ Stop button; 📂 Browse…
+in Windows' own file window; working copies older than a day deleted when the page is
+opened (transcripts kept for now).
+
+### 2026-09-30 (part 3) — Working copies clear themselves after a day
+
+The owner found `uploads/` full of recordings back to 2026-09-14 and asked for automatic
+deletion. Two options were proposed — delete the previous file's copies when a new one
+is chosen, and delete copies over a day old when the page is opened; the owner chose
+the second alone, without transcripts ("uradi tako, samo nemoj i za .txt, to ćemo
+kasnije, zapiši to kao odluku"). My first wording said the existing cleanup "already
+works this way", which the owner rightly questioned: it only ever covered scratch
+folders (24 h) and saved parts (14 days), never `uploads/` or the WAVs. Decision and
+safety rules in §3 Data; the transcripts are an open item in §5.
+
+Verified: 314 tests (6 new: what is deleted and kept, a run in progress, the history
+sharing the uploads folder, a file held open, once per opened page, a page that
+outlived its copy preparing it again and transcribing); 9 of 9 bugs put back were
+caught, in a copy of the repo; two extractions of the same video gave the same
+checkpoint digest (so resuming after a cleanup pays nothing again). Sizes on the
+owner's machine were read only as totals: the first page opened will free about 1.9 GB.
+The owner's app (two instances, started 15:22 and 16:24) runs from this checkout and
+picks the change up on its next rerun.
+
+### 2026-09-30 (part 2) — 📂 Browse… for recordings in any folder
+
+The owner keeps recordings in different folders and did not want to paste paths
+("kreni, slažem se sa predlogom"). The button opens Windows' own *Open* window from a
+child process; decisions in §3 UI.
+
+Verified:
+- 308 tests: the page (a chosen file is picked and its folder kept, the next window
+  opens there, cancel changes nothing, an error or a busy window says why, a non-media
+  file is refused) and the helper against a fake `subprocess.run` (arguments, UTF-8,
+  a failed or timed-out window, one window at a time).
+- 12 of 12 bugs put back were caught, in a copy of the repo (`scratchpad/mutcopy`).
+- The real window, without sending a keystroke: opened from a script, found by its
+  title — shown after 0.7 s, 960×540, topmost, not foreground — and closed with
+  `WM_CLOSE` (what Cancel does), which returned "nothing chosen". End to end: headless
+  Chrome clicked Browse… on an isolated instance, the page showed "Choose the recording
+  in the window that opened…", the server's window appeared, was closed the same way,
+  and the page came back without a warning. Choosing a real file is left to the owner.
+- Pitfall: stopping the isolated instance with `CommandLine -match '8597'` also killed
+  one of the owner's Edge processes, whose arguments happened to contain those digits
+  (one tab or extension will have crashed; a reload brings it back). Test servers are
+  now stopped by process name (python/uv/streamlit) and the exact `--server.port 8597`.
+
+### 2026-09-30 — A visible Stop button
+
+The owner asked for it after the proposal of 2026-09-29 ("uradi sada dugme stop").
+"⏹ Stop" under Start, enabled only while this run owns the job, with a caption; the
+decision and both rerun paths are in §3 UI.
+
+Before writing it, Streamlit 1.56 was read for how a click during a run is handled:
+`ScriptControlException` is a `BaseException` (so the app's `except Exception` around
+the job does not swallow it), every forward message and **every session-state access**
+is a stop point, and a rerun without fast reruns loops in the same thread. That last
+point would have restarted the job, hence `stop_requested` in `_settle_job`. The live
+check then showed that the default `runner.fastReruns` takes the other path (a new
+thread, the existing watchdog).
+
+Verified:
+- 299 tests. The main one presses Stop from inside a fake pipeline the way a browser's
+  click arrives — a rerun request with the page's widget states and the Stop trigger
+  (Streamlit internals, since AppTest cannot click during a run) — and checks that the
+  job ran once. Others cover the button being the only enabled control, a click after
+  the run changing nothing, the fast-reruns path, a Stop during the title (parts kept,
+  the next Start saves one row), and a Stop between the row and the discard.
+- The mutation check ran in a **copy** of the repo (`scratchpad/mutcopy`, the main
+  venv's Python), not in the owner's checkout (lesson of 2026-09-29): 9 of 9 bugs
+  caught. The first run missed one — the simulated click re-sent the Start button's
+  trigger from the same run, which a browser never does, so the job was re-requested
+  and the restart bug hidden; the helper now drops earlier triggers.
+- Live, on an isolated instance with a fake OpenAI server that takes 4 s per part and a
+  16-minute synthetic call (4 parts). Stop clicked during part 3 → part 3 finished
+  and was saved, nothing more was sent, "3 part(s) are saved"; Start then sent only
+  part 4 and the Result counted all four requests. Stop clicked during part 1 of a new
+  run → "Stopping — waiting for the request in progress to finish…" within 1.5 s →
+  "The last run was stopped before it finished. 1 part(s) are saved", again nothing
+  sent after the part in flight. No errors in the log. The real history is unchanged (115 old rows by hash,
+  plus the owner's own row of 2026-09-29 17:06).
+
+### 2026-09-29 (part 3) — Titles keep to the transcript's script; recordings from a folder
+
+The owner asked three things after their first long run (53:12, $0.17): how the
+`(~M:SS)` times come about with gpt-4o-transcribe (answered: chunk start + the
+paragraph's share of the chunk's characters, §2), why the AI title was Chinese, and
+what the red upload error was. Both causes were measured before anything was changed:
+the transcript held 30,375 letters, all Latin (a count by script, read-only), so nano
+had simply switched language; the upload died in Tornado's multipart parser with
+`MemoryError` while the machine had 1.1 GB of commit free (§3 UI). The owner said
+"kreni" for both fixes; a visible Stop button was proposed too and waits (§5 P2).
+
+- **Title:** the script is counted, named after the transcript, and a foreign-script
+  title goes back once (§3 AI title). `make_title` now returns a list of usage records;
+  `TitleError.usage_records` replaces `usage_record`. History got 🏷️ Make a title /
+  New title, whose cost joins the row (`usage.add_to_cost`, `db.set_title`).
+- **Folder source:** `recordings.py`, a source radio and a folder field kept in
+  `preferences`, a list keyed by path with labels that do not change as a file grows,
+  `prepare_audio(name, is_audio, obtain)` so both sources share one path, clean-up
+  clears the pick, `ALLOW_LOCAL_FILES` to turn it off (§3 UI).
+
+**Review.** An adversarial reviewer (a subagent, isolated folders, no network) read
+the diff before any commit and confirmed nine findings by probes; all but the two-tab
+race on one row's cost were fixed the same day (§3 AI title, §3 UI):
+1. A new title closed the History entry and its message was never seen — Streamlit
+   1.56 identifies an expander by its label too. The AppTest passed only because it
+   opened the entry through `session_state`; the tests now send the expander state the
+   way a browser does.
+2. A folder recording still being written got a new identity on every click, wiping
+   the finished transcript — now identified by its path, a change is reported with
+   "↻ Load it again", and the checkpoint digests are taken when the run starts.
+3. One hallucinated Chinese line in a transcript let a Chinese title through — the
+   title's main script now needs a tenth of the transcript's letters.
+4. `º`, `ª`, `µ`, `ＡＩ`, `ʼ` counted as scripts of their own — NFKC, and no Lm.
+5. The title request ran in a callback: no progress, a page frozen for up to minutes
+   (the 5-minute timeout), a double click paid twice — now a spinner in the list, a
+   60 s timeout, a 2 s guard.
+6. A chosen file that vanished was forgotten silently (a Start then did nothing).
+7. A relative path or a bare `C:` listed the app's own folder; a path in another letter
+   case lost the pick; an unreadable folder read as empty.
+8. The folder source stayed on with `--server.address=0.0.0.0` — now loopback only.
+9. Minor: the Result kept the old title after a new one for the same row (fixed); two
+   tabs titling one row at once can lose one cost update (left as it is).
+
+Verified: 293 tests (50 new today); each of 51 bugs put back made a test fail — the
+first build's 30 (no retry, reminder missing, foreign script accepted, first answer's
+cost lost, cost not added or invented for old rows, button while off or without a key,
+newest file chosen at once, a folder file copied to `uploads/`, pick kept after
+clean-up, pasted quotes kept, size in the label, mtime ordering, …) and the review
+fixes' 21 (entry closed after a title, double click paid twice, changed recording wipes
+the result, stray line accepted, NFKC dropped, relative path or app folder accepted,
+digest taken after the run, network address still lists folders, …). Isolated
+instances (port 8597, scratch `DATA_DIR`/`TEMP_DIR`/`UPLOAD_DIR`) in the browser:
+- OpenAI at a dead address: a quoted file path chose the file and its folder; the list
+  held the MKV and the M4A but not a `.txt`, newest first; the MKV's audio was
+  extracted with `uploads/` staying empty; a Local run finished (an empty transcript →
+  "No AI title: the transcript is empty", no request); 🏷️ New title on a seeded row
+  with the Chinese title warned "Cannot reach OpenAI" and left title and cost as they
+  were; clean-up emptied `temp/` and left the recordings.
+- OpenAI replaced by a local fake chat server (first answer Chinese, the corrected one
+  English, request headers never read): "Writing a title…" showed in the entry's place,
+  the entry stayed open under "… - Deployment automation and TIS subscriptions" with its
+  message, the row's title part grew by 2 requests, and a JS double click sent one pair
+  of requests, not two.
+
+The real history was hashed before and after: the 115 rows are unchanged; a 116th
+appeared at 17:06 — the owner's own OpenAI run (video, 75 s, $0.076) in their app on
+port 8501.
+
+Pitfalls:
+- **The owner's app runs from this working tree** (started 13:41, still running), and
+  Streamlit reloads changed modules on its next rerun — so the owner's 17:06 run used
+  this uncommitted code, and the mutation checks, which rewrite `app.py` / `titles.py`
+  for seconds at a time, could have served a planted bug to them. Mutation checks
+  belong in a `git worktree`, not in the owner's checkout.
+- A keyed `st.selectbox` in Streamlit 1.56 stores its value as the formatted label
+  (`value_type="string_value"`), so a label that changes loses the choice; a keyed
+  `st.expander` is identified by its label as well.
+- `st.rerun(scope="fragment")` raises when the fragment runs as part of a full run, so
+  work that changes a fragment's labels goes before they are drawn.
+- A Bash heredoc mangled backslashes in Python edit scripts three times today (a `\n`
+  escape became a real newline, a Windows path became a `\U` escape) — edits with
+  backslashes go through the Edit or Write tool (the machine-wide lesson).
 
 ### 2026-09-29 (part 2) — Model dropdowns explain their options
 
