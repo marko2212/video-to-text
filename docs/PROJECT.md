@@ -38,12 +38,12 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job). No ffmpeg/IO logic inline. |
 | `config.py` | **Pydantic Settings + every constant** (single source of truth): formats, models, paths, limits |
 | `audio.py` | ffmpeg helpers: `save_uploaded_file`, `to_wav` (mono 16 kHz), `to_preview` (small MP3 for the player) — UI-agnostic |
-| `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, stable list labels, a file's identity — UI-agnostic |
+| `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, their lengths (ffprobe, cached per version), stable list labels, a file's identity — UI-agnostic |
 | `frames.py` | One-pass video scan (scene changes + 5 s grid, dHash), selection from the scan, single-frame extraction |
 | `vision.py` | Describes those frames with a vision model (cached per frame); cost estimates for the UI |
 | `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed) and `transcribe_local`; transcript rendering |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
-| `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume |
+| `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; also the age-based clean-ups of `temp/` and `uploads/` and the space they take |
 | `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions; opt-in) |
 | `titles.py` | AI title of a finished transcript: the chat request (with the transcript's script named, and one retry for a title in a foreign script), cleaning the answer into a safe file name, how a title is shown per mode |
 | `usage.py` | Per-request token and cost records (transcription, vision, title), totals, USD formatting; pure functions |
@@ -225,12 +225,31 @@ upload (identified by file_id, saved to uploads/)
 - **The sampling interval is a UI slider** (5–300 s, default 30). It is an *upper*
   bound — scene changes are captured on top of it — so the label reads "at least
   every".
-- **The screenshot count shown before the run is exact, from a scan of the video**
-  *(2026-09-25)*. It used to be the video's length over the interval, which is not
-  what gets described: on four real recordings a static 115-minute meeting estimated
-  at 231 screenshots described 10, and a busy 16-minute screen share estimated at 4
-  described 28 — the number described is the number of *distinct screens*. Now
-  ticking the box scans the video once (`frames.scan_video`): one ffmpeg pass keeps
+- **Before the run the caption gives a ceiling; the run scans the video and describes
+  its distinct screens** *(2026-10-03, the owner's call)*. From 2026-09-25 ticking the
+  box scanned the video so the caption could give the exact count — and the slider
+  waited for it, about a minute and a half per hour of video. The owner did not want
+  that wait, and noted that a maximum is always known. The caption now says, at once:
+  at most one screenshot per look (length ÷ interval, + 1) — the count for slides,
+  since ffmpeg's change detection rarely fires on them (a full-screen slide change
+  scored 0.077, under the 0.1 threshold) — plus what faster changes can add, up to one
+  per 2 s (`FRAME_MIN_INTERVAL_SECONDS`, the burst window) and never past the cap
+  (`FRAME_MAX_COUNT`; 300 on the owner's machine: $0.18 on nano, $0.67 on mini), with
+  "usually far fewer". It is priced for the video's own frame size (ffprobe; Full HD
+  only when unknown): frames are described at full size, and a 4K screen costs about
+  3.4 times the Full HD figure (pre-commit review). A prepared video whose file states
+  no length gets the per-video cap and says so. Its prices are written `\$`: two `$`
+  in one caption made Markdown show the text between as a formula, signs dropped
+  (seen live). A stored
+  scan (an earlier run of the video) still gives the exact count while a job runs; it
+  is not looked up before Start, since naming it means hashing the whole video. The
+  slider's help now says what it sets: how often the screen is *looked at*.
+- **The screenshots described are the distinct screens a scan finds** *(2026-09-25)*.
+  The count used to be the video's length over the interval, which is not what gets
+  described: on four real recordings a static 115-minute meeting estimated at 231
+  screenshots described 10, and a busy 16-minute screen share estimated at 4
+  described 28 — the number described is the number of *distinct screens*. The run
+  scans the video once (`frames.scan_video`): one ffmpeg pass keeps
   every scene change plus a frame every 5 s (the slider's finest step), with each
   frame's scene score and perceptual hash, and a run of near-identical frames keeps
   one JPEG (the static 115-minute meeting: 1,390 frames, 2 MB instead of 253 MB).
@@ -241,8 +260,8 @@ upload (identified by file_id, saved to uploads/)
   (170 s for 115 min, 23 s for 16 min); it is stored as `temp/scan-<hash of the
   video>/` until clean-up or 24 h, with its threshold and grid, so a scan made with
   other settings is redone. Interval samples may come up to one grid step (5 s) later
-  than the exact interval. The fallback when a scan fails is the old rough
-  length-over-interval guess, said to be a guess.
+  than the exact interval. A scan that fails leaves the run without on-screen notes,
+  with a warning.
 - **A frame whose JPEG is shared is taken from the video again before it is
   described** *(2026-09-27, review finding S1)*. The shared JPEG is only a disk
   saving: "near-identical" is the 8×8 hash's opinion, and two slides of one template
@@ -301,18 +320,20 @@ upload (identified by file_id, saved to uploads/)
 - **The job reads its settings from the page it draws, and owns its run from the
   first line** *(2026-09-27, review findings C4 and C6)*. Start used to capture the
   settings in its click; clicked while the page was still busy (ticking on-screen
-  context starts a scan of a minute or more), it carried the previous run's settings
+  context started a scan of a minute or more, until 2026-10-03), it carried the
+  previous run's settings
   and transcribed without screenshots. Now the click only records that a job was
   requested; the job run takes the settings from the widgets it draws (locked, so
   unchanged). The run is also the job's owner from `main()`'s first line, and while a
   job runs the settings panel only *loads* a stored scan, never starts one: a Stop
   during such a scan used to leave a job with no owner — every control locked, and
   the next rerun ran the stopped job.
-- **A failed scan is remembered per video; one scan per video at a time**
-  *(2026-09-27, review findings C1/C5/C7)*. A failed scan used to run again on every
-  rerun (each slider step), and every rerun during a long scan started another full
-  decode of the same video. Failures are kept in the session until the box is
-  unticked; a lock per scan folder makes a second caller wait and load the result.
+- **One scan per video at a time** *(2026-09-27, review findings C1/C5/C7)*. Every
+  rerun during a long scan started another full decode of the same video; a lock per
+  scan folder makes a second caller wait and load the result. While ticking the box
+  scanned (until 2026-10-03), a failed scan was also remembered in the session, as it
+  ran again on every slider step; the scan now runs only in the run, where a failure
+  is a warning.
   The warning shows the last lines of ffmpeg's log, not its 2,000-character banner, and
   a file with no picture stream says so instead of promising screenshots.
 - **Costs of work paid in an earlier, unsaved attempt land in a row** *(2026-09-27,
@@ -561,6 +582,15 @@ upload (identified by file_id, saved to uploads/)
 - **Transcription checkpoints are deleted only after the history row is written** —
   in the app, not in the pipeline, for the same reason: a run stopped between writing
   the transcript and saving it must be able to finish without paying again.
+- **"Clean temporary files" sits in the sidebar, in a "🧹 Working files" section** that
+  says how much space `temp/` and `uploads/` take *(2026-10-03, the owner's call)*.
+  With the one-day cleanup it is rarely needed; it is maintenance, not a transcription
+  step; and under Start/Stop it was a click away from deleting the saved parts of
+  unfinished runs. The size counts what the button deletes (`checkpoints.
+  working_files_size`): everything in both folders except the history or model folder,
+  each file once. The section is drawn after the page, so the size includes what the
+  same click prepared (an extracted WAV); the caption is only the size ("**24.6 MB** in
+  use.", shortened at the owner's request), the details are in the button's help.
 - **"Clean temporary files" is a callback that also empties the uploader** (a new
   widget key). Otherwise the next click saved and extracted the same upload again, the
   WAV download drawn above the button pointed at a deleted file, and a mid-script
@@ -661,13 +691,35 @@ upload (identified by file_id, saved to uploads/)
     no dependency (tkinter ships with the uv Python). Only where the folder source is
     offered (loopback), since the window opens on the machine that runs the app.
   - Labelled "📂 Browse…": "Choose file…" wrapped onto two lines at a 1440 px window.
-- **The folder list's labels must not change while a file grows.** Streamlit 1.56 keeps a
-  keyed selectbox's value as the *formatted label*, so a label with the size or the
-  modification time would lose the choice whenever the file grew — e.g. OBS recording
-  the next meeting into the same folder while the previous one is transcribed. Labels
-  are `name · creation time` (`st_birthtime`, Windows/macOS; Linux falls back to mtime),
-  the list is ordered by creation time for the same reason, and the size and last save
-  are a caption under the list.
+- **The folder list's labels: length first, then name and creation time — nothing that
+  changes while a file grows.** Streamlit 1.56 keeps a keyed selectbox's value as the
+  *formatted label*, so labels hold no size or modification time (they would change on
+  every click while OBS records the next meeting into the same folder). Labels are
+  `length · name · creation time` (`st_birthtime`, Windows/macOS; Linux falls back to
+  mtime), the list is ordered by creation time for the same reason, and the size and
+  last save are a caption under the list.
+  - **The length** *(2026-10-03, the owner's request)* is read by ffprobe
+    (`recordings.duration`): about 0.13 s a file, mostly starting the program, so eight
+    are read at once and each file once per version (size, mtime; `lru_cache`). It
+    leads because recorder names (`2026-09-30 15-02-17 - daily okej prep for
+    deployment.mkv`) are cut off at the list's width (about 55 characters), date and
+    all. Format `M:SS` / `H:MM:SS`, as elsewhere on the page.
+  - Measured on synthetic files: an open-ended MKV being recorded gives `N/A` (no
+    length until the recorder finishes it), an MP4 without its index fails, a
+    fragmented MP4 gives the length so far. So a recording in progress shows no length,
+    and its entry changes once, when it is finished.
+  - **A changed entry of the chosen recording is sent again.** Checked in a real browser
+    (puppeteer, a probe app): after the chosen entry's text changes, the browser keeps
+    the old text and sends it back. The first click still works (the server reads it
+    with the previous run's options before the script runs); the second matches no
+    entry, and the choice is lost. AppTest does not show this — it re-sends the value in
+    its new wording — so the test sends the held text itself. The page remembers every
+    entry it drew (`folder_shown`) and, when the chosen one's text differs from what was
+    drawn, sets the value again, which sends the new text. Every entry, not only the
+    chosen one (pre-commit review): a recording picked from a list drawn before its
+    length appeared was lost on the next click — Start.
+  - Only the newest 200 recordings get a length (`RECORDING_PROBE_LIMIT`): a phone's
+    call folder can hold thousands, and 1,500 would take about 25 s.
 - **The folder source is offered only while the app listens on loopback, and
   `ALLOW_LOCAL_FILES=false` turns it off anyway.** The page can list and read any
   folder of its machine; that is the point locally, and a leak to anyone else who can
@@ -781,7 +833,8 @@ upload (identified by file_id, saved to uploads/)
 - Upload **video** (16 formats) and **audio** (11 formats, incl. AMR); video audio is extracted automatically
 - **Or pick a recording from a folder on this computer** — read in place, no upload, no
   copy; for large files that an upload cannot hold in memory *(2026-09-29)*; found with
-  **📂 Browse…** in Windows' own file window, in any folder *(2026-09-30)*
+  **📂 Browse…** in Windows' own file window, in any folder *(2026-09-30)*; each entry
+  shows the recording's length *(2026-10-03)*
 - **Audio player** before and after transcription
 - **Two engines**: OpenAI API (`gpt-4o-transcribe` / `whisper-1`) and **Local offline** (faster-whisper, selectable model size)
 - **Timestamps + `.srt`** export (whisper-1 and every local model)
@@ -789,8 +842,9 @@ upload (identified by file_id, saved to uploads/)
 - **On-screen context** for video: key frames described by a vision model and placed
   in the transcript by time — exactly with whisper-1 or the local engine, at
   approximate `(~M:SS)` paragraphs with the default gpt-4o-transcribe *(2026-09-25)* —
-  with a selectable screenshot interval *(2026-07-20)* and an exact screenshot count
-  and cost before the run, from a one-pass scan of the video *(2026-09-27)*
+  with a selectable screenshot interval *(2026-07-20)*; the distinct screens found by
+  a one-pass scan are described *(2026-09-27)*, and the most they can number and cost
+  is shown as soon as the box is ticked, with no wait *(2026-10-03)*
 - **Reliable long runs** *(2026-09-25)*: 5-minute chunks cut in pauses (no silent
   truncation at the output cap), checkpoints so a failed or stopped run resumes without
   paying again, partial transcripts clearly marked, one-sentence errors for a bad key
@@ -808,14 +862,15 @@ upload (identified by file_id, saved to uploads/)
   the transcript's script (one retry), and saved rows can be (re)titled from History
 - **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
 - **Working copies clear themselves** — uploads and extracted audio over a day old are
-  deleted when the page is opened *(2026-09-30)*
+  deleted when the page is opened *(2026-09-30)*; the sidebar shows the space working
+  files take, with the button to delete them now *(2026-10-03)*
 - **Hybrid API key** (`.env` or sidebar); offline works with no key
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
 
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 317 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 334 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -909,18 +964,44 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ### Waiting for the owner
 **Next step: the owner opens the app** — that runs the first real cleanup — **and tries
-the live checks below**; then the sidebar question.
+the live checks below**.
 - [x] **Commit and push** — done 2026-10-03 ("komituj i pušuj"): the title's script
       check and the History title button, the folder source with 📂 Browse…, the ⏹ Stop
       button and the one-day cleanup, after a last review of Stop, Browse and the cleanup
       (journal 2026-10-03). One feat commit and one docs commit: `app.py` carries all
       four features, so commits per feature would have left states that do not pass.
-- [ ] **Move "Clean temporary files" to the sidebar?** Proposed 2026-09-30, the owner
-      has not decided: at the bottom of the sidebar, in a small "🧹 Working files"
-      section with one line saying how much space those files take. With the one-day
-      cleanup it is rarely needed, it is maintenance rather than a transcription step,
-      and it sits right under Start/Stop although it also deletes the saved parts of
-      unfinished runs.
+- [x] **Commit and push the three changes of 2026-10-03 (parts 2 and 3)** — done the
+      same day ("komituj i pušuj"), after a reviewer subagent's pass and its fixes
+      (journal), again one feat and one docs commit, as `app.py` carries all three.
+- [x] **Move "Clean temporary files" to the sidebar** — done 2026-10-03 (owner: "uradi"),
+      in a "🧹 Working files" section with the space the files take (§3); its caption
+      cut to "**24.6 MB** in use." at the owner's request, the rest in the button's help.
+- [x] **The recording's length in the folder list** — done 2026-10-03 (owner's request),
+      checked live on an isolated instance (§3).
+- [x] **On-screen context: show its settings at once** — done 2026-10-03 ("uradi
+      ovako"): no scan before Start, the caption gives a ceiling (§3).
+      The discussion that led there: ticking "Describe what's on screen" shows a spinner for about a minute
+      and a half per hour of video before the slider appears — the scan decodes the
+      whole video once so the caption can give the exact screenshot count and cost (the
+      run then reuses it). The owner does not want the wait, and asked why the rough
+      estimate (length ÷ interval) is so far off: it counts samples, while the run
+      describes *distinct screens* (repeats dropped, every change added) — 231 vs 10 on
+      a static 115-minute meeting, 4 vs 28 on a busy 16-minute screen share (§3).
+      Proposed: draw the settings at once; estimate from **keyframes only**
+      (`-skip_frame nokey`: the full pictures the file stores every few seconds, hashed
+      like the scan's frames) — measured on a synthetic 5-minute 1080p MKV: 0.9 s
+      against 8.5 s for the full scan (about 10 s per hour of video instead of 1.5
+      min), one picture every 8.3 s (x264's default keyframe interval); the exact scan
+      runs at Start, as part of the run. To check first, on the owner's recordings
+      (numbers only): their keyframe interval, and the quick count against the exact
+      one. **Simpler, now recommended** (after the owner noted a maximum is always
+      known): no scan before Start; show at once "at most N screenshots (at most $X) —
+      usually fewer, a repeated picture is not described again". N = length ÷ interval
+      for slides (ffmpeg's change detection rarely fires on them: a full-screen slide
+      change scored 0.077, under the 0.1 threshold), never more than one per 2 s
+      (`FRAME_MIN_INTERVAL_SECONDS`, fast changes) nor the cap (`FRAME_MAX_COUNT`, 300
+      in the owner's `.env`). Cost of the cap: nano $0.18, mini $0.67. The owner chose
+      this one.
 - [ ] **First real run of the one-day cleanup.** On 2026-10-03 it had not run yet: the
       owner's app last worked on 2026-09-30 16:32, just before the cleanup was added, and
       was not running. `uploads/` held 16 files (2.67 GB, back to 2026-09-14) and `temp/`
@@ -1063,6 +1144,86 @@ the live checks below**; then the sidebar question.
 ---
 
 ## 6. Journal
+
+### 2026-10-03 (part 3) — No wait for the screenshot slider
+
+The owner disliked the spinner after ticking "Describe what's on screen" (the scan,
+about a minute and a half per hour of video, before the slider appeared) and asked why
+the rough estimate was so far off. Explained: the run describes distinct screens, not
+one per interval (231 estimated vs 10 described on a static 115-minute meeting). Two
+proposals followed — a quick count from keyframes only (measured on a synthetic
+5-minute 1080p MKV: 0.9 s against 8.5 s for the full scan), and, after the owner
+noted that a maximum is always known, simply showing that maximum. The owner chose the
+second ("uradi ovako"), and asked what the slider really sets (how often the screen
+is looked at; repeats are not sent).
+
+- Ticking the box no longer scans; the run does (its spinner now says how long that
+  takes). The caption: at most one per look, plus what faster changes can add up to
+  the cap, "usually far fewer", the exact number during the run. A binding cap is
+  stated with the number one look per interval would give.
+- The tick-time scan's failure memory (`scan_failures`, "untick and tick to try
+  again") went with it: a failed scan is now a warning of the run.
+- Live, two prices in one caption lost their `$` (Markdown read the text between as a
+  formula); now escaped, with a test.
+
+Verified: 327 tests (the scan-on-tick tests became "no scan on tick" and "the run never
+describes more than the ceiling"; a stored scan still gives the exact count during a
+job); 6 of 6 changes undone in a copy of the repo were caught. Isolated instance with a
+synthetic 1:01:40 video in headless Chrome: the slider appeared 0.4 s after the tick
+(it used to take the scan), no scan folder was created, and the caption read "At most
+**124** screenshots (up to $0.07) … up to 300 (up to $0.18) …".
+
+Then, at the owner's request, the sidebar's caption was cut to the size alone
+("**24.6 MB** in use."); what the button deletes and the one-day rule moved into its
+help.
+
+Before the commit a reviewer subagent read the whole diff (isolated, in a copy). It
+found one real bug and four smaller ones, all fixed, each with a test that fails when
+its fix is undone (5 of 5, in a copy of the repo):
+- A recording picked from a list drawn before its length appeared lost the choice on
+  the next click (Start): only the chosen entry's text was remembered. Now every
+  entry drawn is.
+- "Up to $X" assumed Full HD frames; frames are described at full size, so a 4K screen
+  costs about 3.4 times that. The caption now uses the video's own frame size.
+- A folder of over 1,024 recordings defeated the length cache and re-read every file
+  on each click (about 25 s for 1,500); only the newest 200 get a length now.
+- A prepared video that states no length was told its count "appears once it has
+  been prepared"; it now says the file does not say how long it is.
+- The sidebar's size was one click behind (drawn before the page prepared a WAV); it
+  is drawn after the page now.
+The docs said a failed scan was remembered until the box is unticked (that went with
+the scan on tick) and quoted the owner's cap of 300 as the README example; both
+corrected. 334 tests. Committed and pushed: one feat and one docs commit.
+
+### 2026-10-03 (part 2) — Recording lengths in the folder list; clean-up in the sidebar
+
+The owner asked for each recording's length in the folder list, and for "Clean temporary
+files" to move to the sidebar (the proposal of 2026-09-30).
+
+- **Length first in each entry** (`47:12 · name · creation time`), read by ffprobe,
+  eight files at once, each once per version. Measured: 0.13 s a file; an MKV still
+  being recorded gives `N/A`, so its length appears when the recorder finishes it.
+- That makes the chosen entry change once, and §3 said a changed entry loses the choice.
+  An AppTest probe kept it, so it was checked in a real browser: the browser keeps the
+  old text, the first click still works, the second loses the choice. Fixed by sending
+  the value again when the chosen entry's text changes; the test sends the held text
+  itself, since AppTest re-sends values in their new wording.
+- **🧹 Working files** at the bottom of the sidebar: the space `temp/` and `uploads/`
+  take (what the button would delete) and the button, renamed "Clean temporary files"
+  without the broom, which the section title now carries. Its message shows there too.
+
+Verified: 326 tests (9 new); 8 of 8 changes undone in a copy of the repo were caught
+(choice not sent again, length at the end or missing, button left out, length read on
+every click, `N/A` taken as a length, history counted, a folder named twice counted
+twice). Isolated instance (port 8597, scratch folders, synthetic recordings) in headless
+Chrome: lengths `0:47`, `1:01:40`, `2:00` and none for a recording in progress; that
+recording chosen, finished with `q`, then three reruns — entry `0:09 · …`, still chosen,
+with the existing "changed on disk" warning; the sidebar said 25.0 MB, then "Empty"
+after the button, and the pick was cleared. No page errors.
+
+Also asked: why ticking "Describe what's on screen" spins before the slider appears.
+Answered (the one-pass scan, about 1.5 min per hour of video, reused by the run) with
+a proposal in §5; nothing changed yet.
 
 ### 2026-10-03 — Last review, two fixes, commit
 
@@ -1246,7 +1407,8 @@ Pitfalls:
   for seconds at a time, could have served a planted bug to them. Mutation checks
   belong in a `git worktree`, not in the owner's checkout.
 - A keyed `st.selectbox` in Streamlit 1.56 stores its value as the formatted label
-  (`value_type="string_value"`), so a label that changes loses the choice; a keyed
+  (`value_type="string_value"`), so a label that changes loses the choice (precisely:
+  on the second click after the change — measured 2026-10-03, see §3); a keyed
   `st.expander` is identified by its label as well.
 - `st.rerun(scope="fragment")` raises when the fragment runs as part of a full run, so
   work that changes a fragment's labels goes before they are drawn.
