@@ -46,6 +46,7 @@ from config import (
     FRAME_INTERVAL_MIN_SECONDS,
     FRAME_INTERVAL_STEP_SECONDS,
     FRAME_MAX_INTERVAL_SECONDS,
+    FRAME_MIN_INTERVAL_SECONDS,
     JOB_WATCHDOG_SECONDS,
     LOCAL_MODEL_SIZES_MB,
     LOCAL_MODELS,
@@ -53,6 +54,7 @@ from config import (
     PROVIDER_LOCAL,
     PROVIDER_OPENAI,
     PROVIDERS,
+    RECORDING_PROBE_LIMIT,
     SCRATCH_MAX_AGE_HOURS,
     SOURCE_FOLDER,
     SOURCE_UPLOAD,
@@ -105,7 +107,6 @@ _SESSION_KEYS = (
     "source_version",
     "job",
     "uploader_generation",
-    "scan_failures",
 )
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -228,6 +229,55 @@ def render_sidebar(disabled: bool) -> None:
                 "automatically every run."
             )
         render_title_settings(disabled)
+
+
+def _format_size(size: int) -> str:
+    """Render a number of bytes as ``1.2 GB`` or ``340.5 MB``.
+
+    Args:
+        size: Bytes.
+
+    Returns:
+        The size, in GB from 1 GB up.
+    """
+    megabytes = size / (1024 * 1024)
+    if megabytes >= 1024:
+        return f"{megabytes / 1024:.1f} GB"
+    if megabytes >= 0.1:
+        return f"{megabytes:.1f} MB"
+    return "under 0.1 MB"
+
+
+def render_working_files(disabled: bool) -> None:
+    """Say how much space the working files take, and offer to delete them now.
+
+    In the sidebar, apart from the steps of a transcription: copies a day old
+    go by themselves when the page is opened, so the button is rarely needed,
+    and it also deletes saved parts of unfinished runs — nothing to have next
+    to Start. Drawn after the page, so the size includes what this run
+    prepared (an extracted WAV).
+
+    Args:
+        disabled: True while a job runs.
+    """
+    st.subheader("🧹 Working files")
+    size = checkpoints.working_files_size()
+    st.caption(f"**{_format_size(size)}** in use." if size else "Nothing to clean.")
+    st.button(
+        "Clean temporary files",
+        disabled=disabled or checkpoints.any_active_run(),
+        on_click=clean_temp_files,
+        help=(
+            "Deletes everything in `temp/` and `uploads/` now: uploads, extracted "
+            "audio, transcripts and saved parts of unfinished runs. History is "
+            "kept. Uploads and extracted audio older than a day are deleted anyway "
+            "when the page is opened. Unavailable while a transcription runs."
+        ),
+    )
+    message = st.session_state.get("clean_message")
+    if message:
+        getattr(st, message[0])(message[1])
+        st.session_state.clean_message = None
 
 
 # Choices kept across sessions: session-state key (also the widget's key and
@@ -594,6 +644,39 @@ def _format_cost(cost: float | None) -> str:
     return f"about ${cost:.2f}"
 
 
+@st.cache_data(show_spinner=False)
+def _video_frame_size(video_path: str, size_bytes: int) -> tuple[int, int]:
+    """Return a video's width and height, cached across reruns.
+
+    Args:
+        video_path: Path to the video file.
+        size_bytes: File size, part of the cache key (see :func:`_video_length`).
+
+    Returns:
+        ``(width, height)``, or ``(0, 0)`` when it cannot be determined.
+    """
+    del size_bytes  # cache key only
+    return frames.video_frame_size(Path(video_path))
+
+
+def _format_ceiling(cost: float | None) -> str:
+    """Phrase the most a number of screenshots can cost, for a caption.
+
+    Args:
+        cost: Estimated cost in USD, or None when the model has no known price.
+
+    Returns:
+        E.g. ``up to $0.07``, its dollar sign escaped for Markdown: a caption
+        with two of them showed the text between as a formula, without the
+        signs. ``under a cent`` for less.
+    """
+    if cost is None:
+        return "cost unknown"
+    if cost < 0.01:
+        return "under a cent"
+    return f"up to \\${cost:.2f}"
+
+
 def _format_length(seconds: float) -> str:
     """Render a video duration as ``M:SS`` or ``H:MM:SS``.
 
@@ -619,35 +702,6 @@ def _scan_dir(video_path: Path) -> Path:
         A folder under ``temp_dir``, removed by clean-up or after a day.
     """
     return get_settings().temp_dir / f"scan-{_digest(video_path)}"
-
-
-def _scan_video(video_path: Path) -> tuple[dict[str, Any] | None, str | None]:
-    """Scan the video once (a stored scan is reused), remembering a failure.
-
-    A failed scan used to run again on every rerun — each slider move — and a
-    late failure costs a full decode each time.
-
-    Args:
-        video_path: The uploaded video.
-
-    Returns:
-        The scan from :func:`frames.scan_video`, or ``None`` and why it failed.
-    """
-    failures = st.session_state.get("scan_failures") or {}
-    key = _digest(video_path)
-    if key in failures:
-        return None, failures[key]
-    try:
-        with st.spinner(
-            "Scanning the video for screen changes — once per video, about a "
-            "minute and a half per hour of video…",
-            show_time=True,
-        ):
-            return frames.scan_video(video_path, _scan_dir(video_path)), None
-    except (AppError, OSError) as exc:
-        logger.warning("Video scan failed: %s", exc)
-        st.session_state.scan_failures = {**failures, key: str(exc)}
-        return None, str(exc)
 
 
 def _scanned_estimate(
@@ -710,34 +764,59 @@ def _screenshot_estimate(
     cap = frames.max_frames_setting()
 
     duration = 0.0
-    if video_path and video_path.exists():
-        duration = _video_length(str(video_path), video_path.stat().st_size)
+    # Frames are described at the video's own size, so a 1440p or 4K screen
+    # costs more per screenshot than the Full HD assumed without it.
+    tokens: int | None = None
+    ready = bool(video_path and video_path.exists())
+    if ready:
+        size_bytes = video_path.stat().st_size
+        duration = _video_length(str(video_path), size_bytes)
+        width, height = _video_frame_size(str(video_path), size_bytes)
+        if width and height:
+            tokens = vision.frame_tokens(width, height)
 
-    expected = frames.estimate_frame_count(duration, interval)
-    if not expected:
-        ceiling = _format_cost(vision.estimate_frame_cost(cap, model, detail))
+    def most(count: int) -> str:
+        return _format_ceiling(vision.estimate_frame_cost(count, model, detail, tokens))
+
+    if duration <= 0:
+        if ready:
+            return (
+                f"At most **{cap}** screenshots per video ({most(cap)}) — this file "
+                "does not say how long it is."
+            )
         return (
-            f"At most {cap} screenshots per video ({ceiling}). "
-            "The estimate for your video appears once it has been prepared."
+            f"At most **{cap}** screenshots per video ({most(cap)}). The count for "
+            "your video appears once it has been prepared."
         )
 
-    cost = _format_cost(vision.estimate_frame_cost(expected, model, detail))
     length = _format_length(duration)
-    actual = frames.effective_interval(duration, interval)
-    if actual > interval + 1:
+    fewer = (
+        "Usually far fewer: a picture that repeats the one before is not "
+        "described again. The exact number shows during the run."
+    )
+    # One per look at the screen, if every look shows a new picture.
+    used = frames.effective_interval(duration, interval, max_frames=0)
+    looks = int(duration // used) + 1
+    if looks > cap:
         # The cap is binding, so the chosen interval is not what will happen.
         # Spell out the substitution rather than quietly applying it.
         return (
-            f"One every {interval:.0f} s would exceed the {cap}-screenshot limit "
-            f"for this {length} video, so they are spread across the whole video "
-            f"instead: **{expected}** screenshots, one about every "
-            f"{actual:.0f} s ({cost})."
+            f"At most **{cap}** screenshots ({most(cap)}), the limit per video: one "
+            f"every {interval:.0f} s would give {looks} for this {length} video, "
+            f"so they are spread evenly over it. {fewer}"
         )
-    return (
-        f"About **{expected}** screenshots for this {length} video ({cost}), "
-        "plus any scene changes. Near-identical frames are discarded before "
-        "anything is sent."
+    text = (
+        f"At most **{looks}** screenshots ({most(looks)}) — one every {used:.0f} s of "
+        f"this {length} video, if each look shows a new picture."
     )
+    # A screen that changes faster is caught too, one picture per burst window.
+    busiest = min(cap, int(duration // FRAME_MIN_INTERVAL_SECONDS) + 1)
+    if busiest > looks:
+        text += (
+            " A screen that changes faster (scrolling, a video) can add more, up "
+            f"to {busiest} ({most(busiest)})."
+        )
+    return f"{text} {fewer}"
 
 
 def render_visual_options(
@@ -771,32 +850,19 @@ def render_visual_options(
     video_path: Path | None = st.session_state.get("video_path")
     ready = bool(video_path and video_path.exists())
     if not enabled:
-        failures = st.session_state.get("scan_failures")
-        if ready and failures:
-            # Unticking forgets a failed scan, so ticking again retries it.
-            failures.pop(_digest(video_path), None)
         return None
     if not resolve_openai_key():
         st.warning(
             "On-screen context needs an OpenAI API key — add one in the sidebar."
         )
         return None
+    # The video is scanned by the run, not here: ticking the box used to wait
+    # for the scan (about a minute and a half per hour of video) before the
+    # slider appeared. The caption gives a ceiling instead. While a job runs,
+    # a scan stored by an earlier run of this video gives the exact count.
     scan: dict[str, Any] | None = None
-    failure: str | None = None
     if ready and disabled:
-        # A job is running: never start a scan while drawing its page — a Stop
-        # there left every control locked. The job scans for itself.
         scan = frames.load_scan(_scan_dir(video_path))
-        failures = st.session_state.get("scan_failures") or {}
-        failure = failures.get(_digest(video_path))
-    elif ready:
-        scan, failure = _scan_video(video_path)
-    if failure:
-        st.warning(
-            f"On-screen context is not available for this file: {failure} "
-            "Untick and tick the box to try again."
-        )
-        return None
 
     vision_model = st.selectbox(
         "Vision model",
@@ -824,10 +890,12 @@ def render_visual_options(
         step=FRAME_INTERVAL_STEP_SECONDS,
         disabled=disabled,
         help=(
-            "How often to grab a frame even when the picture has not changed. "
-            "Scene changes are always captured on top of this, and short videos "
-            "get extra samples so they are not covered by a single frame. "
-            "Near-identical frames are discarded before anything is sent."
+            "How often the screen is looked at, even when nothing changed. A "
+            "change of screen noticed in between is taken too (at most one per "
+            "2 s), and a look that shows the same picture as the one before is "
+            "not sent. A smaller number catches short slides and puts their notes "
+            "closer to when they appeared; it costs more only when the screen "
+            "really changes more often."
         ),
     )
 
@@ -877,7 +945,11 @@ def collect_visual_notes(
     collected: list[dict[str, Any]] = []
     total = 0
     try:
-        with st.spinner("Looking for scene changes in the video…", show_time=True):
+        with st.spinner(
+            "Looking through the video for screen changes — about a minute and a "
+            "half per hour of video…",
+            show_time=True,
+        ):
             # The same scan and selection the caption counted, so the number
             # described is the number that was shown.
             scan = frames.scan_video(video_path, _scan_dir(video_path))
@@ -1872,6 +1944,30 @@ def _list_folder(folder: Path) -> list[str] | None:
         return None
 
 
+def _recording_labels(files: list[str]) -> dict[str, str]:
+    """Return each listed recording's entry: length (when known), name, date.
+
+    The length leads because long recorder names (``2026-09-30 15-02-17 -
+    daily ….mkv``) are cut off at the end of the list's width. Only the newest
+    ``RECORDING_PROBE_LIMIT`` get one.
+
+    Args:
+        files: The recordings' paths, as listed.
+
+    Returns:
+        Each path's entry, e.g. ``47:12 · Call.mkv · 2026-09-29 16:05``.
+    """
+    paths = [Path(file) for file in files]
+    with st.spinner("Reading how long each recording is…"):
+        lengths = recordings.durations(paths[:RECORDING_PROBE_LIMIT])
+    labels = {}
+    for file, path in zip(files, paths, strict=True):
+        seconds = lengths.get(path)
+        entry = recordings.label(path)
+        labels[file] = f"{_format_length(seconds)} · {entry}" if seconds else entry
+    return labels
+
+
 def _choose_from_folder(disabled: bool) -> ChosenFile | None:
     """Offer the recordings in a folder on this computer, newest first.
 
@@ -1940,14 +2036,25 @@ def _choose_from_folder(disabled: bool) -> ChosenFile | None:
     if not files:
         st.info("No video or audio files in this folder (subfolders are not listed).")
         return None
+    labels = _recording_labels(files)
+    picked = st.session_state.folder_file
+    shown = st.session_state.get("folder_shown") or {}
+    if picked is not None and shown.get(picked, labels[picked]) != labels[picked]:
+        # The chosen recording's entry is not the text the browser was given:
+        # its length appeared (or grew) since the list was drawn — also when
+        # it was picked from that list. The browser holds the old text and
+        # sends it back on the next click, where it matches no entry and the
+        # choice is lost; setting the value again sends the new text.
+        st.session_state.folder_file = picked
     chosen = st.selectbox(
         "Recording",
         options=files,
         key="folder_file",
-        format_func=lambda path: recordings.label(Path(path)),
+        format_func=lambda path: labels.get(path, Path(path).name),
         placeholder="Choose a recording (newest first)",
         disabled=disabled,
     )
+    st.session_state.folder_shown = labels
     if not chosen:
         gone = st.session_state.get("folder_gone")
         if gone:
@@ -2057,21 +2164,6 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
                     )
                 job_area = st.container()
                 render_run_notices()
-
-        st.divider()
-        st.button(
-            "🧹 Clean temporary files",
-            disabled=running or checkpoints.any_active_run(),
-            on_click=clean_temp_files,
-            help=(
-                "Deletes uploads, extracted audio and saved parts of unfinished "
-                "runs; history is kept. Unavailable while a transcription runs."
-            ),
-        )
-        message = st.session_state.get("clean_message")
-        if message:
-            getattr(st, message[0])(message[1])
-            st.session_state.clean_message = None
 
     with right:
         render_results(disabled=running)
@@ -2323,7 +2415,8 @@ def main() -> None:
         st.session_state.checkpoints_pruned = True
     _settle_job()
     _claim_job()
-    render_sidebar(disabled=st.session_state.job is not None)
+    running = st.session_state.job is not None
+    render_sidebar(disabled=running)
 
     st.title("📝 Video & Audio Transcription")
     st.write("Transcribe video or audio — OpenAI API or a local offline Whisper model")
@@ -2333,6 +2426,8 @@ def main() -> None:
         job_area, params = render_transcribe_tab()
     with tab_history:
         render_history_tab()
+    with st.sidebar:
+        render_working_files(disabled=running)
 
     st.markdown("---")
     st.markdown("Made with ❤️ by Marko A")

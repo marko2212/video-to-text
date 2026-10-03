@@ -147,6 +147,28 @@ def _rate_control_kwarg() -> dict[str, str]:
     return {"vsync": "vfr"}
 
 
+def video_frame_size(video_path: Path) -> tuple[int, int]:
+    """Return the width and height of a video's picture.
+
+    Args:
+        video_path: Source video file.
+
+    Returns:
+        ``(width, height)``, or ``(0, 0)`` when it cannot be determined.
+    """
+    try:
+        metadata = ffmpeg.probe(str(video_path), select_streams="v:0")
+    except (ffmpeg.Error, OSError) as exc:
+        logger.debug("ffprobe failed for %s: %s", video_path, exc)
+        return 0, 0
+    for stream in metadata.get("streams", []):
+        try:
+            return int(stream["width"]), int(stream["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return 0, 0
+
+
 def video_duration(video_path: Path) -> float:
     """Return the duration of a video in seconds.
 

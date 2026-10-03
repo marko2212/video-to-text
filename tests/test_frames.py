@@ -506,3 +506,27 @@ def test_ffmpeg_errors_reach_the_user_as_their_last_lines():
     short = frames._last_lines(log)
     assert short.startswith("Stream map '0:v' matches no streams.")
     assert short.endswith("Error opening output files: Invalid argument")
+
+
+def test_the_frame_size_is_read_from_the_video_stream(monkeypatch, tmp_path):
+    asked = []
+
+    def probe(path, **kwargs):
+        asked.append(kwargs)
+        return {"streams": [{"codec_type": "video", "width": 2560, "height": 1440}]}
+
+    monkeypatch.setattr(frames.ffmpeg, "probe", probe)
+
+    assert frames.video_frame_size(tmp_path / "call.mkv") == (2560, 1440)
+    assert asked == [{"select_streams": "v:0"}]
+
+
+def test_an_unreadable_frame_size_is_zero(monkeypatch, tmp_path):
+    def missing(path, **kwargs):
+        raise FileNotFoundError(2, "ffprobe not found")
+
+    monkeypatch.setattr(frames.ffmpeg, "probe", missing)
+    assert frames.video_frame_size(tmp_path / "call.mkv") == (0, 0)
+
+    monkeypatch.setattr(frames.ffmpeg, "probe", lambda path, **kwargs: {"streams": []})
+    assert frames.video_frame_size(tmp_path / "call.mkv") == (0, 0)

@@ -189,3 +189,31 @@ def test_a_copy_that_cannot_be_deleted_is_skipped_not_fatal(monkeypatch):
     assert checkpoints.prune_working_copies(max_age_hours=24) == 1
     assert held.exists()
     assert not other.exists()
+
+
+def test_the_working_files_size_is_what_clean_up_would_free(monkeypatch, tmp_path):
+    settings = config.get_settings()
+    _aged(settings.upload_dir / "call.amr", content=b"a" * 1_000)
+    _aged(settings.temp_dir / "call.wav", content=b"b" * 300)
+    part = settings.temp_dir / "checkpoints" / "abc-gpt" / "chunk_000.json"
+    _aged(part, content=b"c" * 20)
+
+    assert checkpoints.working_files_size() == 1_320
+
+    # The history and the model folder are left alone by the button, so they
+    # are not counted either — even inside temp/.
+    monkeypatch.setenv("DATA_DIR", str(settings.temp_dir / "data"))
+    config.get_settings.cache_clear()
+    _aged(config.get_settings().data_dir / "transcriptions.db", content=b"d" * 5_000)
+
+    assert checkpoints.working_files_size() == 1_320
+
+
+def test_a_folder_named_twice_is_counted_once(monkeypatch, tmp_path):
+    shared = tmp_path / "shared"
+    monkeypatch.setenv("TEMP_DIR", str(shared))
+    monkeypatch.setenv("UPLOAD_DIR", str(shared))
+    config.get_settings.cache_clear()
+    _aged(shared / "call.amr", content=b"a" * 700)
+
+    assert checkpoints.working_files_size() == 700

@@ -288,6 +288,45 @@ def prune_working_copies(max_age_hours: float) -> int:
     return removed
 
 
+def working_files_size() -> int:
+    """Return how much space "Clean temporary files" would free.
+
+    Everything in ``temp/`` and ``uploads/`` counts (uploads, extracted audio,
+    transcripts, scans, saved parts of unfinished runs), except what the button
+    leaves alone too: an entry that is, holds or lies inside the history or
+    model folder. A file is counted once even if both settings name one folder.
+
+    Returns:
+        The size in bytes.
+    """
+    settings = get_settings()
+    keep = [settings.data_dir.resolve(), settings.whisper_model_dir.resolve()]
+    sizes: dict[Path, int] = {}
+    for folder in (settings.temp_dir, settings.upload_dir):
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                resolved = entry.resolve()
+                if any(
+                    resolved.is_relative_to(kept) or kept.is_relative_to(resolved)
+                    for kept in keep
+                ):
+                    continue
+                inside = list(resolved.rglob("*")) if resolved.is_dir() else [resolved]
+            except OSError:
+                continue
+            for path in inside:
+                try:
+                    if path.is_file():
+                        sizes[path] = path.stat().st_size
+                except OSError:
+                    continue  # removed or locked while counting
+    return sum(sizes.values())
+
+
 def discard(directory: Path) -> None:
     """Delete a checkpoint directory once its run has finished.
 

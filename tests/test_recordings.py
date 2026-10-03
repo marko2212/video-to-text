@@ -184,3 +184,65 @@ def test_only_one_file_window_is_open_at_a_time(monkeypatch):
             recordings.ask_for_recording(None)
     finally:
         recordings._picker_open.release()
+
+
+# --- a recording's length ---------------------------------------------------------
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    """Answer ffprobe calls as told; the cache starts empty."""
+    recordings._probe_duration.cache_clear()
+    run = _FakeRun(stdout="2832.48\n")
+    monkeypatch.setattr(recordings.subprocess, "run", run)
+    yield run
+    recordings._probe_duration.cache_clear()
+
+
+def test_the_length_is_read_once_until_the_file_changes(tmp_path, probe):
+    path = _file(tmp_path, "Call.mkv", b"first", mtime=1_000)
+
+    assert recordings.duration(path) == 2832.48
+    assert recordings.duration(path) == 2832.48
+    assert len(probe.calls) == 1  # the list is drawn on every click
+    [(args, kwargs)] = probe.calls
+    assert args[0] == "ffprobe" and args[-1] == str(path)
+    assert kwargs["timeout"] > 0
+
+    _file(tmp_path, "Call.mkv", b"finished take", mtime=2_000)
+    recordings.duration(path)
+
+    assert len(probe.calls) == 2
+
+
+def test_a_file_that_does_not_say_has_no_length(tmp_path, probe, monkeypatch):
+    path = _file(tmp_path, "Call.mkv")
+    # An MKV still being recorded: ffprobe prints N/A until it is finished.
+    monkeypatch.setattr(recordings.subprocess, "run", _FakeRun(stdout="N/A\n"))
+    assert recordings.duration(path) is None
+
+    recordings._probe_duration.cache_clear()
+    broken = _FakeRun(stdout="", returncode=1, stderr="moov atom not found")
+    monkeypatch.setattr(recordings.subprocess, "run", broken)
+    assert recordings.duration(path) is None
+
+    assert recordings.duration(tmp_path / "gone.mkv") is None
+
+
+def test_no_ffprobe_or_a_hanging_drive_gives_no_length(tmp_path, probe, monkeypatch):
+    path = _file(tmp_path, "Call.mkv")
+    missing = _FakeRun(raises=FileNotFoundError(2, "ffprobe not found"))
+    monkeypatch.setattr(recordings.subprocess, "run", missing)
+    assert recordings.duration(path) is None
+
+    recordings._probe_duration.cache_clear()
+    hung = _FakeRun(raises=subprocess.TimeoutExpired(cmd="ffprobe", timeout=15))
+    monkeypatch.setattr(recordings.subprocess, "run", hung)
+    assert recordings.duration(path) is None
+
+
+def test_several_lengths_are_read_together(tmp_path, probe):
+    paths = [_file(tmp_path, f"Call {n}.mkv", b"x" * n) for n in range(1, 4)]
+
+    assert recordings.durations(paths) == dict.fromkeys(paths, 2832.48)
+    assert recordings.durations([]) == {}

@@ -3,7 +3,6 @@
 from streamlit.testing.v1 import AppTest
 
 import config
-from exceptions import VisualContextError
 
 _SCRIPT = """
 import streamlit as st
@@ -55,7 +54,8 @@ def test_the_caption_shows_the_ceiling_when_the_video_length_is_unknown():
     test.checkbox[0].set_value(True).run()
 
     caption = test.caption[0].value
-    assert f"At most {config.DEFAULT_FRAME_MAX_COUNT}" in caption
+    cap = config.DEFAULT_FRAME_MAX_COUNT
+    assert f"At most **{cap}** screenshots per video" in caption
 
 
 _GUESS_SCRIPT = """
@@ -67,14 +67,14 @@ st.caption(app._screenshot_estimate(st.session_state.interval, "gpt-5.4-nano", "
 
 
 def _guess(video, interval: float) -> str:
-    """The rough caption, used while a job runs and no scan is stored yet."""
+    """The caption before a run: a ceiling, since nothing is scanned before Start."""
     test = AppTest.from_string(_GUESS_SCRIPT)
     test.session_state["video_path"] = video
     test.session_state["interval"] = interval
     return test.run().caption[0].value
 
 
-def test_the_caption_estimates_the_screenshot_count_from_the_video_length(
+def test_the_caption_gives_the_most_screenshots_the_video_can_yield(
     monkeypatch, tmp_path
 ):
     import app
@@ -82,15 +82,23 @@ def test_the_caption_estimates_the_screenshot_count_from_the_video_length(
     # A real file so the size lookup works; only the probe itself is stubbed.
     video = tmp_path / "meeting.mkv"
     video.write_bytes(b"not really a video")
-    # 10 minutes, sampled every 30 s: one at the start plus 20 more.
+    # 10 minutes, a look every 30 s: one at the start plus 20 more, if every
+    # look shows a new picture.
     monkeypatch.setattr(app, "_video_length", lambda path, size: 600.0)
 
     caption = _guess(video, 30.0)
-    assert "About **21** screenshots" in caption
-    assert "10:00 video" in caption
+    assert "At most **21** screenshots" in caption
+    assert "one every 30 s of this 10:00 video" in caption
+    # Faster changes are taken too — one per 2 s at most, within the cap.
+    assert f"up to {config.DEFAULT_FRAME_MAX_COUNT} (" in caption
+    # Repeats are left out, so the real number is usually much lower.
+    assert "far fewer" in caption
+    # Two prices in one caption: unescaped, Markdown took the text between the
+    # dollar signs for a formula and dropped the signs.
+    assert caption.count("$") == caption.count(chr(92) + "$") == 2
 
 
-def test_the_estimate_follows_the_interval_slider(monkeypatch, tmp_path):
+def test_the_ceiling_follows_the_interval_slider(monkeypatch, tmp_path):
     import app
 
     video = tmp_path / "meeting.mkv"
@@ -101,8 +109,8 @@ def test_the_estimate_follows_the_interval_slider(monkeypatch, tmp_path):
     at_default = _guess(video, 30.0)
     at_120 = _guess(video, 120.0)
 
-    assert "About **167** screenshots" in at_default
-    assert "About **42** screenshots" in at_120
+    assert "At most **167** screenshots" in at_default
+    assert "At most **42** screenshots" in at_120
     assert "1:23:12 video" in at_default
 
 
@@ -115,10 +123,12 @@ def test_a_binding_cap_is_stated_rather_than_silently_applied(monkeypatch, tmp_p
     monkeypatch.setattr(app, "_video_length", lambda path, size: 36000.0)
 
     caption = _guess(video, 5.0)
-    assert f"{config.DEFAULT_FRAME_MAX_COUNT}-screenshot limit" in caption
-    assert "one about every 180 s" in caption
+    assert f"At most **{config.DEFAULT_FRAME_MAX_COUNT}** screenshots" in caption
+    assert "the limit per video" in caption
     # The substitution must be stated, not just the fact that a cap exists.
-    assert "spread across the whole video" in caption
+    assert "one every 5 s would give 7201" in caption
+    assert "spread evenly" in caption
+    assert "can add more" not in caption  # nothing can exceed the cap
 
 
 def test_a_raised_cap_from_the_environment_reaches_the_caption(monkeypatch, tmp_path):
@@ -132,10 +142,8 @@ def test_a_raised_cap_from_the_environment_reaches_the_caption(monkeypatch, tmp_
     monkeypatch.setattr(app, "_video_length", lambda path, size: 4992.0)
 
     caption = _guess(video, 5.0)
-    # 4992 s over 300 screenshots is one every ~17 s, not the default's ~25 s.
-    assert "300-screenshot limit" in caption
-    assert "**300** screenshots" in caption
-    assert "one about every 17 s" in caption
+    assert "At most **300** screenshots" in caption
+    assert "would give 999" in caption
 
 
 def test_the_screenshot_interval_is_adjustable():
@@ -268,35 +276,27 @@ def test_no_api_key_warns_instead_of_offering_the_feature(monkeypatch):
         config.get_settings.cache_clear()
 
 
-def test_a_video_that_cannot_be_scanned_says_so_once_instead_of_guessing(
+def test_ticking_the_box_shows_the_settings_at_once_without_a_scan(
     monkeypatch, tmp_path
 ):
+    # The scan decodes the whole video (about 1.5 min per hour); the slider
+    # used to wait for it. The run scans instead.
+    import app
     import frames
 
-    video = tmp_path / "voice.mp4"
-    video.write_bytes(b"audio only")
+    video = tmp_path / "meeting.mkv"
+    video.write_bytes(b"not decoded")
     scans = []
+    monkeypatch.setattr(frames, "scan_video", lambda *a, **k: scans.append(1))
+    monkeypatch.setattr(app, "_video_length", lambda path, size: 600.0)
 
-    def no_picture(*args, **kwargs):
-        scans.append(1)
-        raise VisualContextError(
-            "This file has no picture, so there is nothing to describe."
-        )
-
-    monkeypatch.setattr(frames, "scan_video", no_picture)
     test = _run("video", video_path=video)
     test.checkbox[0].set_value(True).run()
-    test.run()
-    test.run()
+    test.slider[0].set_value(60).run()
 
-    assert scans == [1]  # remembered, not rescanned on every rerun
-    assert any("no picture" in w.value for w in test.warning)
-    assert not any("screenshots" in c.value for c in test.caption)
-    assert test.session_state.result is None  # nothing will be described
-
-    test.checkbox[0].set_value(False).run()
-    test.checkbox[0].set_value(True).run()
-    assert scans == [1, 1]  # unticking and ticking tries again
+    assert scans == []
+    assert test.session_state.result["interval"] == 60.0
+    assert "At most **11** screenshots" in test.caption[0].value
 
 
 _JOB_SCRIPT = """
@@ -324,13 +324,38 @@ def test_a_running_job_never_starts_a_scan_while_its_page_is_drawn(
     test.session_state["video_path"] = video
     test.run()
     test.checkbox[0].set_value(True).run()
-    assert scans == [1]
 
     test.session_state["disabled"] = True
     test.run()
 
-    assert scans == [1]
+    assert scans == []
     assert test.session_state.result is not None  # the job still gets its settings
+
+
+def test_while_a_job_runs_a_stored_scan_gives_the_exact_count(monkeypatch, tmp_path):
+    # An earlier run of the same video left its scan; reading it costs nothing.
+    import frames
+
+    video = tmp_path / "meeting.mkv"
+    video.write_bytes(b"not decoded: the scan is faked")
+    frame = {"path": video, "scene": False, "hash": 1}
+    stored = {
+        "duration": 60.0,
+        "width": 1920,
+        "height": 1080,
+        "frames": [{**frame, "time": 0.0}, {**frame, "time": 30.0, "hash": 99}],
+    }
+    monkeypatch.setattr(frames, "load_scan", lambda scan_dir: stored)
+    test = AppTest.from_string(_JOB_SCRIPT)
+    test.session_state["video_path"] = video
+    test.run()
+    test.checkbox[0].set_value(True).run()
+    assert "At most" in test.caption[0].value  # before Start: the ceiling
+
+    test.session_state["disabled"] = True
+    test.run()
+
+    assert "**2** screenshots will be described" in test.caption[0].value
 
 
 def test_a_stopped_local_run_does_not_point_to_an_openai_rerun():
@@ -372,3 +397,36 @@ def test_a_local_row_with_an_unknown_screenshot_cost_is_not_called_free():
     assert app._history_cost(row) == "≈ $0"
     exact = {**row, "usage_json": json.dumps({"provider": config.PROVIDER_LOCAL})}
     assert app._history_cost(exact) == "free (local)"
+
+
+def test_the_ceiling_is_priced_for_the_video_s_own_frame_size(monkeypatch, tmp_path):
+    # Found by review: frames are described at full size, so a 4K screen costs
+    # several times the Full HD figure the caption assumed.
+    import app
+    import vision
+
+    video = tmp_path / "meeting.mkv"
+    video.write_bytes(b"not really a video")
+    monkeypatch.setattr(app, "_video_length", lambda path, size: 600.0)
+    monkeypatch.setattr(app, "_video_frame_size", lambda path, size: (3840, 2160))
+
+    caption = _guess(video, 30.0)
+
+    tokens = vision.frame_tokens(3840, 2160)
+    cost = vision.estimate_frame_cost(21, "gpt-5.4-nano", "low", tokens)
+    assert f"At most **21** screenshots (up to {chr(92)}${cost:.2f})" in caption
+
+
+def test_a_prepared_video_that_does_not_say_its_length_is_told_so(
+    monkeypatch, tmp_path
+):
+    import app
+
+    video = tmp_path / "browser recording.webm"
+    video.write_bytes(b"no duration in the file")
+    monkeypatch.setattr(app, "_video_length", lambda path, size: 0.0)
+
+    caption = _guess(video, 30.0)
+
+    assert "does not say how long it is" in caption
+    assert "appears once it has been prepared" not in caption

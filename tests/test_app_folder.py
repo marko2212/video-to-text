@@ -13,6 +13,7 @@ import app
 import audio
 import config
 import db
+import recordings
 import transcribe
 
 _APP = """
@@ -137,7 +138,7 @@ def test_a_folder_that_does_not_exist_is_reported(tmp_path):
 def test_cleaning_up_forgets_the_pick_but_keeps_the_recording(folder, fake_openai):
     test = _pick(_in_folder_mode(folder), folder / "call.wav")
 
-    clean = next(b for b in test.button if b.label == "🧹 Clean temporary files")
+    clean = next(b for b in test.button if b.label == "Clean temporary files")
     clean.click().run()
 
     assert test.selectbox(key="folder_file").value is None
@@ -433,3 +434,128 @@ def test_a_browse_click_overtaken_by_upload_mode_does_not_come_back(
     test.radio(key="source").set_value(config.SOURCE_FOLDER).run()
 
     assert opened == []
+
+
+@pytest.fixture
+def lengths(monkeypatch):
+    """Recording lengths as ffprobe would read them; none known at first."""
+    known: dict[Path, float] = {}
+    monkeypatch.setattr(
+        recordings, "durations", lambda paths: {path: known.get(path) for path in paths}
+    )
+    return known
+
+
+def test_the_list_shows_each_recording_s_length_first(folder, lengths):
+    lengths[folder / "meeting.mkv"] = 3_735.0
+
+    listed = _in_folder_mode(folder).selectbox(key="folder_file").options
+
+    by_name = {option.split(" · ")[-2]: option for option in listed}
+    # First, because long recorder names are cut off at the end of the list.
+    assert by_name["meeting.mkv"].startswith("1:02:15 · meeting.mkv · ")
+    # Unknown (still being recorded, or unreadable): just name and date.
+    assert by_name["call.wav"].startswith("call.wav · ")
+    assert len(listed) == 2
+
+
+def _send_held(test: AppTest, held: str) -> AppTest:
+    """Run with the text the browser holds as the list's value.
+
+    AppTest re-sends the list's value in its current wording; a browser sends
+    the text it was last given, which is the old one after a change of the
+    entry unless the page sends the value again. Uses AppTest internals of
+    Streamlit 1.56.
+    """
+    states = test._tree.get_widget_states()
+    box = test.selectbox(key="folder_file")
+    for state in states.widgets:
+        if state.id == box.id:
+            state.string_value = held
+    return test._run(states)
+
+
+def test_the_choice_stays_when_its_length_appears(folder, lengths):
+    # Picked while still being recorded (no length yet); finishing it adds the
+    # length to its entry. Live, the next click but one forgot the choice.
+    test = _pick(_in_folder_mode(folder), folder / "call.wav")
+    box = test.selectbox(key="folder_file")
+    held = box.options[box.index]
+    lengths[folder / "call.wav"] = 2_832.0
+
+    for _ in range(3):  # three clicks elsewhere on the page
+        test = _send_held(test, held)
+        box = test.selectbox(key="folder_file")
+        if box.proto.set_value:
+            held = box.proto.raw_value
+
+    assert box.value == str(folder / "call.wav")
+    assert held.startswith("47:12 · call.wav · ")
+    assert not test.warning
+
+
+def test_cleaning_up_is_offered_in_the_sidebar_with_the_space_it_frees(folder):
+    test = _pick(_in_folder_mode(folder), folder / "call.wav")
+    uploads = config.get_settings().upload_dir
+    (uploads / "old call.amr").write_bytes(b"a" * 300_000)
+
+    test.run()
+
+    assert [b.label for b in test.sidebar.button] == ["Clean temporary files"]
+    assert not [b for b in test.main.button if "Clean" in b.label]
+    assert "**0.3 MB** in use." in [c.value for c in test.sidebar.caption]
+
+    test.sidebar.button[0].click().run()
+
+    assert not (uploads / "old call.amr").exists()
+    assert "Nothing to clean." in [c.value for c in test.sidebar.caption]
+    assert any("cleaned" in s.value for s in test.sidebar.success)
+
+
+def test_a_recording_picked_from_a_list_drawn_before_its_length_stays_chosen(
+    folder, lengths
+):
+    # Found by review: the list was drawn while the call was still recording;
+    # it finished, and the owner picked it from that list. The page had only
+    # remembered the chosen entry, so the next click (Start) lost the choice.
+    test = _in_folder_mode(folder)
+    box = test.selectbox(key="folder_file")
+    held = next(option for option in box.options if " call.wav · " in f" {option}")
+    lengths[folder / "call.wav"] = 2_832.0
+
+    for _ in range(3):  # the pick, then two clicks elsewhere
+        test = _send_held(test, held)
+        box = test.selectbox(key="folder_file")
+        if box.proto.set_value:
+            held = box.proto.raw_value
+
+    assert box.value == str(folder / "call.wav")
+    assert not test.warning
+
+
+def test_only_the_newest_recordings_are_given_a_length(folder, monkeypatch):
+    # A phone's call folder can hold thousands of files; reading each one's
+    # length would hold up the page.
+    asked = []
+    monkeypatch.setattr(
+        recordings, "durations", lambda paths: asked.append(paths) or {}
+    )
+    monkeypatch.setattr(app, "RECORDING_PROBE_LIMIT", 1)
+
+    test = _in_folder_mode(folder)
+
+    assert asked and all(len(paths) == 1 for paths in asked)
+    assert len(test.selectbox(key="folder_file").options) == 2
+
+
+def test_the_space_shown_includes_what_this_click_prepared(folder, monkeypatch):
+    def fake_to_wav(source, output):
+        Path(output).write_bytes(b"w" * 400_000)
+        return Path(output)
+
+    monkeypatch.setattr(audio, "to_wav", fake_to_wav)
+    monkeypatch.setattr(app, "_make_preview", lambda source, stem: None)
+
+    test = _pick(_in_folder_mode(folder), folder / "meeting.mkv")
+
+    assert "**0.4 MB** in use." in [c.value for c in test.sidebar.caption]

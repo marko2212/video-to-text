@@ -587,7 +587,7 @@ if visual and st.session_state.get("collect"):
 """
 
 
-def test_the_count_shown_before_the_run_is_the_count_described(tmp_path, monkeypatch):
+def test_the_run_never_describes_more_than_the_ceiling_shown(tmp_path, monkeypatch):
     import frames
     import vision
 
@@ -606,6 +606,7 @@ def test_the_count_shown_before_the_run_is_the_count_described(tmp_path, monkeyp
     ]
     scan = {"duration": 600.0, "width": 1920, "height": 1080, "frames": entries}
     monkeypatch.setattr(frames, "scan_video", lambda *a, **k: scan)
+    monkeypatch.setattr(app, "_video_length", lambda path, size: 600.0)
     described = []
     monkeypatch.setattr(
         vision,
@@ -618,14 +619,18 @@ def test_the_count_shown_before_the_run_is_the_count_described(tmp_path, monkeyp
     test.run()
     test.checkbox[0].set_value(True).run()
     test.slider[0].set_value(60).run()
-    caption = next(c.value for c in test.caption if "will be described" in c.value)
+    caption = next(c.value for c in test.caption if "At most" in c.value)
     shown = int(caption.split("**")[1])
 
     test.session_state["collect"] = True
     test.run()
 
-    assert shown == len(frames.select_from_scan(scan, 60.0))
-    assert described == [shown]
+    # Nothing is scanned before Start, so the caption gives the most a run can
+    # describe (a look a minute, if each showed a new picture): 11, plus what
+    # faster changes may add. The run describes the scan's own selection.
+    assert shown == 11
+    assert described == [len(frames.select_from_scan(scan, 60.0))]
+    assert described[0] <= shown
 
 
 def test_a_run_describes_a_screenshot_that_shares_a_picture_with_its_own(
@@ -713,6 +718,7 @@ def test_when_the_cap_binds_the_caption_and_the_run_use_the_whole_limit(
         ],
     }
     monkeypatch.setattr(frames, "scan_video", lambda *a, **k: scan)
+    monkeypatch.setattr(app, "_video_length", lambda path, size: 1020.0)
     described = []
     monkeypatch.setattr(
         vision,
@@ -725,13 +731,13 @@ def test_when_the_cap_binds_the_caption_and_the_run_use_the_whole_limit(
     test.run()
     test.checkbox[0].set_value(True).run()
     test.slider[0].set_value(5).run()
-    caption = next(c.value for c in test.caption if "will be described" in c.value)
+    caption = next(c.value for c in test.caption if "At most" in c.value)
 
     test.session_state["collect"] = True
     test.run()
 
-    assert "would give 204 screenshots, over the 200-screenshot limit" in caption
-    assert "**200** will be described" in caption
+    assert "At most **200** screenshots" in caption
+    assert "one every 5 s would give 205" in caption
     assert described == [200]
 
 

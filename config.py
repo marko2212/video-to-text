@@ -62,6 +62,15 @@ SOURCES: dict[str, str] = {
 # How long the computer's own file window may stay open before the page stops
 # waiting for it (the page is busy while it is open).
 FILE_PICKER_TIMEOUT_SECONDS: float = 600.0
+# The folder list shows each recording's length, read by ffprobe: about 0.13 s a
+# file (mostly starting the program), so several are read at once, and each file
+# only once until it changes.
+RECORDING_PROBE_WORKERS: int = 8
+# A file that takes longer (a network drive that hangs) is listed without one.
+RECORDING_PROBE_TIMEOUT_SECONDS: float = 15.0
+# Only the newest recordings of a folder get a length: a phone's call folder can
+# hold thousands of files (1,500 would take about 25 s, eight at a time).
+RECORDING_PROBE_LIMIT: int = 200
 
 # Transcription models. The first entry is the default shown in the UI.
 DEFAULT_MODEL: str = "gpt-4o-transcribe"

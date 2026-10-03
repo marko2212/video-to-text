@@ -14,10 +14,18 @@ import os
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
-from config import AUDIO_FORMATS, FILE_PICKER_TIMEOUT_SECONDS, VIDEO_FORMATS
+from config import (
+    AUDIO_FORMATS,
+    FILE_PICKER_TIMEOUT_SECONDS,
+    RECORDING_PROBE_TIMEOUT_SECONDS,
+    RECORDING_PROBE_WORKERS,
+    VIDEO_FORMATS,
+)
 from exceptions import FilePickerError
 
 _MEDIA = {f".{extension}" for extension in VIDEO_FORMATS + AUDIO_FORMATS}
@@ -149,8 +157,9 @@ def label(path: Path) -> str:
     """Return a recording's entry in the list to pick from: name and date.
 
     Nothing that changes while a file is written (size, modification time) is
-    in it: the list keeps the choice by its text, and a recording in progress
-    in the same folder must not make the chosen file's entry change.
+    in it: the list keeps the choice by its text. The page puts the length
+    (:func:`duration`) in front, which appears only once a recording is
+    finished, and handles that one change itself.
 
     Args:
         path: A recording.
@@ -181,6 +190,74 @@ def summary(path: Path) -> str:
         return ""
     saved = datetime.fromtimestamp(stat.st_mtime)
     return f"{stat.st_size / (1024 * 1024):,.1f} MB · saved {saved:%Y-%m-%d %H:%M}"
+
+
+def duration(path: Path) -> float | None:
+    """Return how long a recording plays, as its file says.
+
+    Read once per version of the file (size and modification time), so the
+    list costs nothing on later reruns, and a file that changes is read again.
+
+    Args:
+        path: A recording.
+
+    Returns:
+        The length in seconds; ``None`` when the file does not say. An MKV that
+        is still being recorded has no length until the recorder finishes it
+        (ffprobe prints ``N/A``), an MP4 has none before its index is written,
+        and nothing is known without ffprobe or for a file it cannot read.
+    """
+    try:
+        size, modified = version(path)
+    except OSError:
+        return None
+    return _probe_duration(str(path), size, modified)
+
+
+@lru_cache(maxsize=1024)
+def _probe_duration(path: str, size: int, modified: int) -> float | None:
+    """Ask ffprobe for a file's length (``size`` and ``modified`` key the cache)."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=RECORDING_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        seconds = float(result.stdout.strip())
+    except ValueError:
+        return None  # "N/A", or nothing for a file ffprobe cannot read
+    return seconds if seconds > 0 else None
+
+
+def durations(paths: list[Path]) -> dict[Path, float | None]:
+    """Return the lengths of several recordings, reading a few at a time.
+
+    Args:
+        paths: Recordings, e.g. from :func:`list_recordings`.
+
+    Returns:
+        Each path's :func:`duration`.
+    """
+    if not paths:
+        return {}
+    with ThreadPoolExecutor(max_workers=RECORDING_PROBE_WORKERS) as pool:
+        return dict(zip(paths, pool.map(duration, paths), strict=True))
 
 
 def version(path: Path) -> tuple[int, int]:
