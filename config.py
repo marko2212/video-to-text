@@ -50,6 +50,19 @@ AUDIO_FORMATS: list[str] = [
     "amr",
 ]
 
+# Where the file to transcribe comes from. A browser upload passes through the
+# app's memory several times over (see recordings.py); a file in a folder on
+# this computer is read where it lies. Kept across sessions like the title mode.
+SOURCE_UPLOAD: str = "upload"
+SOURCE_FOLDER: str = "folder"
+SOURCES: dict[str, str] = {
+    SOURCE_UPLOAD: "Upload a file",
+    SOURCE_FOLDER: "From a folder on this computer",
+}
+# How long the computer's own file window may stay open before the page stops
+# waiting for it (the page is busy while it is open).
+FILE_PICKER_TIMEOUT_SECONDS: float = 600.0
+
 # Transcription models. The first entry is the default shown in the UI.
 DEFAULT_MODEL: str = "gpt-4o-transcribe"
 TRANSCRIPTION_MODELS: list[str] = [DEFAULT_MODEL, "whisper-1"]
@@ -221,6 +234,12 @@ TITLE_MAX_TRANSCRIPT_CHARS: int = 200_000
 # Text tokens in an hour of transcript, for the cost hint next to the setting:
 # dense Serbian speech measured 2,450-2,920 tokens per 10 minutes (2026-09-25).
 TITLE_TOKENS_PER_HOUR: int = 17_000
+# Read timeout of a title request. nano answers in seconds; the transcription
+# timeout (5 minutes, per retry) would leave the page waiting far too long.
+TITLE_TIMEOUT_SECONDS: float = 60.0
+# A History title click this soon after the last title of the same entry is
+# taken as the second half of a double click, not as a request to pay again.
+TITLE_REPEAT_GUARD_SECONDS: float = 2.0
 
 # Saved parts of unfinished runs hold transcript text; they are deleted after
 # this many days without use, even if nobody cleans temporary files.
@@ -229,6 +248,14 @@ CHECKPOINT_MAX_AGE_DAYS: float = 14.0
 # after this long. Generous: a live screenshot folder can sit unchanged for over
 # an hour while its frames are described.
 SCRATCH_MAX_AGE_HOURS: float = 24.0
+# Working copies of recordings — uploads stored in uploads/, and a video's
+# extracted WAV and the player's MP3 in temp/ — are deleted after this long, each
+# time the page is opened. Nothing else removed them but the "Clean temporary
+# files" button: 3.4 GB piled up in two weeks (2026-09-30).
+WORKING_COPY_MAX_AGE_HOURS: float = 24.0
+# The working copies in temp/, by extension. Transcripts (.txt, .srt) are left
+# alone for now — the owner's call (2026-09-30), to be decided later.
+WORKING_COPY_TEMP_SUFFIXES: tuple[str, ...] = (".wav", ".mp3")
 
 # While a job runs, a hidden fragment checks this often whether the run was
 # stopped (toolbar Stop), so the disabled controls come back without a reload.
@@ -275,6 +302,7 @@ class Settings(BaseSettings):
         local_compute_type: Quantization for local Whisper (e.g. "int8").
         frame_max_count: Hard cap on screenshots described per video.
         serbian_latin: Rewrite Serbian Cyrillic in transcripts as Latin (off).
+        allow_local_files: Offer recordings from a folder on this computer.
     """
 
     openai_api_key: str | None = Field(
@@ -298,6 +326,10 @@ class Settings(BaseSettings):
     # On, Serbian Cyrillic is rewritten in Latin (the API picks the script per
     # chunk, so a long Serbian meeting can alternate between the two).
     serbian_latin: bool = Field(default=False)
+    # On for the usual local use: the page can list and read any folder of the
+    # computer it runs on. Turn it off (ALLOW_LOCAL_FILES=false) wherever other
+    # people can open the page — a hosted copy would show them its server's disk.
+    allow_local_files: bool = Field(default=True)
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from config import get_settings
+from config import WORKING_COPY_TEMP_SUFFIXES, get_settings
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -231,6 +231,60 @@ def prune_scratch(max_age_hours: float) -> int:
             if newest < cutoff:
                 shutil.rmtree(directory, ignore_errors=True)
                 removed += 1
+    return removed
+
+
+def prune_working_copies(max_age_hours: float) -> int:
+    """Delete working copies of recordings that are older than ``max_age_hours``.
+
+    An upload is stored in ``uploads/``, and a video's audio is extracted into
+    ``temp/`` as a WAV, with a small MP3 for the player. Only the "Clean
+    temporary files" button removed them. Deleted here: files directly in
+    ``uploads/``, and WAV and MP3 files directly in ``temp/``. Left alone:
+    transcripts, folders (saved parts of unfinished runs have their own
+    14-day rule, scratch folders theirs), anything inside the history or model
+    folder, and a file another program holds open. A page that still shows a
+    deleted copy prepares it again from its source. Nothing is touched while a
+    run is active in this process.
+
+    Args:
+        max_age_hours: Age limit, by the file's modification time.
+
+    Returns:
+        How many files were deleted.
+    """
+    if any_active_run():
+        return 0
+    settings = get_settings()
+    cutoff = time.time() - max_age_hours * 3600
+    keep = [settings.data_dir.resolve(), settings.whisper_model_dir.resolve()]
+    removed = 0
+    for folder, suffixes in (
+        (settings.upload_dir, None),
+        (settings.temp_dir, WORKING_COPY_TEMP_SUFFIXES),
+    ):
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            try:
+                if not path.is_file():
+                    continue
+                if suffixes is not None and path.suffix.lower() not in suffixes:
+                    continue
+                resolved = path.resolve()
+                if any(resolved.is_relative_to(kept) for kept in keep):
+                    continue
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                # Held open elsewhere (a player, another app instance): next time.
+                logger.warning("Could not remove %s: %s", path, exc)
+    if removed:
+        logger.info("Removed %d working copies older than %g h", removed, max_age_hours)
     return removed
 
 

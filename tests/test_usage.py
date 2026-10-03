@@ -110,6 +110,50 @@ def test_a_title_is_priced_like_a_chat_answer_and_marked_as_a_title():
     assert record["kind"] == "title"
 
 
+def _title(cost: float | None) -> dict:
+    return {
+        "kind": "title",
+        "model": "gpt-5.4-nano",
+        "input_tokens": 3_000,
+        "output_tokens": 10,
+        "cost_usd": cost,
+        "estimated": cost is None,
+    }
+
+
+def test_a_title_made_later_is_added_to_the_saved_cost():
+    saved = {
+        "provider": "OpenAI API",
+        "transcription": {"requests": 1, "cost_usd": 0.06, "estimated": False},
+        "vision": None,
+        "title": None,
+        "cost_usd": 0.06,
+        "estimated": False,
+    }
+
+    once = usage.add_to_cost(saved, "title", [_title(0.001)])
+    twice = usage.add_to_cost(once, "title", [_title(0.001), _title(0.001)])
+
+    assert once["title"]["requests"] == 1
+    assert once["cost_usd"] == pytest.approx(0.061)
+    assert twice["title"]["requests"] == 3
+    assert twice["title"]["input_tokens"] == 9_000
+    assert twice["cost_usd"] == pytest.approx(0.063)
+    assert twice["transcription"] == saved["transcription"]
+    assert not twice["estimated"]
+    assert saved["title"] is None  # the saved cost itself is not changed
+
+
+def test_an_unpriced_later_title_marks_the_cost_as_estimated():
+    saved = {"title": None, "cost_usd": 0.06, "estimated": False}
+
+    grown = usage.add_to_cost(saved, "title", [_title(None)])
+
+    assert grown["estimated"]
+    assert grown["title"]["estimated"]
+    assert usage.add_to_cost(saved, "title", []) is saved
+
+
 def test_every_offered_transcription_model_has_a_hint_with_its_price():
     import config
 

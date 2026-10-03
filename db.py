@@ -214,6 +214,28 @@ def set_preference(key: str, value: str) -> None:
         )
 
 
+def set_title(
+    record_id: int,
+    title: str | None,
+    cost_usd: float | None,
+    usage_json: str | None,
+) -> None:
+    """Store a transcription's AI title and its cost with the new title's request.
+
+    Args:
+        record_id: The transcription id.
+        title: The AI title.
+        cost_usd: The row's cost, now including the title request.
+        usage_json: The row's usage details, likewise.
+    """
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE transcriptions SET title = ?, cost_usd = ?, usage_json = ? "
+            "WHERE id = ?",
+            (title, cost_usd, usage_json, record_id),
+        )
+
+
 def delete_transcription(record_id: int) -> None:
     """Delete a single transcription record.
 

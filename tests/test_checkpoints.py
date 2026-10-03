@@ -113,3 +113,79 @@ def test_scratch_folders_of_a_killed_run_are_pruned():
     assert checkpoints.prune_scratch(max_age_hours=24) == 1
     assert not old.exists()
     assert (fresh / "chunk.mp3").exists()
+
+
+def _aged(path, hours=48, content=b"x"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    then = time.time() - hours * 3600
+    os.utime(path, (then, then))
+    return path
+
+
+def test_working_copies_a_day_old_are_removed_but_not_transcripts():
+    settings = config.get_settings()
+    uploads, temp = settings.upload_dir, settings.temp_dir
+    old_upload = _aged(uploads / "Sprint planning.mkv")
+    old_call = _aged(uploads / "phone call.amr")
+    old_wav = _aged(temp / "Sprint planning.wav")
+    old_preview = _aged(temp / "Sprint planning_preview.MP3")
+    # Kept: transcripts (the owner's call, for later), saved parts of an
+    # unfinished run (their own 14-day rule), and anything recent.
+    old_text = _aged(temp / "transcript_Sprint planning.txt")
+    old_subtitles = _aged(temp / "transcript_Sprint planning.srt")
+    old_part = _aged(temp / "checkpoints" / "abc-gpt" / "chunk_000.json")
+    fresh_upload = _aged(uploads / "today.mkv", hours=2)
+    fresh_wav = _aged(temp / "today.wav", hours=2)
+
+    removed = checkpoints.prune_working_copies(max_age_hours=24)
+
+    assert removed == 4
+    for gone in (old_upload, old_call, old_wav, old_preview):
+        assert not gone.exists(), gone
+    for kept in (old_text, old_subtitles, old_part, fresh_upload, fresh_wav):
+        assert kept.exists(), kept
+
+
+def test_working_copies_stay_while_a_run_is_active():
+    old_wav = _aged(config.get_settings().temp_dir / "meeting.wav")
+
+    with checkpoints.active_run():
+        assert checkpoints.prune_working_copies(max_age_hours=24) == 0
+
+    assert old_wav.exists()
+
+
+def test_the_history_is_never_a_working_copy(monkeypatch, tmp_path):
+    # DATA_DIR may point at the uploads folder: the database must survive, so
+    # nothing in that folder is treated as a working copy.
+    shared = tmp_path / "shared"
+    monkeypatch.setenv("DATA_DIR", str(shared))
+    monkeypatch.setenv("UPLOAD_DIR", str(shared))
+    config.get_settings.cache_clear()
+    database = _aged(shared / "transcriptions.db")
+    upload = _aged(shared / "call.amr")
+
+    checkpoints.prune_working_copies(max_age_hours=24)
+
+    assert database.exists()
+    # Everything in a folder the history lives in is left alone.
+    assert upload.exists()
+
+
+def test_a_copy_that_cannot_be_deleted_is_skipped_not_fatal(monkeypatch):
+    temp = config.get_settings().temp_dir
+    held = _aged(temp / "held open.wav")
+    other = _aged(temp / "other.wav")
+    real_unlink = type(held).unlink
+
+    def unlink(self, missing_ok=False):
+        if self.name == held.name:
+            raise PermissionError(13, "The file is being used by another process")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(type(held), "unlink", unlink)
+
+    assert checkpoints.prune_working_copies(max_age_hours=24) == 1
+    assert held.exists()
+    assert not other.exists()

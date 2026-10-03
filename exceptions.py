@@ -70,15 +70,20 @@ class VisualContextError(AppError):
     usage_record: dict | None = None
 
 
+class FilePickerError(AppError):
+    """Raised when the computer's own file window cannot be shown or used."""
+
+
 class TitleError(AppError):
     """Raised when the AI title of a finished transcript cannot be made.
 
     Attributes:
-        usage_record: The usage record of a request that was paid for although
-            it produced no title (an empty answer), else ``None``.
+        usage_records: The usage records of requests that were paid for although
+            they produced no title (an empty answer, a title in the wrong
+            script), else ``None``.
     """
 
-    usage_record: dict | None = None
+    usage_records: list[dict] | None = None
 
 
 class OpenAIAccountError(AppError):

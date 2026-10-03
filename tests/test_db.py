@@ -149,6 +149,21 @@ def test_preferences_roundtrip_and_overwrite():
     }
 
 
+def test_a_new_title_replaces_the_old_one_with_its_cost():
+    db.init_db()
+    record_id = db.add_transcription(
+        "call.wav", "audio", "whisper-1", False, "t", cost_usd=0.06, title="Old"
+    )
+
+    db.set_title(record_id, "New", 0.061, '{"cost_usd": 0.061}')
+
+    saved = db.get_transcription(record_id)
+    assert saved["title"] == "New"
+    assert saved["cost_usd"] == 0.061
+    assert saved["usage_json"] == '{"cost_usd": 0.061}'
+    assert saved["transcript"] == "t"
+
+
 def test_a_title_is_stored_beside_the_file_name():
     db.init_db()
     record_id = db.add_transcription(

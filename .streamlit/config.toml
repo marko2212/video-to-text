@@ -2,7 +2,9 @@
 maxUploadSize = 2048 # The value is in Megabytes (MB)
 # Transcripts are confidential and the app has no login, so it listens on this
 # machine only (both loopbacks, and the localhost URL keeps working). To reach
-# it from another device on purpose, run with --server.address=0.0.0.0.
+# it from another device on purpose, run with --server.address=0.0.0.0: anyone
+# on the network then sees the history and can transcribe with your key. The
+# "From a folder on this computer" source switches itself off in that case.
 address = "localhost"
 
 [browser]

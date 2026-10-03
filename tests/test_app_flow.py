@@ -165,6 +165,8 @@ def test_a_stopped_run_still_in_its_request_keeps_the_page_locked(fake_openai):
         assert _start_button(test).disabled
         assert any("Stopping" in i.value for i in test.info)
         assert fake_openai == []  # the job is not started a second time
+        # That run is already stopping; a Stop button would do nothing.
+        assert not any(b.key == "stop_job" for b in test.button)
         # Editing the result is a widget change, which would stop a job too.
         [preview] = [a for a in test.text_area if a.label == "Transcript preview:"]
         assert preview.disabled
@@ -794,3 +796,264 @@ def test_a_first_chunk_that_failed_after_paying_says_what_it_spent(monkeypatch):
     _start(test)
 
     assert any("$0.03" in i.value and "spent so far" in i.value for i in test.info)
+
+
+def _press_stop_now() -> None:
+    """Press Stop from inside the running job, as a browser's click arrives.
+
+    The click reaches the running script as a rerun request carrying the page's
+    widget states plus the Stop button's trigger; Streamlit raises it at the
+    script's next Streamlit call. (Streamlit 1.56 internals: AppTest cannot
+    click while a run is in progress.)
+    """
+    from streamlit.proto.WidgetStates_pb2 import WidgetState, WidgetStates
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    from streamlit.runtime.scriptrunner_utils.script_requests import RerunData
+
+    ctx = get_script_run_ctx()
+    states = WidgetStates()
+    # A browser sends a button press once: the Start click of this run must
+    # not come back with it (it would request a new job and hide the bug of a
+    # job that starts again after Stop).
+    states.widgets.extend(
+        state
+        for state in ctx.session_state.get_widget_states()
+        if state.WhichOneof("value") != "trigger_value"
+    )
+    stop_id = next(i for i in ctx.widget_ids_this_run if i.endswith("-stop_job"))
+    states.widgets.append(WidgetState(id=stop_id, trigger_value=True))
+    assert ctx.script_requests.request_rerun(RerunData(widget_states=states))
+
+
+def test_stop_ends_the_run_after_the_part_in_progress(monkeypatch):
+    parts = []
+
+    def stopped_during_part_one(input_file, output_file, api_key, **kwargs):
+        report = kwargs["progress_callback"]
+        report({"status": "progress", "message": "Part 1 of 3…", "progress": 0.0})
+        parts.append(1)
+        _press_stop_now()  # while part 1 is with OpenAI
+        # Part 1 is back (and saved); reporting part 2 is where the run stops.
+        report({"status": "progress", "message": "Part 2 of 3…", "progress": 0.33})
+        parts.append(2)
+        raise AssertionError("the run went on after Stop")
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", stopped_during_part_one)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    assert not any(b.key == "stop_job" for b in test.button)  # only during a run
+
+    _start(test)
+
+    # AppTest reruns in the job's own thread (as Streamlit does with
+    # runner.fastReruns off): the rerun must retire the job, not start it again.
+    assert parts == [1]
+    assert test.session_state.job is None
+    assert not _start_button(test).disabled
+    assert not any(b.key == "stop_job" for b in test.button)
+    assert any("stopped before it finished" in w.value for w in test.warning)
+    assert not any("Unexpected error" in e.value for e in test.error)
+    assert db.list_transcriptions() == []
+
+
+def test_a_stop_click_after_the_run_has_ended_changes_nothing():
+    test = AppTest.from_string(
+        "import streamlit as st\nimport app\napp.init_session_state()\n"
+        "app._request_stop()\n"
+        "st.session_state.flag = st.session_state.get('stop_requested')",
+        default_timeout=_TIMEOUT,
+    ).run()
+
+    assert test.session_state.flag is None
+
+
+_OWNED_JOB_SCRIPT = """
+import threading
+import streamlit as st
+import app
+
+if st.session_state.get("own_job"):
+    st.session_state.job = {"params": None, "worker": threading.current_thread()}
+    st.session_state.own_job = False
+app.main()
+"""
+
+
+def test_stop_is_the_one_control_left_enabled_during_a_run(monkeypatch):
+    monkeypatch.setattr(app, "_execute_job", lambda area, params: None)
+    test = AppTest.from_string(_OWNED_JOB_SCRIPT, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+
+    test.session_state["own_job"] = True
+    test.run()
+
+    assert _start_button(test).disabled
+    stop = test.button(key="stop_job")
+    assert not stop.disabled
+    assert any("stops after the part in progress" in c.value for c in test.caption)
+
+
+def test_a_stop_right_after_the_row_is_saved_leaves_no_saved_parts(monkeypatch):
+    # Every Streamlit call, session state included, is where a Stop takes
+    # effect. Between the history row and the discard of the saved parts,
+    # a Stop would have let Start save the same transcript a second time.
+    import checkpoints
+
+    saved = []
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        digest = checkpoints.file_digest(Path(input_file))
+        parts = transcribe.checkpoint_dir(digest, kwargs["model"])
+        parts.mkdir(parents=True, exist_ok=True)
+        (parts / "chunk_000.json").write_text("{}", encoding="utf-8")
+        saved.append(parts)
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+
+    real_add = db.add_transcription
+
+    def add_then_stop(**row):
+        row_id = real_add(**row)
+        _press_stop_now()
+        return row_id
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    monkeypatch.setattr(db, "add_transcription", add_then_stop)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+
+    _start(test)
+
+    [parts] = saved
+    assert not parts.exists()
+    assert len(db.list_transcriptions()) == 1
+    assert test.session_state.job is None
+
+
+def test_stop_with_fast_reruns_waits_for_the_part_in_progress(fake_openai):
+    # Streamlit's default (runner.fastReruns): the click's rerun starts at once
+    # in a new thread while the job's thread finishes the part it is in.
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    worker.start()
+    try:
+        test.session_state["job"] = {"params": _PARAMS, "worker": worker}
+        test.session_state["stop_requested"] = True  # what the callback set
+        test.run()
+
+        assert test.session_state.job is not None  # still locked
+        assert _start_button(test).disabled
+        assert any("Stopping" in i.value for i in test.info)
+        assert "stop_requested" not in test.session_state
+        assert fake_openai == []
+    finally:
+        release.set()
+        worker.join()
+
+    test.run()
+    assert test.session_state.job is None
+    assert any("stopped before it finished" in w.value for w in test.warning)
+
+
+def test_a_stop_during_the_title_keeps_the_parts_for_the_next_start(monkeypatch):
+    # The last step: the transcript is written but not saved. Its parts must
+    # stay saved, so the next Start pays for nothing but the title.
+    import checkpoints
+    import titles
+
+    runs = []
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        digest = checkpoints.file_digest(Path(input_file))
+        parts = transcribe.checkpoint_dir(digest, kwargs["model"])
+        parts.mkdir(parents=True, exist_ok=True)
+        (parts / "chunk_000.json").write_text("{}", encoding="utf-8")
+        runs.append(parts)
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+
+    def title_then_stop(transcript, api_key, model):
+        if len(runs) == 1:
+            _press_stop_now()  # while the title request is with OpenAI
+        return "A title", []
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    monkeypatch.setattr(titles, "make_title", title_then_stop)
+    db.init_db()
+    db.set_preference("title_mode", config.TITLE_MODE_APPEND)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+
+    _start(test)
+
+    assert db.list_transcriptions() == []
+    assert runs[0].exists()  # kept for the next Start
+    assert any("stopped before it finished" in w.value for w in test.warning)
+
+    _start(test)
+
+    [row] = db.list_transcriptions()
+    assert row["title"] == "A title"
+    assert not runs[0].exists()
+
+
+def test_opening_the_page_clears_day_old_working_copies_once():
+    import os
+    import time
+
+    uploads = config.get_settings().upload_dir
+    uploads.mkdir(parents=True, exist_ok=True)
+    then = time.time() - 48 * 3600
+    old = uploads / "last week.mkv"
+    old.write_bytes(b"video")
+    os.utime(old, (then, then))
+
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+
+    assert not old.exists()
+    later = uploads / "left meanwhile.mkv"
+    later.write_bytes(b"video")
+    os.utime(later, (then, then))
+    test.run()
+    assert later.exists()  # once per opened page, not on every click
+
+
+def test_a_working_copy_deleted_meanwhile_is_prepared_again(fake_openai):
+    # A page left open for days: its upload's copy was cleared as a day old.
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    saved = test.session_state.audio_path
+    saved.unlink()
+
+    test.run()
+
+    assert saved.exists()
+    _start(test)
+    assert fake_openai == [b"talk audio"]
+    assert len(db.list_transcriptions()) == 1
+
+
+def test_an_uploaded_video_whose_copy_went_first_is_prepared_again(monkeypatch):
+    # Found by review: an upload is saved a little before its WAV is extracted,
+    # so a one-day cleanup can delete the video and keep the WAV.
+    import audio
+
+    extracted = []
+
+    def fake_to_wav(source, output):
+        extracted.append(Path(source).read_bytes())
+        Path(output).write_bytes(b"wav")
+        return Path(output)
+
+    monkeypatch.setattr(audio, "to_wav", fake_to_wav)
+    monkeypatch.setattr(app, "_make_preview", lambda source, stem: None)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "meeting.mkv", b"the video")
+    video = test.session_state.video_path
+    assert test.session_state.audio_path.exists()
+
+    video.unlink()
+    test.run()
+
+    assert video.read_bytes() == b"the video"  # saved again from the upload
+    assert extracted == [b"the video", b"the video"]

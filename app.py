@@ -7,10 +7,11 @@ history persistence in :mod:`db`.
 Clicking Start only records a job (in the button's callback); the run that
 follows draws every control disabled and then does the work at the end of the
 script. Streamlit stops a running script whenever a widget changes, so while a
-job runs nothing that could change is left clickable — History lives in a
-fragment, whose reruns wait for the job instead of cancelling it. A job records
-the thread doing it, because a stopped script keeps running until its next
-Streamlit call — possibly a minute later, after a paid request returns.
+job runs nothing that could change is left clickable — except Stop, which uses
+exactly that — and History lives in a fragment, whose reruns wait for the job
+instead of cancelling it. A job records the thread doing it, because a stopped
+script keeps running until its next Streamlit call — possibly a minute later,
+after a paid request returns.
 """
 
 import importlib.util
@@ -28,6 +29,7 @@ import audio
 import checkpoints
 import db
 import frames
+import recordings
 import titles
 import transcribe
 import usage
@@ -52,14 +54,19 @@ from config import (
     PROVIDER_OPENAI,
     PROVIDERS,
     SCRATCH_MAX_AGE_HOURS,
+    SOURCE_FOLDER,
+    SOURCE_UPLOAD,
+    SOURCES,
     TIMESTAMP_MODELS,
     TITLE_MODE_OFF,
     TITLE_MODELS,
     TITLE_MODES,
+    TITLE_REPEAT_GUARD_SECONDS,
     TRANSCRIPTION_MODEL_NOTES,
     TRANSCRIPTION_MODELS,
     VIDEO_FORMATS,
     VISION_MODELS,
+    WORKING_COPY_MAX_AGE_HOURS,
     get_settings,
 )
 from exceptions import AppError, IncompleteTranscriptionError, OpenAIAccountError
@@ -84,14 +91,18 @@ _RUN_STATE_KEYS = (
     "partial",
     "run_notices",
     "run_title",
+    "run_row_id",
 )
 # Keys that live alongside the run state but are not reset by a new upload:
-# ``upload_id`` is what detects the new upload, ``job`` is the run request, and
-# ``uploader_generation`` is bumped to empty the uploader after a cleanup.
+# ``upload_id`` is what detects a new file (an upload's id, or a folder file's
+# path) and ``source_version`` the folder file's size and time when it was
+# chosen; ``job`` is the run request, and ``uploader_generation`` is bumped to
+# empty the uploader after a cleanup.
 _SESSION_KEYS = (
     *_RUN_STATE_KEYS,
     "original_filename",
     "upload_id",
+    "source_version",
     "job",
     "uploader_generation",
     "scan_failures",
@@ -166,6 +177,21 @@ def _digest(path: Path) -> str:
     return _cached_digest(str(path), stat.st_size, stat.st_mtime_ns)
 
 
+def _digest_if_any(path: Path | None) -> str | None:
+    """Return a file's digest, or ``None`` when there is no readable file.
+
+    Args:
+        path: File to identify, if any.
+
+    Returns:
+        :func:`_digest` of the file, or ``None``.
+    """
+    try:
+        return _digest(path) if path else None
+    except OSError:
+        return None
+
+
 def resolve_openai_key() -> str | None:
     """Return the OpenAI key from settings (.env) or the sidebar field, if any.
 
@@ -204,27 +230,43 @@ def render_sidebar(disabled: bool) -> None:
         render_title_settings(disabled)
 
 
-# The AI title preferences: session-state key → (offered values, default).
-_TITLE_PREFERENCES = {
+# Choices kept across sessions: session-state key (also the widget's key and
+# the stored name) → (offered values, or None for free text; default).
+_PREFERENCES: dict[str, tuple[list[str] | None, str]] = {
     "title_mode": (list(TITLE_MODES), TITLE_MODE_OFF),
     "title_model": (TITLE_MODELS, DEFAULT_TITLE_MODEL),
+    "source": (list(SOURCES), SOURCE_UPLOAD),
+    "recordings_folder": (None, ""),
 }
+
+
+def _preference(key: str) -> str:
+    """Return a kept choice, loading the stored one when the session has none.
+
+    Args:
+        key: A key of ``_PREFERENCES``.
+
+    Returns:
+        The value in session state; a stored value no longer offered (a model
+        since removed) falls back to the default.
+    """
+    options, default = _PREFERENCES[key]
+    value = st.session_state.get(key)
+    if not isinstance(value, str) or (options is not None and value not in options):
+        value = db.get_preferences().get(key)
+        if value is None or (options is not None and value not in options):
+            value = default
+        st.session_state[key] = value
+    return value
 
 
 def _title_preferences() -> tuple[str, str]:
     """Return the AI title mode and model, loading the stored ones once a session.
 
     Returns:
-        The mode (a ``TITLE_MODES`` key) and the chat model. A stored value no
-        longer offered (a model since removed) falls back to the default.
+        The mode (a ``TITLE_MODES`` key) and the chat model.
     """
-    stored: dict[str, str] | None = None
-    for key, (options, default) in _TITLE_PREFERENCES.items():
-        if st.session_state.get(key) not in options:
-            stored = db.get_preferences() if stored is None else stored
-            value = stored.get(key)
-            st.session_state[key] = value if value in options else default
-    return st.session_state.title_mode, st.session_state.title_model
+    return _preference("title_mode"), _preference("title_model")
 
 
 def _save_preference(key: str) -> None:
@@ -318,7 +360,7 @@ def make_progress_callback(container: Any) -> ProgressCallback:
 
 def save_to_history(
     source_type: str, provider: str, model: str, with_timestamps: bool
-) -> None:
+) -> int | None:
     """Persist the just-finished transcription into the SQLite history.
 
     Args:
@@ -326,10 +368,13 @@ def save_to_history(
         provider: Engine used (OpenAI API or local).
         model: Transcription model used.
         with_timestamps: Whether subtitles were generated.
+
+    Returns:
+        The new row's id, or ``None`` when there was no transcript to save.
     """
     transcript_path: Path | None = st.session_state.transcript_path
     if not transcript_path or not transcript_path.exists():
-        return
+        return None
     cost: dict[str, Any] | None = st.session_state.get("run_cost")
 
     srt_path: Path | None = st.session_state.srt_path
@@ -340,7 +385,7 @@ def save_to_history(
     if audio_path and audio_path.exists():
         file_size_mb = round(audio_path.stat().st_size / (1024 * 1024), 2)
 
-    db.add_transcription(
+    return db.add_transcription(
         filename=st.session_state.original_filename,
         source_type=source_type,
         model=model,
@@ -405,31 +450,38 @@ def clean_temp_files() -> None:
         logger.warning("Cleanup failed: %s", exc)
         st.session_state.clean_message = ("error", f"Error during cleanup: {exc}")
         return
-    for key in (*_RUN_STATE_KEYS, "original_filename", "upload_id"):
+    for key in (*_RUN_STATE_KEYS, "original_filename", "upload_id", "source_version"):
         st.session_state[key] = None
-    # Empty the uploader too (a new key is a new, empty widget), or the next
-    # click would save and extract the same file again.
+    # Empty the uploader and the folder pick too (a new uploader key is a new,
+    # empty widget), or the next click would extract the same file again.
     st.session_state.uploader_generation = (
         st.session_state.uploader_generation or 0
     ) + 1
+    st.session_state.folder_file = None
     st.session_state.clean_message = ("success", "Temporary files cleaned.")
 
 
-def _track_upload(uploaded_file: Any) -> None:
-    """Reset the previous file's state when a different upload arrives.
+def _track_source(
+    source_id: str, name: str, version: tuple[int, int] | None = None
+) -> None:
+    """Reset the previous file's state when a different file is chosen.
 
-    Keyed on the upload's ``file_id``, not its name: phones and screen
-    recorders reuse names, and a new ``call.wav`` used to be ignored in favour
-    of the previous one — transcribed, billed and saved under the new upload.
+    Keyed on the upload's ``file_id`` (or a folder file's path), not its name:
+    phones and screen recorders reuse names, and a new ``call.wav`` used to be
+    ignored in favour of the previous one — transcribed, billed and saved under
+    the new upload.
 
     Args:
-        uploaded_file: The Streamlit uploaded file.
+        source_id: What identifies the chosen file.
+        name: Its file name.
+        version: A folder file's size and time when chosen, to notice a change.
     """
-    if st.session_state.upload_id != uploaded_file.file_id:
+    if st.session_state.upload_id != source_id:
         for key in _RUN_STATE_KEYS:
             st.session_state[key] = None
-        st.session_state.upload_id = uploaded_file.file_id
-    st.session_state.original_filename = uploaded_file.name
+        st.session_state.upload_id = source_id
+        st.session_state.source_version = version
+    st.session_state.original_filename = name
 
 
 def _safe_stem(filename: str) -> str:
@@ -461,24 +513,35 @@ def _make_preview(source: Path, stem: str) -> Path | None:
         return None
 
 
-def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
-    """Make the uploaded media ready for transcription (run once per file).
+def prepare_audio(name: str, is_audio: bool, obtain: Callable[[], Path]) -> None:
+    """Make the chosen media ready for transcription (run once per file).
 
-    Audio uploads are stored as-is; videos have their audio track extracted.
+    Audio files are used as they are; videos have their audio track extracted.
     Videos, formats browsers cannot play (AMR, WMA, AIFF) and large files also
     get a small MP3 preview for the player. Paths are stored in session state.
 
     Args:
-        uploaded_file: The Streamlit uploaded file.
-        is_audio: True if the upload is an audio file.
+        name: The file's name.
+        is_audio: True if the file is an audio file.
+        obtain: Returns the file on disk: an upload is saved to ``uploads/``
+            first, a file from a folder is used where it lies.
     """
-    if st.session_state.audio_path is not None:
+    prepared: Path | None = st.session_state.audio_path
+    video: Path | None = st.session_state.video_path
+    if (
+        prepared is not None
+        and prepared.exists()
+        and (is_audio or (video is not None and video.exists()))
+    ):
         return
-    stem = _safe_stem(uploaded_file.name)
-    extension = Path(uploaded_file.name).suffix.lower().lstrip(".")
+    # Not prepared yet, or a working copy was deleted meanwhile (they are
+    # cleared after a day — an upload's copy can go a little before its WAV):
+    # prepare it again from the source.
+    stem = _safe_stem(name)
+    extension = Path(name).suffix.lower().lstrip(".")
     try:
         if is_audio:
-            source = audio.save_uploaded_file(uploaded_file)
+            source = obtain()
             size_mb = source.stat().st_size / (1024 * 1024)
             if extension in BROWSER_UNPLAYABLE_AUDIO or size_mb > PREVIEW_ABOVE_MB:
                 with st.spinner("Preparing a playable preview…", show_time=True):
@@ -488,13 +551,14 @@ def prepare_audio(uploaded_file: Any, is_audio: bool) -> None:
             st.session_state.audio_path = source
         else:
             with st.spinner("Extracting audio from video...", show_time=True):
-                source = audio.save_uploaded_file(uploaded_file)
+                source = obtain()
                 # Kept so on-screen context can go back to the video for frames.
                 st.session_state.video_path = source
                 wav = audio.to_wav(source, get_settings().temp_dir / f"{stem}.wav")
                 st.session_state.preview_path = _make_preview(wav, stem)
                 st.session_state.audio_path = wav
-    except AppError as exc:
+    except (AppError, OSError) as exc:
+        # OSError: the source itself is gone (moved or deleted meanwhile).
         st.error(f"Error preparing audio: {exc}")
 
 
@@ -1043,15 +1107,14 @@ def _make_title(
         return []
     progress({"status": "info", "message": "Writing a title…"})
     try:
-        title, record = titles.make_title(
+        title, records = titles.make_title(
             transcript_path.read_text(encoding="utf-8"), api_key, model
         )
     except AppError as exc:
         notices.append(("warning", f"No AI title: {exc}"))
-        paid = getattr(exc, "usage_record", None)
-        return [paid] if paid else []
+        return list(getattr(exc, "usage_records", None) or [])
     st.session_state.run_title = title
-    return [record]
+    return records
 
 
 def run_transcription(
@@ -1084,6 +1147,7 @@ def run_transcription(
     st.session_state.elapsed_seconds = None
     st.session_state.run_cost = None
     st.session_state.run_title = None
+    st.session_state.run_row_id = None
     vision_spent: list[dict[str, Any]] = []
     used_frames: list[str] = []
     progress = make_progress_callback(st.empty())
@@ -1092,6 +1156,14 @@ def run_transcription(
     started = time.monotonic()
 
     try:
+        # Taken before the run: a recording from a folder that is still being
+        # written would hash differently at the end, and what is discarded then
+        # must be what this run saved.
+        audio_digest = video_digest = None
+        if provider == PROVIDER_OPENAI:
+            audio_digest = _digest_if_any(st.session_state.audio_path)
+        if visual:
+            video_digest = _digest_if_any(st.session_state.video_path)
         visual_notes = None
         visual_complete = False
         if visual:
@@ -1133,11 +1205,9 @@ def run_transcription(
             # shows the earlier partial transcript, and must still say so.
             st.session_state.partial = None
             cache = None
-            if visual and st.session_state.video_path:
+            if visual and video_digest:
                 cache = vision.cache_dir(
-                    _digest(st.session_state.video_path),
-                    visual["model"],
-                    visual["detail"],
+                    video_digest, visual["model"], visual["detail"]
                 )
                 if visual_complete:
                     # The cache is discarded below. Descriptions an earlier,
@@ -1149,15 +1219,15 @@ def run_transcription(
             st.session_state.run_cost = _run_cost(
                 provider, transcription_spent, vision_spent, title_records=title_spent
             )
-            save_to_history(source_type, provider, model, with_timestamps)
+            row_id = save_to_history(source_type, provider, model, with_timestamps)
             # Only now: a run stopped after its last chunk has already written
             # the transcript but not saved it, and must be able to resume free.
-            if provider == PROVIDER_OPENAI:
-                checkpoints.discard(
-                    transcribe.checkpoint_dir(
-                        _digest(st.session_state.audio_path), model
-                    )
-                )
+            # And straight after the row, with no Streamlit call in between: each
+            # one (session state included) is where a Stop takes effect, and a
+            # Stop between the row and the discard would let Start save the
+            # same transcript as a second row.
+            if audio_digest:
+                checkpoints.discard(transcribe.checkpoint_dir(audio_digest, model))
             if cache is not None:
                 if visual_complete:
                     checkpoints.discard(cache)
@@ -1165,6 +1235,7 @@ def run_transcription(
                     # Kept so a rerun pays only for the missing screenshots;
                     # this row has counted the ones it used.
                     vision.mark_billed(cache, used_frames)
+            st.session_state.run_row_id = row_id
     except IncompleteTranscriptionError as exc:
         st.session_state.transcript_path = transcript_path
         st.session_state.srt_path = None
@@ -1258,17 +1329,50 @@ def _stopped_notice(job: dict[str, Any]) -> list[tuple[str, str]]:
     return [("warning", f"The last run was stopped before it finished. {hint}")]
 
 
+def _request_stop() -> None:
+    """Ask the running job to stop (the Stop button's callback).
+
+    The click is a rerun request, which stops the job's script at its next
+    Streamlit call — after the request in flight has returned and been saved.
+    With ``runner.fastReruns`` (Streamlit's default) the rerun starts at once
+    in a new thread while the old one finishes: the page stays locked, says
+    "Stopping — waiting…", and the watchdog retires the job once that thread
+    has ended — the toolbar Stop's path. Without it, the rerun runs in the
+    job's own thread after the stop, and :func:`_settle_job` retires the job
+    there instead of letting the rerun start it again. A click that arrives
+    after the job has finished is ignored.
+    """
+    if st.session_state.job is not None:
+        st.session_state.stop_requested = True
+
+
+def _owns_job() -> bool:
+    """Return True when this run is the one doing the requested job."""
+    job = st.session_state.job
+    return job is not None and job["worker"] is threading.current_thread()
+
+
 def _settle_job() -> None:
     """At the start of a full run, retire a job whose run is gone.
 
-    A job's worker is the thread that runs it. If that thread has ended without
-    clearing the job, its run was stopped (the toolbar's Stop, the rerun
-    shortcut, a reconnect). If it is still alive, it is finishing a request it
-    was in when stopped — it dies at its next Streamlit call — so the job is
-    kept and the controls stay locked until it does; otherwise Start could send
-    the same, already paid, chunk a second time.
+    A job's worker is the thread that runs it. If the Stop button's rerun runs
+    in that same thread (``runner.fastReruns`` off), the job is retired here.
+    If the thread has ended without clearing the job, its run was stopped (the
+    Stop button or the toolbar's Stop with fast reruns, a reconnect). If it is
+    still alive in another run, it is finishing a request it was in when
+    stopped — it dies at its next Streamlit call — so the job is kept and the
+    controls stay locked until it does; otherwise Start could send the same,
+    already paid, chunk a second time.
     """
     job = st.session_state.job
+    if st.session_state.pop("stop_requested", False) and job is not None:
+        worker = job["worker"]
+        if worker is None or worker is threading.current_thread():
+            # The Stop button: its click reran the script in the job's own
+            # thread, which is here now, so the job is no longer running.
+            st.session_state.job = None
+            st.session_state.run_notices = _stopped_notice(job)
+            return
     if job is None or job["worker"] is None or job["worker"].is_alive():
         return
     st.session_state.job = None
@@ -1576,6 +1680,298 @@ def render_resume_hint(provider: str, model: str) -> None:
         )
 
 
+# What the uploader accepts, for its help.
+_FORMATS_HELP = (
+    "**Video**\n\n"
+    "- Common: MKV, MP4, MOV, AVI, WebM, M4V\n"
+    "- Legacy: WMV, FLV, MPEG, MPG\n"
+    "- Mobile: 3GP\n"
+    "- TV/streaming: TS, MTS, M2TS\n"
+    "- Other: OGV, VOB\n\n"
+    "**Audio**\n\n"
+    "- MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, AMR"
+)
+
+# A chosen file: what identifies it, its name, a function that returns it on
+# disk (saving an upload first), and its version on disk (a folder file only).
+ChosenFile = tuple[str, str, Callable[[], Path], tuple[int, int] | None]
+# Server addresses that only this computer can reach.
+_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+
+def _local_files_allowed() -> bool:
+    """Return True when the page may offer recordings from this computer's folders.
+
+    Only while the app listens on this machine alone: started with
+    ``--server.address=0.0.0.0`` (as in Docker), anyone who can open the page
+    could browse the disk and transcribe what is on it with the owner's key.
+
+    Returns:
+        Whether ``ALLOW_LOCAL_FILES`` is on and the server is loopback-only.
+    """
+    address = st.get_option("server.address")
+    return get_settings().allow_local_files and address in _LOOPBACK
+
+
+def _choose_source(disabled: bool) -> ChosenFile | None:
+    """Offer an upload, or a recording from a folder on this computer.
+
+    Args:
+        disabled: True while a job runs.
+
+    Returns:
+        The chosen file, or ``None`` while there is none.
+    """
+    local_files = _local_files_allowed()
+    source = SOURCE_UPLOAD
+    if local_files:
+        _preference("source")
+        source = st.radio(
+            "Source",
+            options=list(SOURCES),
+            format_func=SOURCES.get,
+            key="source",
+            on_change=_save_preference,
+            args=("source",),
+            horizontal=True,
+            disabled=disabled,
+            label_visibility="collapsed",
+        )
+    if source == SOURCE_FOLDER:
+        return _choose_from_folder(disabled)
+    # A Browse click that the switch to Upload overtook must not open the
+    # window later, when the folder source is shown again.
+    st.session_state.pop("pick_pending", None)
+
+    help_text = _FORMATS_HELP
+    if local_files:
+        help_text += (
+            "\n\n**Large recordings:** choose *From a folder on this computer* "
+            "instead. An upload is held in the app's memory while it arrives, and "
+            "a big one fails when memory runs short."
+        )
+    uploaded_file = st.file_uploader(
+        "Choose video or audio file",
+        type=VIDEO_FORMATS + AUDIO_FORMATS,
+        key=f"uploader_{st.session_state.uploader_generation or 0}",
+        disabled=disabled,
+        help=help_text,
+    )
+    if not uploaded_file:
+        return None
+    return (
+        uploaded_file.file_id,
+        uploaded_file.name,
+        lambda: audio.save_uploaded_file(uploaded_file),
+        None,
+    )
+
+
+def _save_folder() -> None:
+    """Keep the recordings folder for next time (the folder field's callback).
+
+    A pasted path of one recording keeps its folder and chooses that file.
+    """
+    text = st.session_state.recordings_folder
+    folder, recording = recordings.parse_location(text)
+    if folder is not None:
+        st.session_state.recordings_folder = text = str(folder)
+    if folder is not None and recording is not None:
+        st.session_state.folder_file = str(folder / recording.name)
+    db.set_preference("recordings_folder", text)
+
+
+def _request_pick() -> None:
+    """Open the computer's file window on this click's run (the button callback).
+
+    The window itself is opened while the page is drawn, under a spinner that
+    says where to look: a callback has no place to show that.
+    """
+    st.session_state.pick_pending = True
+
+
+def _pick_recording() -> None:
+    """Let the owner choose a recording in the computer's own file window.
+
+    The chosen file's folder becomes the recordings folder (kept for next
+    time), and the file is chosen in the list. Called before the folder field
+    is drawn, so both widgets can still be set.
+    """
+    start, _ = recordings.parse_location(st.session_state.recordings_folder)
+    with st.spinner(
+        "Choose the recording in the window that opened — it may be behind this "
+        "browser window…"
+    ):
+        try:
+            chosen = recordings.ask_for_recording(start)
+        except AppError as exc:
+            st.warning(str(exc))
+            return
+    if chosen is None:
+        return  # cancelled
+    if not recordings.is_media(chosen):
+        st.warning(f"{chosen.name} is not a video or audio file the app can read.")
+        return
+    folder = str(chosen.parent)
+    st.session_state.recordings_folder = folder
+    st.session_state.folder_file = str(chosen.parent / chosen.name)
+    db.set_preference("recordings_folder", folder)
+
+
+def _forget_source() -> None:
+    """Drop what was made from a recording that changed, so it is prepared again."""
+    for key in _RUN_STATE_KEYS:
+        st.session_state[key] = None
+    st.session_state.upload_id = None
+
+
+def _is_app_folder(folder: Path) -> bool:
+    """Return True for the app's own working folders, or a folder inside them.
+
+    Args:
+        folder: A folder given as the recordings folder.
+
+    Returns:
+        Whether it is (in) ``temp/``, ``uploads/``, the history or the model
+        folder — "Clean temporary files" would delete a recording picked there.
+    """
+    settings = get_settings()
+    work = (
+        settings.temp_dir,
+        settings.upload_dir,
+        settings.data_dir,
+        settings.whisper_model_dir,
+    )
+    try:
+        resolved = folder.resolve()
+        return any(resolved.is_relative_to(path.resolve()) for path in work)
+    except OSError:
+        return False
+
+
+def _list_folder(folder: Path) -> list[str] | None:
+    """List a folder's recordings for the pick list, reporting what goes wrong.
+
+    Args:
+        folder: The recordings folder.
+
+    Returns:
+        The recordings' paths, newest first; ``None`` (with a warning drawn)
+        when the folder cannot be used.
+    """
+    if _is_app_folder(folder):
+        st.warning(
+            "This is one of the app's own working folders — choose the folder your "
+            "recordings are saved in."
+        )
+        return None
+    try:
+        return [str(path) for path in recordings.list_recordings(folder)]
+    except OSError as exc:
+        st.warning(f"This folder cannot be read: {exc.strerror or exc}")
+        return None
+
+
+def _choose_from_folder(disabled: bool) -> ChosenFile | None:
+    """Offer the recordings in a folder on this computer, newest first.
+
+    The file is read where it lies: nothing passes through the browser or the
+    app's memory, and nothing is copied into ``uploads/``. It is identified by
+    its path; when it changes on disk afterwards (still being recorded), the
+    page says so instead of silently dropping what was made from it.
+
+    Args:
+        disabled: True while a job runs.
+
+    Returns:
+        The chosen recording, or ``None`` while there is none.
+    """
+    _preference("recordings_folder")
+    # Popped on every run, and the window is opened only while nothing runs: a
+    # click that lands together with Start must not open it in the job's run.
+    if st.session_state.pop("pick_pending", False) and not disabled:
+        _pick_recording()
+    field, browse = st.columns([2, 1], vertical_alignment="bottom")
+    with field:
+        st.text_input(
+            "Recordings folder",
+            key="recordings_folder",
+            on_change=_save_folder,
+            disabled=disabled,
+            placeholder="e.g. C:\\Users\\you\\Videos",
+            help=(
+                "The folder your recordings are saved in (OBS, Teams, a phone's "
+                "folder), as a full path — or use **📂 Browse…** to find one "
+                "recording in this computer's own file window. Pasting the path of "
+                "one recording works too (Explorer: Shift + right-click it → "
+                "*Copy as path*). Remembered for next time."
+            ),
+        )
+    with browse:
+        st.button(
+            "📂 Browse…",
+            key="pick_file",
+            on_click=_request_pick,
+            disabled=disabled,
+            width="stretch",
+            help=(
+                "Opens this computer's own window for choosing a file, in the last "
+                "folder used. The recording is read from there, not uploaded."
+            ),
+        )
+    text = st.session_state.recordings_folder
+    folder, _ = recordings.parse_location(text)
+    if folder is None:
+        if text.strip():
+            st.warning("There is no such folder on this computer (give its full path).")
+        return None
+    files = _list_folder(folder)
+    if files is None:
+        return None
+    picked = st.session_state.get("folder_file")
+    if picked not in files:
+        # Nothing chosen yet (start empty rather than on the newest file, so
+        # opening the page does not start an extraction), a path typed in
+        # another letter case, or a file that is gone.
+        found = recordings.find(files, picked) if picked else None
+        if picked and found is None:
+            st.session_state.folder_gone = Path(picked).name
+        st.session_state.folder_file = found
+    if not files:
+        st.info("No video or audio files in this folder (subfolders are not listed).")
+        return None
+    chosen = st.selectbox(
+        "Recording",
+        options=files,
+        key="folder_file",
+        format_func=lambda path: recordings.label(Path(path)),
+        placeholder="Choose a recording (newest first)",
+        disabled=disabled,
+    )
+    if not chosen:
+        gone = st.session_state.get("folder_gone")
+        if gone:
+            st.warning(f"{gone} is no longer in this folder — choose it again.")
+        return None
+    st.session_state.folder_gone = None
+    path = Path(chosen)
+    try:
+        version = recordings.version(path)
+    except OSError:
+        st.warning("This recording can no longer be read.")
+        return None
+    source_id = f"folder:{chosen}"
+    prepared = st.session_state.source_version
+    if st.session_state.upload_id == source_id and prepared not in (None, version):
+        st.warning(
+            "This recording has changed on disk since it was prepared — it may "
+            "still be being recorded. The audio and result below are from before."
+        )
+        st.button("↻ Load it again", on_click=_forget_source, disabled=disabled)
+    st.caption(f"{recordings.summary(path)} · read from disk, not uploaded")
+    return source_id, path.name, lambda: path, version
+
+
 def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
     """Render the main transcription workflow: upload, prepare, transcribe.
 
@@ -1591,32 +1987,18 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
     left, right = st.columns([2, 3])
 
     with left:
-        uploaded_file = st.file_uploader(
-            "Choose video or audio file",
-            type=VIDEO_FORMATS + AUDIO_FORMATS,
-            key=f"uploader_{st.session_state.uploader_generation or 0}",
-            disabled=running,
-            help=(
-                "**Video**\n\n"
-                "- Common: MKV, MP4, MOV, AVI, WebM, M4V\n"
-                "- Legacy: WMV, FLV, MPEG, MPG\n"
-                "- Mobile: 3GP\n"
-                "- TV/streaming: TS, MTS, M2TS\n"
-                "- Other: OGV, VOB\n\n"
-                "**Audio**\n\n"
-                "- MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, AMR"
-            ),
-        )
+        chosen = _choose_source(running)
 
-        if uploaded_file:
-            _track_upload(uploaded_file)
+        if chosen:
+            source_id, name, obtain, version = chosen
+            _track_source(source_id, name, version)
 
-            extension = Path(uploaded_file.name).suffix.lower().lstrip(".")
+            extension = Path(name).suffix.lower().lstrip(".")
             is_audio = extension in AUDIO_FORMATS
             source_type = "audio" if is_audio else "video"
 
             st.subheader("1️⃣ Audio")
-            prepare_audio(uploaded_file, is_audio)
+            prepare_audio(name, is_audio, obtain)
 
             preview: Path | None = st.session_state.preview_path
             if preview and preview.exists():
@@ -1655,6 +2037,24 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
                     disabled=running,
                     on_click=_request_job,
                 )
+                if _owns_job():
+                    # The one control left enabled during a run. Not while an
+                    # earlier run's thread is still finishing (toolbar Stop):
+                    # that one is already stopping.
+                    st.button(
+                        "⏹ Stop",
+                        key="stop_job",
+                        on_click=_request_stop,
+                        help=(
+                            "Stops after the part in progress: a part already sent "
+                            "to OpenAI is paid for either way, so it is finished "
+                            "and kept, and Start later sends only the rest."
+                        ),
+                    )
+                    st.caption(
+                        "⏹ stops after the part in progress (it is kept) — "
+                        "usually within a minute."
+                    )
                 job_area = st.container()
                 render_run_notices()
 
@@ -1703,6 +2103,96 @@ def _history_cost(record: Any) -> str | None:
     return usage.format_usd(record["cost_usd"], bool(details.get("estimated")))
 
 
+def _request_retitle(record_id: int) -> None:
+    """Ask for a History entry's title on the fragment's next run (a callback).
+
+    The request itself is made while the list is drawn, under a spinner where
+    the entry is: a callback has no place to show progress, and blocks the page
+    without a sign. A click that arrives right after this entry's last title
+    is taken as the second half of a double click and ignored — it would
+    otherwise pay for a second title.
+
+    Args:
+        record_id: The transcription id.
+    """
+    done = st.session_state.get(f"hist_title_done_{record_id}")
+    if done is not None and time.monotonic() - done < TITLE_REPEAT_GUARD_SECONDS:
+        return
+    st.session_state.hist_title_pending = record_id
+
+
+def _retitle(record_id: int) -> None:
+    """Ask for a new AI title for a saved transcript and store it with its cost.
+
+    What the request cost is added to the row's cost whether or not a title
+    came back — it was paid either way. Rows saved before costs were recorded
+    keep no cost: the title's alone would read as the price of the whole
+    transcript.
+
+    Args:
+        record_id: The transcription id.
+    """
+    full = db.get_transcription(record_id)
+    api_key = resolve_openai_key()
+    if full is None or not api_key:
+        return
+    _, model = _title_preferences()
+    title = full["title"]
+    try:
+        title, records = titles.make_title(full["transcript"], api_key, model)
+        message = ("success", f"🏷️ New title: {title}")
+    except AppError as exc:
+        records = list(getattr(exc, "usage_records", None) or [])
+        message = ("warning", f"No new title: {exc}")
+    cost_usd, usage_json = full["cost_usd"], full["usage_json"]
+    if records and usage_json:
+        try:
+            cost = usage.add_to_cost(json.loads(usage_json), "title", records)
+        except (ValueError, AttributeError):
+            cost = None
+        if cost is not None:
+            cost_usd, usage_json = cost["cost_usd"], json.dumps(cost)
+    db.set_title(record_id, title, cost_usd, usage_json)
+    st.session_state[f"hist_title_msg_{record_id}"] = message
+    st.session_state[f"hist_title_done_{record_id}"] = time.monotonic()
+    if st.session_state.get("run_row_id") == record_id:
+        # The result on the Transcribe tab names its downloads after it too.
+        st.session_state.run_title = title
+
+
+def _render_retitle(record_id: int, has_title: bool) -> None:
+    """Offer a (new) AI title for a History entry, and say how the last try went.
+
+    Args:
+        record_id: The transcription id.
+        has_title: Whether the row already has a title.
+    """
+    _, model = _title_preferences()
+    has_key = bool(resolve_openai_key())
+    per_hour = titles.estimate_cost_per_hour(model)
+    cost = ""
+    if per_hour:
+        cost = f" — about {usage.format_usd(per_hour)} per hour of recording"
+    st.button(
+        "🏷️ New title" if has_title else "🏷️ Make a title",
+        key=f"hist_title_{record_id}",
+        on_click=_request_retitle,
+        args=(record_id,),
+        disabled=not has_key,
+        help=(
+            f"Sends this transcript to {model} for a title{cost}, added to this "
+            "entry's cost. The model is set in the sidebar."
+            if has_key
+            else "Needs an OpenAI API key (sidebar or `.env`)."
+        ),
+    )
+    # Kept while the entry stays open (a second click of a double click reruns
+    # the list and would otherwise wipe it); closing the entry clears it.
+    message = st.session_state.get(f"hist_title_msg_{record_id}")
+    if message:
+        getattr(st, message[0])(message[1])
+
+
 @st.fragment
 def render_history_tab() -> None:
     """List past transcriptions stored in SQLite, with download/delete.
@@ -1719,15 +2209,31 @@ def render_history_tab() -> None:
         return
 
     mode, _ = _title_preferences()
+    pending = st.session_state.pop("hist_title_pending", None)
+    # Entries to draw open whatever their state: Streamlit identifies an
+    # expander by its label too, so a new title makes a new, closed widget.
+    reopen: set[tuple[int, str]] = st.session_state.setdefault("hist_reopen", set())
     for record in records:
+        if record["id"] == pending:
+            with st.spinner("Writing a title…", show_time=True):
+                _retitle(pending)
+            record = db.get_transcription(pending) or record
         flag = "⏱️ " if record["with_timestamps"] else ""
         name = (
             titles.display_name(_safe_stem(record["filename"]), record["title"], mode)
             or record["filename"]
         )
         label = f"{flag}{name} · {record['model']} · {record['created_at']}"
-        entry = st.expander(label, key=f"hist_{record['id']}", on_change="rerun")
+        if record["id"] == pending:
+            reopen.add((pending, label))
+        entry = st.expander(
+            label,
+            key=f"hist_{record['id']}",
+            on_change="rerun",
+            expanded=(record["id"], label) in reopen,
+        )
         if not entry.open:
+            st.session_state.pop(f"hist_title_msg_{record['id']}", None)
             continue
         with entry:
             meta_parts = [record["source_type"]]
@@ -1776,6 +2282,8 @@ def render_history_tab() -> None:
                     key=f"hist_dl_srt_{record['id']}",
                     on_click="ignore",
                 )
+            if mode != TITLE_MODE_OFF:
+                _render_retitle(record["id"], has_title=bool(full["title"]))
             # A callback, not `if st.button(...)` + a fragment-scoped rerun: the
             # row is gone before the fragment redraws, in any kind of run.
             st.button(
@@ -1809,6 +2317,9 @@ def main() -> None:
         # forever just because nobody pressed "Clean temporary files".
         checkpoints.prune(CHECKPOINT_MAX_AGE_DAYS)
         checkpoints.prune_scratch(SCRATCH_MAX_AGE_HOURS)
+        # Uploads, extracted WAVs and player MP3s (not transcripts): each page
+        # opened clears those a day old, so they no longer pile up for weeks.
+        checkpoints.prune_working_copies(WORKING_COPY_MAX_AGE_HOURS)
         st.session_state.checkpoints_pruned = True
     _settle_job()
     _claim_job()

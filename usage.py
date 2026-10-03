@@ -153,6 +153,37 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def add_to_cost(
+    cost: dict[str, Any], part: str, records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Add later requests to a saved run's cost, e.g. a title asked for in History.
+
+    Args:
+        cost: A run's cost as saved with its history row (``usage_json``): part
+            summaries such as ``title``, the total ``cost_usd`` and ``estimated``.
+        part: The part the requests belong to.
+        records: Their usage records.
+
+    Returns:
+        A new cost with that part's summary and the total grown by the records.
+    """
+    if not records:
+        return cost
+    added = summarize(records)
+    before = cost.get(part) or {}
+    grown = {
+        key: before.get(key, 0) + added[key]
+        for key in ("requests", "seconds", "input_tokens", "output_tokens", "cost_usd")
+    }
+    grown["estimated"] = bool(before.get("estimated")) or added["estimated"]
+    return {
+        **cost,
+        part: grown,
+        "cost_usd": (cost.get("cost_usd") or 0) + added["cost_usd"],
+        "estimated": bool(cost.get("estimated")) or added["estimated"],
+    }
+
+
 def format_usd(cost: float, estimated: bool = False) -> str:
     """Render a cost readably at every scale, from fractions of a cent up.
 
