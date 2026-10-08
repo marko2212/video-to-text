@@ -48,7 +48,9 @@ User-facing changes (formats, flags, `.env` keys, commands) must also land in RE
 (`EXTRAS` in the Makefile); `make sync-local` adds it. **Plain `uv sync` uninstalls it**
 (uv sync is exact) — use `uv sync --extra local`, or `uv run --no-sync` to avoid syncing.
 
-Tests run without network or ffmpeg. CI runs `make check` on push/PR.
+Tests run without network or ffmpeg. CI runs `make check` on push/PR **with no ffmpeg** (this
+machine has it), so before a push also run, in Git Bash (a missing ffprobe broke CI 2026-10-03):
+`PATH="$(echo "$PATH" | tr ':' '\n' | grep -vi ffmpeg | paste -sd:)" .venv/Scripts/python.exe -m pytest -q`
 
 ## Commit messages
 

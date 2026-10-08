@@ -870,7 +870,7 @@ upload (identified by file_id, saved to uploads/)
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 334 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 335 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -965,6 +965,11 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ### Waiting for the owner
 **Next step: the owner opens the app** — that runs the first real cleanup — **and tries
 the live checks below**.
+- [x] **Commit and push the CI fix** — done 2026-10-09 ("komituj i pušuj"): CI had
+      failed on `9b4e622` (run 37087537499) — `frames.video_duration` raised
+      `FileNotFoundError` where no ffprobe is installed, which the new screenshot caption
+      reaches as soon as the box is ticked. Fixed in `frames.py` with a test; 335 tests
+      pass with and without ffmpeg on PATH (journal 2026-10-03, part 4).
 - [x] **Commit and push** — done 2026-10-03 ("komituj i pušuj"): the title's script
       check and the History title button, the folder source with 📂 Browse…, the ⏹ Stop
       button and the one-day cleanup, after a last review of Stop, Browse and the cleanup
@@ -972,7 +977,8 @@ the live checks below**.
       four features, so commits per feature would have left states that do not pass.
 - [x] **Commit and push the three changes of 2026-10-03 (parts 2 and 3)** — done the
       same day ("komituj i pušuj"), after a reviewer subagent's pass and its fixes
-      (journal), again one feat and one docs commit, as `app.py` carries all three.
+      (journal), again one feat and one docs commit, as `app.py` carries all three
+      (`af83254`, `9b4e622`). CI failed on them; fixed by the item above.
 - [x] **Move "Clean temporary files" to the sidebar** — done 2026-10-03 (owner: "uradi"),
       in a "🧹 Working files" section with the space the files take (§3); its caption
       cut to "**24.6 MB** in use." at the owner's request, the rest in the button's help.
@@ -1144,6 +1150,26 @@ the live checks below**.
 ---
 
 ## 6. Journal
+
+### 2026-10-03 (part 4) — CI red after the push: no ffprobe there
+
+CI failed on `9b4e622` (both test jobs): three tests raised `FileNotFoundError:
+'ffprobe'`. `frames.video_duration` caught only `ffmpeg.Error`, not the `OSError` of a
+missing program. Until today the caption without a scan was reached only when a scan
+had failed or a job ran; now it is drawn as soon as on-screen context is ticked, and
+asks for the video's length. Locally ffprobe is on PATH and returns an error for the
+test's fake video, so all tests passed here — and a machine without ffmpeg would
+have shown the same exception on the page.
+
+Fixed: `video_duration` returns 0.0 when ffprobe cannot run (as the new
+`video_frame_size` and `recordings.duration` already did), with a test that fails when
+the fix is undone. Reproduced and checked by running the suite with ffmpeg removed
+from PATH: 3 failed before, 335 passed after (and 335 with ffmpeg). Committed and pushed
+on 2026-10-09, when the owner said so (a fix commit and a docs commit).
+
+**Lesson:** CI has no ffmpeg, this machine does, so a missing-program branch is only
+exercised by CI. Before pushing, run the tests once without ffmpeg on PATH (command in
+`CLAUDE.md`).
 
 ### 2026-10-03 (part 3) — No wait for the screenshot slider
 
