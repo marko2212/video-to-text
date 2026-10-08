@@ -530,3 +530,14 @@ def test_an_unreadable_frame_size_is_zero(monkeypatch, tmp_path):
 
     monkeypatch.setattr(frames.ffmpeg, "probe", lambda path, **kwargs: {"streams": []})
     assert frames.video_frame_size(tmp_path / "call.mkv") == (0, 0)
+
+
+def test_a_missing_ffprobe_gives_no_length_instead_of_an_error(monkeypatch, tmp_path):
+    # CI has no ffmpeg: the screenshot caption asks for the length as soon as
+    # the box is ticked, and the page raised FileNotFoundError.
+    def missing(path, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory: 'ffprobe'")
+
+    monkeypatch.setattr(frames.ffmpeg, "probe", missing)
+
+    assert frames.video_duration(tmp_path / "call.mkv") == 0.0

@@ -183,6 +183,11 @@ def video_duration(video_path: Path) -> float:
     except ffmpeg.Error as exc:
         logger.debug("ffprobe failed for %s: %s", video_path, _ffmpeg_error_detail(exc))
         return 0.0
+    except OSError as exc:
+        # No ffprobe at all (CI has none). The caption that asks is drawn as
+        # soon as on-screen context is ticked, so it must not raise.
+        logger.debug("ffprobe could not run for %s: %s", video_path, exc)
+        return 0.0
     try:
         return float(metadata["format"]["duration"])
     except (KeyError, TypeError, ValueError):
