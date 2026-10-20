@@ -20,6 +20,9 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
+from datetime import time as clock_time
+from datetime import timedelta
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,7 @@ import titles
 import transcribe
 import usage
 import vision
+import waveform
 from config import (
     AUDIO_FORMATS,
     BROWSER_UNPLAYABLE_AUDIO,
@@ -66,6 +70,8 @@ from config import (
     TITLE_REPEAT_GUARD_SECONDS,
     TRANSCRIPTION_MODEL_NOTES,
     TRANSCRIPTION_MODELS,
+    TRIM_CLOCK_LIMIT_SECONDS,
+    TRIM_STEP_SECONDS,
     VIDEO_FORMATS,
     VISION_MODELS,
     WORKING_COPY_MAX_AGE_HOURS,
@@ -612,6 +618,189 @@ def prepare_audio(name: str, is_audio: bool, obtain: Callable[[], Path]) -> None
         st.error(f"Error preparing audio: {exc}")
 
 
+@st.cache_data(show_spinner="Reading the sound…")
+def _audio_loudness(path: str, size: int, mtime_ns: int) -> tuple[list[float], float]:
+    """Measure a recording's loudness per stretch, once per version of the file.
+
+    Args:
+        path: The audio the run will transcribe.
+        size: Its size, part of the cache key.
+        mtime_ns: Its modification time, likewise.
+
+    Returns:
+        :func:`waveform.loudness` of the file, or no levels and a length of 0
+        when its sound cannot be read — the page then shows no slider.
+    """
+    del size, mtime_ns  # cache key only
+    try:
+        return waveform.loudness(Path(path))
+    except AppError as exc:
+        logger.warning("No picture of the sound for %s: %s", path, exc)
+        return [], 0.0
+
+
+def _as_clock(seconds: int) -> clock_time:
+    """Return a number of seconds as a time of day, for the trim slider.
+
+    Args:
+        seconds: Whole seconds from the start of the recording (under a day).
+
+    Returns:
+        The same point as a clock time.
+    """
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return clock_time(hours, minutes, secs)
+
+
+def _as_seconds(moment: clock_time) -> int:
+    """Return a trim slider value as seconds from the start of the recording.
+
+    Args:
+        moment: A clock time from the slider.
+
+    Returns:
+        Whole seconds.
+    """
+    return moment.hour * 3600 + moment.minute * 60 + moment.second
+
+
+def _reset_trim(key: str, whole: tuple[clock_time, clock_time]) -> None:
+    """Put the trim slider back to the whole recording (a button callback).
+
+    Args:
+        key: The slider's session-state key.
+        whole: Its two ends.
+    """
+    st.session_state[key] = whole
+
+
+def _stretch_ok(span: tuple[int, int] | None, duration: float) -> bool:
+    """Return whether a run can be started with this stretch.
+
+    Args:
+        span: The chosen stretch, or ``None`` for the whole recording.
+        duration: The recording's length in seconds.
+
+    Returns:
+        False when less than a second of the recording is left: the slider's
+        ends sit together, or its last second (the length rounded up) holds
+        only a fraction of one.
+    """
+    return span is None or min(span[1], duration) - span[0] >= 1
+
+
+def _trim_caption(span: tuple[int, int] | None, duration: float) -> str:
+    """Say what the run will be sent.
+
+    Args:
+        span: The chosen stretch in seconds, or ``None`` for the whole recording.
+        duration: The recording's length in seconds.
+
+    Returns:
+        One sentence for the caption under the player.
+    """
+    total = _format_length(duration)
+    if span is None:
+        return f"The whole recording, **{total}**, is sent."
+    start, end = span
+    kept = end - start
+    return (
+        f"**{_format_length(start)} – {_format_length(end)}** is sent: "
+        f"{_format_length(kept)} of {total}; "
+        f"{_format_length(max(0.0, duration - kept))} left out — not sent, "
+        "not paid for."
+    )
+
+
+def render_audio(
+    preview: Path | None, audio_path: Path | None, disabled: bool
+) -> tuple[tuple[int, int] | None, bool]:
+    """Draw the player, the sound, and the slider that leaves part of it out.
+
+    The slider is a widget of its own per recording (its key carries the
+    recording's id), so a new recording starts with all of it chosen.
+
+    Args:
+        preview: The file the player plays, if one could be made.
+        audio_path: The audio the run will transcribe, once prepared.
+        disabled: True while a job runs.
+
+    Returns:
+        The stretch — ``(start, end)`` in seconds when part of the recording
+        is left out; ``None`` for the whole recording, and when there is no
+        slider because the sound could not be read — and whether a run may
+        start with it (:func:`_stretch_ok`).
+    """
+    levels: list[float] = []
+    duration = 0.0
+    if audio_path and audio_path.exists():
+        stat = audio_path.stat()
+        levels, duration = _audio_loudness(
+            str(audio_path), stat.st_size, stat.st_mtime_ns
+        )
+    span: tuple[int, int] | None = None
+    # The slider's last second is the length rounded up (a clock holds no
+    # fractions); a recording of a day or longer gets no slider.
+    last = ceil(duration)
+    sliding = bool(levels) and 0 < last < TRIM_CLOCK_LIMIT_SECONDS
+    if sliding:
+        whole = (_as_clock(0), _as_clock(last))
+        key = f"trim_{st.session_state.upload_id}"
+        stored = st.session_state.get(key)
+        if not stored or not (whole[0] <= stored[0] <= stored[1] <= whole[1]):
+            # A fresh recording, or one that changed on disk under the slider.
+            st.session_state[key] = whole
+        chosen = st.slider(
+            "Transcribe from – to",
+            min_value=whole[0],
+            max_value=whole[1],
+            step=timedelta(seconds=TRIM_STEP_SECONDS),
+            format="H:mm:ss",
+            key=key,
+            disabled=disabled,
+            help=(
+                "Drag the ends to leave out the start or the end of the "
+                "recording — minutes recorded by mistake, or an empty tail after "
+                "the meeting. Only the part between them is sent and paid for; "
+                "its times in the transcript stay the recording's own. The arrow "
+                "keys move an end by a second."
+            ),
+        )
+        start, end = _as_seconds(chosen[0]), _as_seconds(chosen[1])
+        if (start, end) != (0, last):
+            span = (start, end)
+        st.image(waveform.picture(levels, (start / last, end / last)), width="stretch")
+    if preview and preview.exists():
+        # st.audio labels everything audio/wav unless told otherwise; browsers
+        # sniff raw uploads fine, so only the MP3 previews this app makes get
+        # their real type (the OS registry is unreliable).
+        mime = "audio/mpeg" if preview.suffix == ".mp3" else "audio/wav"
+        st.audio(
+            str(preview),
+            format=mime,
+            start_time=span[0] if span else 0,
+            end_time=span[1] if span else None,
+        )
+    ok = _stretch_ok(span, duration)
+    if sliding:
+        if not ok:
+            st.warning(
+                "Nothing is left to transcribe — move the ends of the slider apart."
+            )
+        else:
+            # The length as the slider shows it: whole seconds, rounded up.
+            st.caption(_trim_caption(span, last))
+        if span is not None:
+            st.button(
+                "Whole recording",
+                on_click=_reset_trim,
+                args=(key, whole),
+                disabled=disabled,
+            )
+    return span, ok
+
+
 @st.cache_data(show_spinner=False)
 def _video_length(video_path: str, size_bytes: int) -> float:
     """Return a video's duration in seconds, cached across reruns.
@@ -704,16 +893,30 @@ def _scan_dir(video_path: Path) -> Path:
     return get_settings().temp_dir / f"scan-{_digest(video_path)}"
 
 
+def _video_subject(length: str, clipped: bool) -> str:
+    """Name what a screenshot caption counts over.
+
+    Args:
+        length: The counted stretch as a clock string.
+        clipped: Whether that is only part of the video.
+
+    Returns:
+        E.g. ``this 1:01:40 video`` or ``the chosen 47:12 of this video``.
+    """
+    return f"the chosen {length} of this video" if clipped else f"this {length} video"
+
+
 def _scanned_estimate(
-    scan: dict[str, Any], interval: float, model: str, detail: str
+    scan: dict[str, Any], interval: float, model: str, detail: str, clipped: bool
 ) -> str:
     """Say exactly how many screenshots a run will describe, and the cost.
 
     Args:
-        scan: The video's scan.
+        scan: The video's scan — of the chosen stretch only, when ``clipped``.
         interval: Chosen maximum seconds between screenshots.
         model: Selected vision model.
         detail: Selected image fidelity.
+        clipped: Whether only part of the video is transcribed.
 
     Returns:
         A caption with the count the run will use — the same selection.
@@ -726,25 +929,29 @@ def _scanned_estimate(
         vision.frame_tokens(scan["width"], scan["height"]) if scan["width"] else None
     )
     cost = _format_cost(vision.estimate_frame_cost(len(chosen), model, detail, tokens))
-    length = _format_length(scan["duration"])
+    subject = _video_subject(_format_length(scan["duration"]), clipped)
     if len(candidates) > len(chosen):
         return (
             f"One every {interval:.0f} s would give {len(candidates)} screenshots, "
             f"over the {cap}-screenshot limit, so **{len(chosen)}** will be "
-            f"described, spread evenly over the video ({cost}) — counted from a "
-            f"scan of this {length} video."
+            f"described, spread evenly over it ({cost}) — counted from a "
+            f"scan of {subject}."
         )
     used = frames.effective_interval(scan["duration"], interval, max_frames=0)
     return (
         f"**{len(chosen)}** screenshots will be described ({cost}) — counted from "
-        f"a scan of this {length} video: every screen change, plus a look every "
+        f"a scan of {subject}: every screen change, plus a look every "
         f"{used:.0f} s when nothing changed, with repeats of the same picture "
         "left out."
     )
 
 
 def _screenshot_estimate(
-    interval: float, model: str, detail: str, scan: dict[str, Any] | None = None
+    interval: float,
+    model: str,
+    detail: str,
+    scan: dict[str, Any] | None = None,
+    span: tuple[int, int] | None = None,
 ) -> str:
     """Describe how many screenshots the current settings will take.
 
@@ -753,13 +960,17 @@ def _screenshot_estimate(
         model: Selected vision model.
         detail: Selected image fidelity.
         scan: The video's scan; exact when given, a rough guess otherwise.
+        span: The stretch of the video to transcribe, when not all of it:
+            only its screenshots are described.
 
     Returns:
         A caption stating the count and cost, and saying so plainly when the
         frame cap overrides the chosen interval.
     """
     if scan is not None:
-        return _scanned_estimate(scan, interval, model, detail)
+        if span is not None:
+            scan = frames.clip_scan(scan, span)
+        return _scanned_estimate(scan, interval, model, detail, span is not None)
     video_path: Path | None = st.session_state.get("video_path")
     cap = frames.max_frames_setting()
 
@@ -771,6 +982,8 @@ def _screenshot_estimate(
     if ready:
         size_bytes = video_path.stat().st_size
         duration = _video_length(str(video_path), size_bytes)
+        if span is not None and duration > 0:
+            duration = max(0.0, min(duration, span[1]) - span[0])
         width, height = _video_frame_size(str(video_path), size_bytes)
         if width and height:
             tokens = vision.frame_tokens(width, height)
@@ -789,7 +1002,7 @@ def _screenshot_estimate(
             "your video appears once it has been prepared."
         )
 
-    length = _format_length(duration)
+    subject = _video_subject(_format_length(duration), span is not None)
     fewer = (
         "Usually far fewer: a picture that repeats the one before is not "
         "described again. The exact number shows during the run."
@@ -802,12 +1015,12 @@ def _screenshot_estimate(
         # Spell out the substitution rather than quietly applying it.
         return (
             f"At most **{cap}** screenshots ({most(cap)}), the limit per video: one "
-            f"every {interval:.0f} s would give {looks} for this {length} video, "
+            f"every {interval:.0f} s would give {looks} for {subject}, "
             f"so they are spread evenly over it. {fewer}"
         )
     text = (
         f"At most **{looks}** screenshots ({most(looks)}) — one every {used:.0f} s of "
-        f"this {length} video, if each look shows a new picture."
+        f"{subject}, if each look shows a new picture."
     )
     # A screen that changes faster is caught too, one picture per burst window.
     busiest = min(cap, int(duration // FRAME_MIN_INTERVAL_SECONDS) + 1)
@@ -820,13 +1033,14 @@ def _screenshot_estimate(
 
 
 def render_visual_options(
-    source_type: str, disabled: bool = False
+    source_type: str, disabled: bool = False, span: tuple[int, int] | None = None
 ) -> dict[str, Any] | None:
     """Offer on-screen context for video uploads.
 
     Args:
         source_type: Either ``"audio"`` or ``"video"``.
         disabled: True while a job runs.
+        span: The stretch of the video to transcribe, when not all of it.
 
     Returns:
         The chosen settings (``model``, ``detail``, ``interval``), or ``None``
@@ -899,7 +1113,7 @@ def render_visual_options(
         ),
     )
 
-    st.caption(_screenshot_estimate(float(interval), vision_model, detail, scan))
+    st.caption(_screenshot_estimate(float(interval), vision_model, detail, scan, span))
     return {"model": vision_model, "detail": detail, "interval": float(interval)}
 
 
@@ -910,6 +1124,7 @@ def collect_visual_notes(
     stop_on_account_error: bool,
     spent: list[dict[str, Any]] | None = None,
     used: list[str] | None = None,
+    span: tuple[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Extract key frames from the uploaded video and describe what they show.
 
@@ -927,6 +1142,9 @@ def collect_visual_notes(
         spent: Usage records of the descriptions are appended here.
         used: The cache names of the selected frames are appended here, so
             the caller can mark exactly those as counted.
+        span: The stretch of the video to transcribe, when not all of it: the
+            whole video is scanned (the scan is kept for any stretch), and only
+            the screenshots within the stretch are described.
 
     Returns:
         Notes with ``time`` and ``description`` (possibly empty), and whether
@@ -953,6 +1171,8 @@ def collect_visual_notes(
             # The same scan and selection the caption counted, so the number
             # described is the number that was shown.
             scan = frames.scan_video(video_path, _scan_dir(video_path))
+            if span is not None:
+                scan = frames.clip_scan(scan, span)
             keyframes = frames.select_from_scan(scan, visual["interval"])
             if used is not None:
                 used.extend(vision.frame_name(frame["time"]) for frame in keyframes)
@@ -1027,6 +1247,7 @@ def _run_pipeline(
     paths: tuple[Path, Path | None],
     progress: ProgressCallback,
     visual_notes: list[dict[str, Any]] | None,
+    span: tuple[int, int] | None = None,
 ) -> tuple[bool, dict[str, Any] | None]:
     """Run the chosen engine.
 
@@ -1037,6 +1258,7 @@ def _run_pipeline(
         paths: Transcript path, and the SRT path or ``None``.
         progress: Progress callback for the pipeline.
         visual_notes: On-screen notes to place into the transcript.
+        span: The stretch of the recording to transcribe, when not all of it.
 
     Returns:
         Whether the pipeline ran (False when no API key was available), and
@@ -1066,6 +1288,7 @@ def _run_pipeline(
                 srt_output_file=srt_path,
                 progress_callback=progress,
                 visual_notes=visual_notes,
+                span=span,
             )
         return True, None
 
@@ -1082,8 +1305,22 @@ def _run_pipeline(
             srt_output_file=srt_path,
             progress_callback=progress,
             visual_notes=visual_notes,
+            span=span,
         )
     return True, spent
+
+
+def _with_span(cost: dict[str, Any], span: tuple[int, int] | None) -> dict[str, Any]:
+    """Record on a run's cost which stretch of the recording it transcribed.
+
+    Args:
+        cost: The run's cost from :func:`_run_cost`.
+        span: The stretch, or ``None`` for the whole recording.
+
+    Returns:
+        The cost, with ``span`` added when part of the recording was left out.
+    """
+    return {**cost, "span": list(span)} if span is not None else cost
 
 
 def _run_cost(
@@ -1195,6 +1432,7 @@ def run_transcription(
     with_timestamps: bool,
     source_type: str,
     visual: dict[str, Any] | None = None,
+    span: tuple[int, int] | None = None,
 ) -> None:
     """Run the selected provider's pipeline and store result paths.
 
@@ -1207,6 +1445,8 @@ def run_transcription(
         with_timestamps: Whether to generate timestamps/subtitles.
         source_type: Either ``"audio"`` or ``"video"``.
         visual: On-screen context settings, or None to skip that step.
+        span: ``(start, end)`` in seconds when only that stretch of the
+            recording is transcribed and described.
     """
     settings = get_settings()
     base_name = _safe_stem(st.session_state.original_filename)
@@ -1248,6 +1488,7 @@ def run_transcription(
                 stop_on_account_error=provider == PROVIDER_OPENAI,
                 spent=vision_spent,
                 used=used_frames,
+                span=span,
             )
 
         ran, transcription_spent = _run_pipeline(
@@ -1257,6 +1498,7 @@ def run_transcription(
             (transcript_path, srt_path if with_timestamps else None),
             progress,
             visual_notes,
+            span,
         )
         if not ran:
             notices.append(
@@ -1288,8 +1530,14 @@ def run_transcription(
                     vision_spent += vision.unbilled_usage(
                         cache, visual["model"], used_frames
                     )
-            st.session_state.run_cost = _run_cost(
-                provider, transcription_spent, vision_spent, title_records=title_spent
+            st.session_state.run_cost = _with_span(
+                _run_cost(
+                    provider,
+                    transcription_spent,
+                    vision_spent,
+                    title_records=title_spent,
+                ),
+                span,
             )
             row_id = save_to_history(source_type, provider, model, with_timestamps)
             # Only now: a run stopped after its last chunk has already written
@@ -1299,7 +1547,9 @@ def run_transcription(
             # Stop between the row and the discard would let Start save the
             # same transcript as a second row.
             if audio_digest:
-                checkpoints.discard(transcribe.checkpoint_dir(audio_digest, model))
+                checkpoints.discard(
+                    transcribe.checkpoint_dir(audio_digest, model, span)
+                )
             if cache is not None:
                 if visual_complete:
                     checkpoints.discard(cache)
@@ -1313,7 +1563,7 @@ def run_transcription(
         st.session_state.srt_path = None
         st.session_state.partial = f"{exc.completed} of {exc.total}"
         st.session_state.run_cost = {
-            **_run_cost(provider, exc.spent, vision_spent),
+            **_with_span(_run_cost(provider, exc.spent, vision_spent), span),
             "partial": True,
         }
         hint = (
@@ -1327,7 +1577,7 @@ def run_transcription(
                 f"Stopped after part {exc.completed} of {exc.total}: {exc}{hint}",
             )
         )
-        notices.append(("info", _saved_parts_hint(model, exc.total)))
+        notices.append(("info", _saved_parts_hint(model, exc.total, span)))
     except OpenAIAccountError as exc:
         hint = " The Local engine needs no key or credit." if LOCAL_AVAILABLE else ""
         notices.append(("error", f"{exc}{hint}"))
@@ -1358,7 +1608,9 @@ def _request_job() -> None:
     st.session_state.run_notices = None
 
 
-def _saved_parts_hint(model: str, total: int | None = None) -> str:
+def _saved_parts_hint(
+    model: str, total: int | None = None, span: tuple[int, int] | None = None
+) -> str:
     """Say how much of an unfinished run is really saved.
 
     Counted on disk rather than promised: the saved parts can be gone (another
@@ -1367,6 +1619,7 @@ def _saved_parts_hint(model: str, total: int | None = None) -> str:
     Args:
         model: The transcription model of the run.
         total: Parts in the recording, when known.
+        span: The stretch of the recording the run was for, if not all of it.
 
     Returns:
         One sentence for the notice.
@@ -1374,7 +1627,7 @@ def _saved_parts_hint(model: str, total: int | None = None) -> str:
     audio_path: Path | None = st.session_state.audio_path
     saved = 0
     if audio_path and audio_path.exists():
-        saved = transcribe.saved_chunk_count(_digest(audio_path), model)
+        saved = transcribe.saved_chunk_count(_digest(audio_path), model, span)
     if not saved:
         return "No finished parts are saved — Start transcribes it from the beginning."
     of_total = f" of {total}" if total else ""
@@ -1395,7 +1648,7 @@ def _stopped_notice(job: dict[str, Any]) -> list[tuple[str, str]]:
     """
     params = job["params"]
     if params and params["provider"] == PROVIDER_OPENAI:
-        hint = _saved_parts_hint(params["model"])
+        hint = _saved_parts_hint(params["model"], span=params.get("span"))
     else:
         hint = "Press Start to run it again."
     return [("warning", f"The last run was stopped before it finished. {hint}")]
@@ -1558,6 +1811,12 @@ def _describe_cost(cost: dict[str, Any]) -> str:
     if title:
         parts.append(
             f"title {title['input_tokens']:,} → {title['output_tokens']:,} tokens"
+        )
+    span = cost.get("span")
+    if span:
+        parts.append(
+            f"{_format_length(span[0])}–{_format_length(span[1])} of the recording "
+            "transcribed, the rest left out"
         )
     total = usage.format_usd(cost["cost_usd"], cost.get("estimated", False))
     text = f"💵 {total} — " + "; ".join(parts) if parts else f"💵 {total}"
@@ -1734,21 +1993,34 @@ def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
     return provider, model, with_timestamps
 
 
-def render_resume_hint(provider: str, model: str) -> None:
+def render_resume_hint(
+    provider: str, model: str, span: tuple[int, int] | None = None
+) -> None:
     """Say so when an unfinished run of this recording can be continued.
 
     Args:
         provider: Selected engine.
         model: Selected model.
+        span: The stretch of the recording chosen now, if not all of it: only
+            an unfinished run of the same stretch can be continued.
     """
     audio_path: Path | None = st.session_state.audio_path
     if provider != PROVIDER_OPENAI or not audio_path or not audio_path.exists():
         return
-    saved = transcribe.saved_chunk_count(_digest(audio_path), model)
+    digest = _digest(audio_path)
+    saved = transcribe.saved_chunk_count(digest, model, span)
     if saved:
+        what = "this stretch of the recording" if span else "this recording"
         st.caption(
-            f"↻ {saved} part(s) of an unfinished run of this recording are saved — "
+            f"↻ {saved} part(s) of an unfinished run of {what} are saved — "
             "Start sends only the rest."
+        )
+    elif span and transcribe.saved_parts_within(digest, model, span):
+        # Saved for the whole recording or another stretch: reused only where
+        # the part boundaries come out the same, which a run alone can tell.
+        st.caption(
+            "↻ An unfinished run of this recording left saved parts — Start "
+            "reuses those whose boundaries match this stretch and sends the rest."
         )
 
 
@@ -2107,14 +2379,10 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
             st.subheader("1️⃣ Audio")
             prepare_audio(name, is_audio, obtain)
 
-            preview: Path | None = st.session_state.preview_path
-            if preview and preview.exists():
-                # st.audio labels everything audio/wav unless told otherwise;
-                # browsers sniff raw uploads fine, so only the MP3 previews this
-                # app makes get their real type (the OS registry is unreliable).
-                mime = "audio/mpeg" if preview.suffix == ".mp3" else "audio/wav"
-                st.audio(str(preview), format=mime)
             audio_path: Path | None = st.session_state.audio_path
+            span, stretch_ok = render_audio(
+                st.session_state.preview_path, audio_path, disabled=running
+            )
             if not is_audio and audio_path and audio_path.exists():
                 st.download_button(
                     label="📥 Download extracted audio (WAV)",
@@ -2128,20 +2396,21 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
             if st.session_state.audio_path:
                 st.subheader("2️⃣ Transcription")
                 provider, model, with_timestamps = render_engine_options(running)
-                visual = render_visual_options(source_type, disabled=running)
-                render_resume_hint(provider, model)
+                visual = render_visual_options(source_type, disabled=running, span=span)
+                render_resume_hint(provider, model, span)
                 params = {
                     "provider": provider,
                     "model": model,
                     "with_timestamps": with_timestamps,
                     "source_type": source_type,
                     "visual": visual,
+                    "span": span,
                 }
 
                 st.button(
                     "Start Transcription",
                     type="primary",
-                    disabled=running,
+                    disabled=running or not stretch_ok,
                     on_click=_request_job,
                 )
                 if _owns_job():

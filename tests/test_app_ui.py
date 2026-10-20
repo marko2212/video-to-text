@@ -62,15 +62,23 @@ _GUESS_SCRIPT = """
 import streamlit as st
 import app
 
-st.caption(app._screenshot_estimate(st.session_state.interval, "gpt-5.4-nano", "low"))
+st.caption(
+    app._screenshot_estimate(
+        st.session_state.interval,
+        "gpt-5.4-nano",
+        "low",
+        span=st.session_state.get("span"),
+    )
+)
 """
 
 
-def _guess(video, interval: float) -> str:
+def _guess(video, interval: float, span=None) -> str:
     """The caption before a run: a ceiling, since nothing is scanned before Start."""
     test = AppTest.from_string(_GUESS_SCRIPT)
     test.session_state["video_path"] = video
     test.session_state["interval"] = interval
+    test.session_state["span"] = span
     return test.run().caption[0].value
 
 
@@ -304,7 +312,9 @@ import streamlit as st
 import app
 
 st.session_state.result = app.render_visual_options(
-    "video", disabled=st.session_state.get("disabled", False)
+    "video",
+    disabled=st.session_state.get("disabled", False),
+    span=st.session_state.get("span"),
 )
 """
 
@@ -356,6 +366,49 @@ def test_while_a_job_runs_a_stored_scan_gives_the_exact_count(monkeypatch, tmp_p
     test.run()
 
     assert "**2** screenshots will be described" in test.caption[0].value
+
+
+def test_the_ceiling_counts_only_the_chosen_stretch_of_the_video(monkeypatch, tmp_path):
+    import app
+
+    video = tmp_path / "meeting.mkv"
+    video.write_bytes(b"not really a video")
+    monkeypatch.setattr(app, "_video_length", lambda path, size: 600.0)
+
+    caption = _guess(video, 30.0, span=(100, 400))
+
+    # Five minutes of the ten: one look at the start and nine more.
+    assert "At most **11** screenshots" in caption
+    assert "one every 30 s of the chosen 5:00 of this video" in caption
+
+
+def test_a_stored_scan_counts_only_the_chosen_stretch(monkeypatch, tmp_path):
+    import frames
+
+    video = tmp_path / "meeting.mkv"
+    video.write_bytes(b"not decoded: the scan is faked")
+    frame = {"path": video, "scene": False}
+    stored = {
+        "duration": 60.0,
+        "width": 1920,
+        "height": 1080,
+        "frames": [
+            {**frame, "time": float(t), "hash": (t + 1) * 7919} for t in range(0, 60, 5)
+        ],
+    }
+    monkeypatch.setattr(frames, "load_scan", lambda scan_dir: stored)
+    test = AppTest.from_string(_JOB_SCRIPT)
+    test.session_state["video_path"] = video
+    test.session_state["span"] = (20, 40)
+    test.session_state["disabled"] = True
+    test.run()
+    test.checkbox[0].set_value(True).run()
+    test.slider[0].set_value(5).run()
+
+    # The frames at 20, 25, 30, 35 and 40 s, counted over the chosen 20 s.
+    caption = test.caption[0].value
+    assert "**5** screenshots will be described" in caption
+    assert "a scan of the chosen 0:20 of this video" in caption
 
 
 def test_a_stopped_local_run_does_not_point_to_an_openai_rerun():

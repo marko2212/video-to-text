@@ -130,6 +130,18 @@ PREVIEW_BITRATE: str = "32k"
 # Playable uploads bigger than this get the preview too: the player re-reads its
 # file on every click, which cost ~0.5 s per click with a 150 MB WAV.
 PREVIEW_ABOVE_MB: float = 25.0
+# A picture of the sound between the trim slider and the player: the loudness
+# of this many equal stretches of the recording, one bar each, so an empty
+# stretch — a recording left running for hours after the meeting ended — can be
+# seen and left out of the run with the slider.
+WAVEFORM_BUCKETS: int = 1200
+# Size of that picture in pixels (drawn again at each move of the slider).
+WAVEFORM_WIDTH: int = 1200
+WAVEFORM_HEIGHT: int = 100
+# The stretch to transcribe is chosen in whole seconds. The slider shows times
+# on a clock, so a recording of a day or longer gets no slider.
+TRIM_STEP_SECONDS: int = 1
+TRIM_CLOCK_LIMIT_SECONDS: int = 24 * 3600
 
 # On-screen context: key frames pulled from a video and described by a vision
 # model, so slides and shared screens end up in the transcript alongside speech.

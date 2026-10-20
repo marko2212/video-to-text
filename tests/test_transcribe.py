@@ -143,3 +143,9 @@ def test_split_into_paragraphs_groups_sentences():
     text = "One. Two. Three. Four. Five. Six."
     out = transcribe.split_into_paragraphs(text, sentences_per_paragraph=2)
     assert out == "One. Two.\n\nThree. Four.\n\nFive. Six."
+
+
+def test_format_span_note_says_which_part_was_transcribed():
+    assert transcribe.format_span_note(600, 3607) == (
+        "⏭️ Transcribed 10:00–1:00:07 of the recording; the rest was left out."
+    )

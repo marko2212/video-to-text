@@ -707,6 +707,27 @@ def candidates_from_scan(
     return drop_near_duplicates(chosen)
 
 
+def clip_scan(scan: dict[str, Any], span: tuple[float, float]) -> dict[str, Any]:
+    """Keep the part of a scan between two times, so a run describes just that.
+
+    Args:
+        scan: Result of :func:`scan_video`.
+        span: Where the stretch to transcribe starts and ends, in seconds.
+
+    Returns:
+        A copy of the scan whose ``frames`` lie within the stretch and whose
+        ``duration`` is the stretch's length (never more than the video has).
+    """
+    start, end = span
+    if scan["duration"]:
+        end = min(end, scan["duration"])
+    return {
+        **scan,
+        "duration": max(0.0, end - start),
+        "frames": [frame for frame in scan["frames"] if start <= frame["time"] <= end],
+    }
+
+
 def select_from_scan(
     scan: dict[str, Any],
     max_interval: float,

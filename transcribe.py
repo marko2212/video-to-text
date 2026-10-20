@@ -9,6 +9,7 @@ failed or interrupted run resumes instead of paying again. This module is
 UI-agnostic: progress is reported through an optional callback.
 """
 
+import os
 import re
 import shutil
 import tempfile
@@ -64,6 +65,11 @@ _VISUAL_NOTE_MARKER = "🖥️"
 # Prefix of the lines that mark missing speech: where a partial transcript
 # stops, or where an answer still ended at the output cap.
 _MISSING_MARKER = "⚠️"
+# Prefix of the line that says only part of the recording was transcribed, on
+# purpose (the start or the end was left out with the slider).
+_SPAN_MARKER = "⏭️"
+# A stretch shorter than this is nothing to transcribe.
+_MIN_SPAN_MS = 1000
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -144,6 +150,22 @@ def format_missing_marker(start: float, end: float, reason: str) -> str:
         f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) "
         f"Not transcribed: {reason} Press Start again to finish — the parts "
         "above are saved and will not be sent again."
+    )
+
+
+def format_span_note(start: float, end: float) -> str:
+    """Render the line that says which part of the recording was transcribed.
+
+    Args:
+        start: Where the transcribed stretch begins (seconds).
+        end: Where it ends (seconds).
+
+    Returns:
+        One line for the top of the transcript.
+    """
+    return (
+        f"{_SPAN_MARKER} Transcribed {_format_clock(start)}–{_format_clock(end)} "
+        "of the recording; the rest was left out."
     )
 
 
@@ -309,49 +331,156 @@ def segment_minutes(model: str) -> int:
     return SEGMENT_MINUTES_BY_MODEL.get(model, DEFAULT_SEGMENT_MINUTES)
 
 
-def checkpoint_dir(audio_digest: str, model: str) -> Path:
+def checkpoint_dir(
+    audio_digest: str, model: str, span: tuple[float, float] | None = None
+) -> Path:
     """Return where finished chunks of one recording and model are kept.
 
     Args:
         audio_digest: :func:`checkpoints.file_digest` of the audio file.
         model: Transcription model name.
+        span: Where the transcribed stretch starts and ends (seconds), when
+            only part of the recording is transcribed.
 
     Returns:
         The checkpoint directory (created on first save).
     """
     minutes = segment_minutes(model)
-    return checkpoints.run_dir(
-        audio_digest, "transcribe", model, f"{minutes}min", _CHECKPOINT_VERSION
+    parts: list[object] = [
+        audio_digest,
+        "transcribe",
+        model,
+        f"{minutes}min",
+        _CHECKPOINT_VERSION,
+    ]
+    if span is not None:
+        # A folder per stretch: chunks are named by index, so a stretch's run
+        # would otherwise overwrite — and, when it finished, discard — the
+        # whole recording's saved parts. Parts whose boundaries match are still
+        # reused across folders (see _saved_elsewhere).
+        start, end = span
+        parts.append(f"{start:g}-{end:g}s")
+    return checkpoints.run_dir(*parts)
+
+
+def _saved_elsewhere(
+    base: Path, own: Path
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    """Collect the chunks saved for other stretches of the same recording.
+
+    A stretch that starts where the whole recording does plans the same
+    leading chunks, so a run stopped by an empty credit and started again
+    with the tail left out must not pay for them twice.
+
+    Args:
+        base: The whole recording's checkpoint directory for this model.
+        own: The directory of the run being planned (skipped).
+
+    Returns:
+        The pieces of every finished chunk, by its ``(start_ms, end_ms)``.
+    """
+    found: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    if not base.parent.is_dir():
+        return found
+    for folder in sorted(base.parent.glob(f"{base.name}*")):
+        if folder == own or not folder.is_dir():
+            continue
+        for path in folder.glob("chunk_*.json"):
+            saved = checkpoints.load(folder, path.stem) or {}
+            bounds, pieces = saved.get("bounds"), saved.get("pieces")
+            if bounds and pieces is not None:
+                found.setdefault((bounds[0], bounds[1]), pieces)
+    return found
+
+
+def saved_parts_within(audio_digest: str, model: str, span: tuple[float, float]) -> int:
+    """Count parts saved for other stretches that lie within this one.
+
+    They are reused only if the plan's boundaries match them exactly, which
+    this cannot know without the audio — so the hint it serves promises no
+    more than "those that fit".
+
+    Args:
+        audio_digest: :func:`checkpoints.file_digest` of the audio file.
+        model: Transcription model name.
+        span: The stretch chosen now, in seconds.
+
+    Returns:
+        How many saved chunks lie within the stretch.
+    """
+    base = checkpoint_dir(audio_digest, model)
+    start_ms, end_ms = round(span[0] * 1000), round(span[1] * 1000)
+    return sum(
+        1
+        for start, end in _saved_elsewhere(
+            base, checkpoint_dir(audio_digest, model, span)
+        )
+        if start_ms <= start and end <= end_ms
     )
 
 
-def saved_chunk_count(audio_digest: str, model: str) -> int:
+def saved_chunk_count(
+    audio_digest: str, model: str, span: tuple[float, float] | None = None
+) -> int:
     """Return how many chunks of an unfinished run are already on disk.
 
     Args:
         audio_digest: :func:`checkpoints.file_digest` of the audio file.
         model: Transcription model name.
+        span: The stretch of the recording the run is for, if not all of it.
 
     Returns:
         The number of checkpointed chunks (0 when nothing is saved).
     """
-    return checkpoints.count(checkpoint_dir(audio_digest, model), "chunk_")
+    return checkpoints.count(checkpoint_dir(audio_digest, model, span), "chunk_")
 
 
-def _quietest_cut(audio: AudioSegment, target_ms: int, search_ms: int) -> int:
+def _span_ms(span: tuple[float, float] | None, total_ms: int) -> tuple[int, int] | None:
+    """Place the chosen stretch on the recording, in milliseconds.
+
+    Args:
+        span: Where the stretch starts and ends, in seconds, or ``None`` for
+            the whole recording.
+        total_ms: The recording's length.
+
+    Returns:
+        ``(start_ms, end_ms)`` within the recording, or ``None``.
+
+    Raises:
+        TranscriptionError: If less than a second of the recording is left.
+    """
+    if span is None:
+        return None
+    start = min(max(0, round(span[0] * 1000)), total_ms)
+    end = min(max(start, round(span[1] * 1000)), total_ms)
+    if end - start < _MIN_SPAN_MS:
+        raise TranscriptionError(
+            f"Nothing to transcribe between {_format_clock(span[0])} and "
+            f"{_format_clock(span[1])} — move the ends of the slider apart."
+        )
+    return start, end
+
+
+def _quietest_cut(
+    audio: AudioSegment, target_ms: int, search_ms: int, limit_ms: int | None = None
+) -> int:
     """Return the quietest moment near ``target_ms`` — a pause to cut at.
 
     Args:
         audio: The whole recording.
         target_ms: Nominal cut position in milliseconds.
         search_ms: How far either side of it to look.
+        limit_ms: Where the stretch being cut ends; the recording's end by
+            default.
 
     Returns:
         The centre of the quietest window, preferring the one nearest the
         target on a tie (e.g. digital silence), or ``target_ms`` itself.
     """
+    if limit_ms is None:
+        limit_ms = len(audio)
     low = max(0, target_ms - search_ms)
-    high = min(len(audio) - _CUT_WINDOW_MS, target_ms + search_ms)
+    high = min(limit_ms - _CUT_WINDOW_MS, target_ms + search_ms)
     if high <= low:
         return target_ms
 
@@ -363,23 +492,27 @@ def _quietest_cut(audio: AudioSegment, target_ms: int, search_ms: int) -> int:
     return best + _CUT_WINDOW_MS // 2
 
 
-def _chunk_bounds(audio: AudioSegment, chunk_ms: int) -> list[tuple[int, int]]:
+def _chunk_bounds(
+    audio: AudioSegment, chunk_ms: int, span_ms: tuple[int, int] | None = None
+) -> list[tuple[int, int]]:
     """Plan chunk boundaries: about ``chunk_ms`` long, cut in pauses.
 
     Args:
         audio: The whole recording.
         chunk_ms: Nominal chunk length in milliseconds.
+        span_ms: The stretch to cover, from :func:`_span_ms`; the whole
+            recording when ``None``.
 
     Returns:
-        ``(start_ms, end_ms)`` pairs covering the recording without gaps. A
+        ``(start_ms, end_ms)`` pairs covering the stretch without gaps. A
         final chunk shorter than ``MIN_TAIL_SECONDS`` is merged into the one
         before it.
     """
-    total = len(audio)
+    start, total = span_ms if span_ms is not None else (0, len(audio))
     search_ms = int(CUT_SEARCH_SECONDS * 1000)
-    cuts = [0]
+    cuts = [start]
     while cuts[-1] + chunk_ms < total:
-        cuts.append(_quietest_cut(audio, cuts[-1] + chunk_ms, search_ms))
+        cuts.append(_quietest_cut(audio, cuts[-1] + chunk_ms, search_ms, total))
     cuts.append(total)
     if len(cuts) > 2 and cuts[-1] - cuts[-2] < MIN_TAIL_SECONDS * 1000:
         del cuts[-2]
@@ -643,6 +776,7 @@ def _write_outputs(
     srt_output_file: str | Path | None,
     visual_notes: list[dict[str, Any]] | None = None,
     missing: tuple[float, float, str] | None = None,
+    span: tuple[float, float] | None = None,
 ) -> None:
     """Write the rendered transcript and, when requested, the SRT file.
 
@@ -657,6 +791,8 @@ def _write_outputs(
         srt_output_file: Destination ``.srt`` path, or None to skip subtitles.
         visual_notes: Optional on-screen notes with ``time`` and ``description``.
         missing: ``(start, end, reason)`` of an untranscribed tail, if any.
+        span: ``(start, end)`` of the stretch transcribed on purpose, if not
+            the whole recording; the transcript says so in its first line.
     """
     if timed_entries:
         notes = visual_notes or []
@@ -676,6 +812,8 @@ def _write_outputs(
             document = build_transcript(timed_entries, visual_notes=notes)
     else:
         document = build_untimed_transcript(pieces, visual_notes, missing)
+    if span is not None:
+        document = f"{format_span_note(*span)}\n\n{document}"
 
     srt = build_srt(timed_entries) if srt_output_file and timed_entries else None
     if get_settings().serbian_latin and serbian.is_serbian_cyrillic(document):
@@ -695,6 +833,7 @@ def _transcribe_all(
     want_segments: bool,
     work: tuple[Path, Path],
     progress_callback: ProgressCallback | None,
+    borrowed: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], tuple[int, AppError] | None]:
     """Transcribe every chunk in order, reusing and saving checkpoints.
 
@@ -706,6 +845,9 @@ def _transcribe_all(
         want_segments: Whether the model returns per-segment timestamps.
         work: Scratch directory for chunk MP3s, and the checkpoint directory.
         progress_callback: Optional progress callback.
+        borrowed: Chunks saved for other stretches of the recording, by
+            bounds (:func:`_saved_elsewhere`); one with the same bounds is
+            taken instead of a request.
 
     Returns:
         The pieces transcribed so far, and ``(chunk index, error)`` if a chunk
@@ -720,6 +862,14 @@ def _transcribe_all(
         saved = checkpoints.load(checkpoint, name)
         if saved and saved.get("bounds") == [start_ms, end_ms]:
             pieces += saved["pieces"]
+            continue
+        lent = (borrowed or {}).get((start_ms, end_ms))
+        if lent is not None:
+            # Saved as this run's own, so its count and clean-up stay simple.
+            checkpoints.save(
+                checkpoint, name, {"bounds": [start_ms, end_ms], "pieces": lent}
+            )
+            pieces += lent
             continue
         _report(
             progress_callback,
@@ -798,12 +948,17 @@ def _unfinished_chunk_usage(
     return records
 
 
-def _reusable_chunks(checkpoint: Path, bounds: list[tuple[int, int]]) -> int:
+def _reusable_chunks(
+    checkpoint: Path,
+    bounds: list[tuple[int, int]],
+    borrowed: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
+) -> int:
     """Count saved chunks that match the planned boundaries and will be reused.
 
     Args:
         checkpoint: The checkpoint directory.
         bounds: ``(start_ms, end_ms)`` of each chunk.
+        borrowed: Chunks saved for other stretches, by bounds.
 
     Returns:
         How many chunks need no request.
@@ -811,8 +966,11 @@ def _reusable_chunks(checkpoint: Path, bounds: list[tuple[int, int]]) -> int:
     return sum(
         1
         for index, (start_ms, end_ms) in enumerate(bounds)
-        if (saved := checkpoints.load(checkpoint, f"chunk_{index:03d}"))
-        and saved.get("bounds") == [start_ms, end_ms]
+        if (
+            (saved := checkpoints.load(checkpoint, f"chunk_{index:03d}"))
+            and saved.get("bounds") == [start_ms, end_ms]
+        )
+        or (start_ms, end_ms) in (borrowed or {})
     )
 
 
@@ -825,6 +983,7 @@ def transcribe_openai(
     srt_output_file: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
     visual_notes: list[dict[str, Any]] | None = None,
+    span: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Transcribe an audio/video file with the OpenAI API, chunk by chunk.
 
@@ -837,6 +996,8 @@ def transcribe_openai(
         srt_output_file: Destination ``.srt`` path; written only with timestamps.
         progress_callback: Optional callback receiving status payloads.
         visual_notes: Optional on-screen notes to place into the transcript.
+        span: ``(start, end)`` in seconds to transcribe only that stretch of
+            the recording; its times in the transcript stay the recording's.
 
     Returns:
         What the requests used and cost (:func:`usage.summarize`), counting
@@ -867,16 +1028,30 @@ def transcribe_openai(
     temp_folder = Path(tempfile.mkdtemp(prefix="segments-", dir=temp_dir))
     client: OpenAI | None = None
     try:
-        checkpoint = checkpoint_dir(checkpoints.file_digest(input_file), model)
+        digest = checkpoints.file_digest(input_file)
+        checkpoint = checkpoint_dir(digest, model, span)
+        borrowed = _saved_elsewhere(checkpoint_dir(digest, model), checkpoint)
         audio = _load_audio(input_file, temp_folder)
-        bounds = _chunk_bounds(audio, segment_minutes(model) * 60_000)
-        restored = _reusable_chunks(checkpoint, bounds)
+        bounds = _chunk_bounds(
+            audio, segment_minutes(model) * 60_000, _span_ms(span, len(audio))
+        )
+        # The stretch being transcribed: the whole recording, or the chosen
+        # part of it, placed on the recording's own timeline.
+        first, last = bounds[0][0] / 1000, bounds[-1][1] / 1000
+        covered = (first, last) if span is not None else None
+        restored = _reusable_chunks(checkpoint, bounds, borrowed)
         resume = f" — {restored} already done, resuming" if restored else ""
+        stretch = ""
+        if covered:
+            stretch = (
+                f" ({_format_clock(first)}–{_format_clock(last)} of the "
+                f"{_format_clock(len(audio) / 1000)} recording)"
+            )
         _report(
             progress_callback,
             status="info",
             message=(
-                f"{_format_clock(len(audio) / 1000)} of audio in "
+                f"{_format_clock(last - first)} of audio{stretch} in "
                 f"{len(bounds)} part(s){resume}"
             ),
         )
@@ -890,6 +1065,7 @@ def transcribe_openai(
             want_segments,
             (temp_folder, checkpoint),
             progress_callback,
+            borrowed,
         )
         timed_entries = [
             segment for piece in pieces for segment in piece.get("segments", [])
@@ -911,7 +1087,7 @@ def transcribe_openai(
                 ),
                 # The length the partial transcript covers, not the audio sent
                 # (a split chunk is sent more than once).
-                "audio_seconds": round(bounds[index][0] / 1000, 3),
+                "audio_seconds": round(bounds[index][0] / 1000 - first, 3),
             }
             # Keep what was paid for: the finished chunks stay checkpointed, and
             # a partial transcript says plainly where it stops and why.
@@ -921,7 +1097,8 @@ def transcribe_openai(
                 timed_entries,
                 None,
                 visual_notes=visual_notes,
-                missing=(bounds[index][0] / 1000, len(audio) / 1000, str(cause)),
+                missing=(bounds[index][0] / 1000, last, str(cause)),
+                span=covered,
             )
             raise IncompleteTranscriptionError(
                 str(cause), completed=index, total=len(bounds), spent=spent
@@ -933,6 +1110,7 @@ def transcribe_openai(
             timed_entries,
             srt_output_file if with_timestamps else None,
             visual_notes=visual_notes,
+            span=covered,
         )
         # The checkpoints stay until the caller has stored the result (see
         # discard_checkpoints): a run stopped right after this point must be
@@ -948,10 +1126,10 @@ def transcribe_openai(
         )
         logger.info("Transcription saved to %s", output_file)
         # `seconds` in the summary is audio *sent*, which a split chunk exceeds;
-        # the recording's own length is reported alongside it.
+        # the length transcribed is reported alongside it.
         return {
             **usage.summarize(_usage_records(pieces, model)),
-            "audio_seconds": round(len(audio) / 1000, 3),
+            "audio_seconds": round(last - first, 3),
         }
 
     except AppError as exc:
@@ -976,6 +1154,7 @@ def transcribe_local(
     srt_output_file: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
     visual_notes: list[dict[str, Any]] | None = None,
+    span: tuple[float, float] | None = None,
 ) -> None:
     """Transcribe an audio/video file with a local faster-whisper model.
 
@@ -991,6 +1170,8 @@ def transcribe_local(
         srt_output_file: Destination ``.srt`` path; written only with timestamps.
         progress_callback: Optional callback receiving status payloads.
         visual_notes: Optional on-screen notes to interleave into the transcript.
+        span: ``(start, end)`` in seconds to transcribe only that stretch of
+            the recording; its times in the transcript stay the recording's.
 
     Raises:
         TranscriptionError: If transcription fails.
@@ -998,22 +1179,52 @@ def transcribe_local(
     input_file = Path(input_file)
     output_file = Path(output_file)
     started = time.monotonic()
+    source = input_file
+    offset = 0.0
+    cut: Path | None = None
     try:
+        if span is not None:
+            # The stretch is cut out into a WAV of its own: faster-whisper's own
+            # clip option would switch its silence filter off.
+            start, end = span
+            if (end - start) * 1000 < _MIN_SPAN_MS:
+                raise TranscriptionError(
+                    f"Nothing to transcribe between {_format_clock(start)} and "
+                    f"{_format_clock(end)} — move the ends of the slider apart."
+                )
+            temp_dir = get_settings().temp_dir
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            handle, name = tempfile.mkstemp(
+                prefix="stretch-", suffix=".wav", dir=temp_dir
+            )
+            os.close(handle)
+            cut = Path(name)
+            _report(
+                progress_callback,
+                status="start",
+                message=(
+                    f"Cutting out {_format_clock(start)}–{_format_clock(end)} "
+                    "of the recording…"
+                ),
+            )
+            to_wav(input_file, cut, start=start, duration=end - start)
+            source, offset = cut, start
         _report(
             progress_callback, status="start", message="Local transcription started…"
         )
         # transcribe() returns a lazy generator; iterating it does the work.
-        segments, info = whisper_model.transcribe(str(input_file), vad_filter=True)
+        segments, info = whisper_model.transcribe(str(source), vad_filter=True)
 
         # faster-whisper always returns timed segments, so collect them even when
-        # no SRT was requested — they drive the readable transcript.
+        # no SRT was requested — they drive the readable transcript. Times are
+        # placed on the recording's own timeline when a stretch was cut out.
         timed_entries: list[dict[str, Any]] = []
         duration = getattr(info, "duration", 0) or 0
         for segment in segments:
             timed_entries.append(
                 {
-                    "start": segment.start,
-                    "end": segment.end,
+                    "start": segment.start + offset,
+                    "end": segment.end + offset,
                     "text": segment.text.strip(),
                 }
             )
@@ -1021,7 +1232,10 @@ def transcribe_local(
                 _report(
                     progress_callback,
                     status="progress",
-                    message=f"Transcribing… {segment.end:.0f}/{duration:.0f}s",
+                    message=(
+                        f"Transcribing… {segment.end + offset:.0f}/"
+                        f"{duration + offset:.0f}s"
+                    ),
                     progress=min(1.0, segment.end / duration),
                 )
 
@@ -1031,6 +1245,7 @@ def transcribe_local(
             timed_entries,
             srt_output_file if with_timestamps else None,
             visual_notes=visual_notes,
+            span=span,
         )
 
         _report(
@@ -1046,3 +1261,6 @@ def transcribe_local(
         _report(progress_callback, status="error", message=f"An error occurred: {exc}")
         logger.exception("Local transcription failed")
         raise TranscriptionError(str(exc)) from exc
+    finally:
+        if cut is not None:
+            cut.unlink(missing_ok=True)

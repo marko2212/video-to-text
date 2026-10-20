@@ -541,3 +541,28 @@ def test_a_missing_ffprobe_gives_no_length_instead_of_an_error(monkeypatch, tmp_
     monkeypatch.setattr(frames.ffmpeg, "probe", missing)
 
     assert frames.video_duration(tmp_path / "call.mkv") == 0.0
+
+
+# --- only part of the video --------------------------------------------------------
+
+
+def test_clip_scan_keeps_the_frames_of_the_stretch_and_its_length():
+    scan = _scan(
+        [(0.0, True, 1), (5.0, False, 2), (10.0, False, 3), (15.0, False, 4)],
+        duration=20.0,
+    )
+
+    clipped = frames.clip_scan(scan, (4.0, 12.0))
+
+    assert [frame["time"] for frame in clipped["frames"]] == [5.0, 10.0]
+    assert clipped["duration"] == 8.0
+    assert len(scan["frames"]) == 4  # the scan itself is kept for any stretch
+
+
+def test_clip_scan_never_claims_more_than_the_video_has():
+    scan = _scan([(0.0, True, 1), (5.0, False, 2)], duration=10.0)
+
+    assert frames.clip_scan(scan, (5.0, 60.0))["duration"] == 5.0
+    # A length the scan does not know: the stretch's own.
+    unknown = {**scan, "duration": 0.0}
+    assert frames.clip_scan(unknown, (5.0, 60.0))["duration"] == 55.0

@@ -572,3 +572,161 @@ def test_a_first_chunk_that_fails_after_a_split_still_reports_what_it_paid(pipel
 
     assert not isinstance(stopped.value, IncompleteTranscriptionError)
     assert stopped.value.spent["requests"] == 2  # the capped answer and half a
+
+
+# --- only part of the recording ----------------------------------------------------
+
+
+def test_a_chosen_stretch_is_the_only_audio_sent(pipeline):
+    client = FakeClient(lambda name, ms: _text(f"Said in {name}."))
+
+    text = pipeline.run(_tone(10 * MINUTE), client, span=(120.0, 420.0))
+
+    # Five minutes from 2:00 to 7:00: one chunk, on the recording's timeline.
+    assert client.calls == [("chunk_000", 5 * MINUTE)]
+    assert text.startswith(
+        "⏭️ Transcribed 2:00–7:00 of the recording; the rest was left out."
+    )
+    assert "(~2:00) Said in chunk_000." in text
+    assert pipeline.spent[-1]["audio_seconds"] == 300.0
+    # Its saved parts are kept apart from the whole recording's.
+    digest = checkpoints.file_digest(pipeline.source)
+    assert transcribe.saved_chunk_count(digest, config.DEFAULT_MODEL, (120, 420)) == 1
+    assert transcribe.saved_chunk_count(digest, config.DEFAULT_MODEL) == 0
+
+
+def test_a_stretch_is_cut_within_its_own_ends():
+    audio = _tone(12 * MINUTE)
+
+    bounds = transcribe._chunk_bounds(audio, 5 * MINUTE, (MINUTE, 11 * MINUTE))
+
+    assert bounds[0][0] == MINUTE and bounds[-1][1] == 11 * MINUTE
+    assert len(bounds) == 2
+    assert all(end > start for start, end in bounds)
+    assert all(bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1))
+
+
+def test_the_pause_search_stops_at_the_stretch_s_end():
+    # Digital silence just past the end of the stretch would be the quietest
+    # moment near the five-minute mark (a cut there was absorbed by the tail
+    # merge, but it was sound the owner left out deciding the cut); the cut
+    # must fall on the pause inside the stretch instead.
+    audio = (
+        _tone(291_500)
+        + (_tone(1000) - 30)
+        + _tone(12_500)
+        + AudioSegment.silent(duration=5000)
+        + _tone(290_000)
+    )
+
+    bounds = transcribe._chunk_bounds(audio, 5 * MINUTE, (0, 305_000))
+
+    assert len(bounds) == 2
+    assert abs(bounds[0][1] - 292_000) <= 500
+    assert bounds[-1][1] == 305_000
+
+
+def test_parts_of_the_whole_recording_serve_a_stretch_with_the_same_start(pipeline):
+    # A run of the whole recording stopped at its third part; the owner leaves
+    # the tail out and starts again: the two finished parts have the same
+    # boundaries and must not be paid for twice.
+    def failing(name, ms):
+        if name == "chunk_002":
+            raise _rate_limit_error("insufficient_quota")
+        return _text(f"Said in {name}.")
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(_tone(15 * MINUTE), FakeClient(failing))
+
+    again = FakeClient(lambda name, ms: _text("Paid again."))
+    text = pipeline.run(_tone(15 * MINUTE), again, span=(0.0, 660.0))
+
+    # Only the stretch's own last part, 10:00–11:00, is sent.
+    assert [name for name, _ in again.calls] == ["chunk_002"]
+    assert again.calls[0][1] == pytest.approx(MINUTE, abs=250)
+    assert "Said in chunk_000." in text and "Said in chunk_001." in text
+    assert "Paid again." in text
+    assert pipeline.spent[-1]["requests"] == 3  # the two the first run paid, plus one
+    digest = checkpoints.file_digest(pipeline.source)
+    assert transcribe.saved_chunk_count(digest, config.DEFAULT_MODEL, (0, 660)) == 3
+    assert transcribe.saved_chunk_count(digest, config.DEFAULT_MODEL) == 2
+    assert transcribe.saved_parts_within(digest, config.DEFAULT_MODEL, (0, 660)) == 2
+
+
+def test_a_stretch_with_another_start_borrows_nothing(pipeline):
+    def failing(name, ms):
+        if name == "chunk_002":
+            raise _rate_limit_error("insufficient_quota")
+        return _text("Said.")
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(_tone(15 * MINUTE), FakeClient(failing))
+
+    shifted = FakeClient(lambda name, ms: _text("Said."))
+    pipeline.run(_tone(15 * MINUTE), shifted, span=(60.0, 660.0))
+
+    # 1:00–11:00 is cut at 6:00, not 5:00 and 10:00: nothing matches.
+    assert [ms for _, ms in shifted.calls] == pytest.approx(
+        [5 * MINUTE, 5 * MINUTE], abs=250
+    )
+    digest = checkpoints.file_digest(pipeline.source)
+    # One of the whole recording's parts lies within the stretch, so the hint
+    # may mention saved parts; the run itself reuses only matching boundaries.
+    assert transcribe.saved_parts_within(digest, config.DEFAULT_MODEL, (60, 660)) == 1
+
+
+def test_an_empty_stretch_is_refused_before_any_request(pipeline):
+    client = FakeClient(lambda name, ms: _text("x"))
+
+    with pytest.raises(TranscriptionError, match="Nothing to transcribe"):
+        pipeline.run(_tone(MINUTE), client, span=(30.0, 30.5))
+
+    assert client.calls == []
+
+
+def test_a_partial_stretch_counts_from_its_own_start(pipeline):
+    def failing(name, ms):
+        if name == "chunk_001":
+            raise _rate_limit_error("insufficient_quota")
+        return _text("Said.")
+
+    with pytest.raises(IncompleteTranscriptionError) as stopped:
+        pipeline.run(_tone(22 * MINUTE), FakeClient(failing), span=(60.0, 1260.0))
+
+    # One five-minute chunk (cut in a pause near its end) of the stretch is done.
+    assert stopped.value.spent["audio_seconds"] == pytest.approx(300.0, abs=11)
+    text = pipeline.output.read_text(encoding="utf-8")
+    assert text.startswith("⏭️ Transcribed 1:00–21:00 of the recording")
+    assert "–21:00)" in text  # the missing part ends where the stretch does
+
+
+def test_the_local_engine_cuts_the_stretch_out_and_keeps_the_recording_s_times(
+    tmp_path, monkeypatch
+):
+    cuts = []
+    seen = []
+
+    def fake_to_wav(source, target, start=None, duration=None):
+        cuts.append((start, duration))
+        target.write_bytes(b"the cut")
+        return target
+
+    class Model:
+        def transcribe(self, path, vad_filter):
+            seen.append(Path(path).read_bytes())
+            segments = [SimpleNamespace(start=0.0, end=2.0, text=" Hello there.")]
+            return iter(segments), SimpleNamespace(duration=120.0)
+
+    monkeypatch.setattr(transcribe, "to_wav", fake_to_wav)
+    output = tmp_path / "out.txt"
+
+    transcribe.transcribe_local(
+        tmp_path / "meeting.wav", output, Model(), span=(600.0, 720.0)
+    )
+
+    assert cuts == [(600.0, 120.0)]
+    assert seen == [b"the cut"]
+    text = output.read_text(encoding="utf-8")
+    assert text.startswith("⏭️ Transcribed 10:00–12:00 of the recording")
+    assert "(10:00) Hello there." in text
+    assert not list(config.get_settings().temp_dir.glob("stretch-*.wav"))

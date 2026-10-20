@@ -53,7 +53,12 @@ def save_uploaded_file(uploaded_file: Any) -> Path:
     return destination
 
 
-def to_wav(input_path: Path, output_path: Path | None = None) -> Path:
+def to_wav(
+    input_path: Path,
+    output_path: Path | None = None,
+    start: float | None = None,
+    duration: float | None = None,
+) -> Path:
     """Convert any media file to a mono 16 kHz PCM WAV using ffmpeg.
 
     Works for both video (extracts the audio track) and audio inputs, since
@@ -62,6 +67,10 @@ def to_wav(input_path: Path, output_path: Path | None = None) -> Path:
     Args:
         input_path: Path to the source video/audio file.
         output_path: Destination WAV path. Defaults to ``<temp_dir>/<stem>.wav``.
+        start: Seconds to skip at the beginning, if only part of the file is
+            wanted (exact in a WAV, within a frame or so in an MP3).
+        duration: How many seconds to keep from there; the rest of the file
+            when ``None``.
 
     Returns:
         Path to the written WAV file.
@@ -72,8 +81,13 @@ def to_wav(input_path: Path, output_path: Path | None = None) -> Path:
     if output_path is None:
         output_path = get_settings().temp_dir / f"{input_path.stem}.wav"
 
+    stretch: dict[str, str] = {}
+    if start:
+        stretch["ss"] = f"{start:.3f}"
+    if duration is not None:
+        stretch["t"] = f"{duration:.3f}"
     try:
-        stream = ffmpeg.input(str(input_path))
+        stream = ffmpeg.input(str(input_path), **stretch)
         stream = ffmpeg.output(
             stream,
             str(output_path),
