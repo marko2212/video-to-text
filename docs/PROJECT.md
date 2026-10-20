@@ -623,6 +623,41 @@ upload (identified by file_id, saved to uploads/)
   WAV was re-read and hashed on every rerun; the extracted-WAV download is now a
   callable, read only on click. Measured with a 90-minute recording: the audio block
   went from **329 ms to 25 ms per rerun**.
+- **Part of a recording can be left out with a slider, and the sound is drawn under the
+  slider, above the player** *(2026-10-20, the owner's request: a recording left running for two hours
+  after the meeting would cost tokens for nothing)*. `waveform.py` measures the loudness
+  of 1,200 equal stretches (pydub: 0.1 s to read a 75-minute WAV, 0.13 s for the
+  buckets; other formats go through one ffmpeg conversion to a mono 16 kHz WAV and are
+  never decoded at their own rate — a two-hour stereo file would take over a gigabyte)
+  and draws them with Pillow: the part to transcribe in Streamlit's red, the rest grey
+  under a light shade, on a transparent background so both themes work; the bars are
+  scaled to the 98th percentile, not to the loudest moment (one clap would flatten the
+  rest). The control is a plain `st.slider` of two `datetime.time` values (`H:mm:ss`, a
+  second a step, Page Up/Down ten) rather than an Altair brush or a custom component: it
+  works in AppTest, needs no JavaScript, and its one limit is a day (a recording that
+  long gets no slider). Its key carries the recording's id, so a new recording starts
+  whole and the value survives reruns; "Whole recording" sets the key in a callback.
+  The stretch is a `span` given to both engines. OpenAI plans its chunk boundaries
+  inside the stretch — the pause search stops at its end, as it stops at the
+  recording's end for the whole, so sound the owner left out never decides a cut (a cut
+  past the end was absorbed by the tail merge even before, as the review showed) — and
+  every time stays on the recording's own timeline, so `(10:00)` in the transcript is
+  10:00 in the video. The local engine cuts the stretch out into a WAV with ffmpeg and
+  offsets the segments, because faster-whisper's own `clip_timestamps` switches its
+  silence filter off. The checkpoint folder carries the stretch (`…_v1_600-3607s`):
+  chunks are named by index, so a stretch's run would otherwise overwrite — and, when
+  it finished, discard — the whole recording's saved parts. Parts saved for the whole
+  recording or for another stretch are still borrowed when their boundaries match the
+  plan exactly: a stretch that starts where the whole does plans the same leading
+  chunks, so a run stopped by an empty credit and started again with the tail left out
+  pays for none of them twice (the review's case: 9 parts, 45 minutes, about $0.18).
+  The hint before a run counts only the stretch's own parts exactly, and otherwise
+  promises just "those that fit". The whole video is
+  still scanned for screenshots (the scan is kept and serves any stretch);
+  `frames.clip_scan` keeps only the frames within it, for the caption and the run
+  alike. The transcript's first line says which part was transcribed, and the history
+  row records the `span` in its usage details. Not done: an automatic "the last 15
+  minutes are silent — leave them out?" suggestion from the same measurement (§5).
 - **History entries are lazy** — `st.expander(key=…, on_change="rerun")` and only the
   open one is read from SQLite. Every rerun used to fetch and render all transcripts
   (1.6 MB of text at 104 rows). Measured with 104 synthetic rows: **281 ms → 14 ms per
@@ -835,7 +870,9 @@ upload (identified by file_id, saved to uploads/)
   copy; for large files that an upload cannot hold in memory *(2026-09-29)*; found with
   **📂 Browse…** in Windows' own file window, in any folder *(2026-09-30)*; each entry
   shows the recording's length *(2026-10-03)*
-- **Audio player** before and after transcription
+- **Audio player** before and after transcription, with **a picture of the sound and a
+  slider to leave the start or the end of the recording out** of the run *(2026-10-20)*:
+  only the chosen stretch is sent, described and paid for; its times stay the recording's
 - **Two engines**: OpenAI API (`gpt-4o-transcribe` / `whisper-1`) and **Local offline** (faster-whisper, selectable model size)
 - **Timestamps + `.srt`** export (whisper-1 and every local model)
 - **Readable transcript**: inline `(M:SS)` + paragraphs *(2026-07-20)*
@@ -870,7 +907,7 @@ upload (identified by file_id, saved to uploads/)
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 335 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 365 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -963,8 +1000,19 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 - [x] Committed and pushed (code, then docs), CI on GitHub.
 
 ### Waiting for the owner
-**Next step: the owner opens the app** — that runs the first real cleanup — **and tries
-the live checks below**.
+**Next step: the owner tries the live checks below** (the app is in daily use since
+2026-10-05, and the one-day cleanup is verified).
+- [ ] **The trim slider on a real recording** (2026-10-20, §3 UI): a Teams recording
+      with a long empty tail — does the picture show where the meeting ended, is Page
+      Down (ten seconds a press) enough to reach it, and does the OpenAI run's cost drop
+      with it? Checked here only on synthetic sound (a square wave, Windows
+      text-to-speech) and with the Local engine.
+- [x] **OpenAI credit ran out** — 2026-10-14 the page said "OpenAI credit exhausted";
+      the owner was told how to top up (platform.openai.com → Settings → Organization →
+      Billing → Add to credit balance, on the marko2212 organization the `.env` key
+      belongs to; Start again resumes from the saved parts). Runs succeed again from
+      2026-10-14/15. Pace for budgeting: 41 OpenAI runs from 2026-10-05 to 2026-10-20
+      cost $2.41 in all, about $0.06 a run, so $5 lasts about a month.
 - [x] **Commit and push the CI fix** — done 2026-10-09 ("komituj i pušuj"): CI had
       failed on `9b4e622` (run 37087537499) — `frames.video_duration` raised
       `FileNotFoundError` where no ffprobe is installed, which the new screenshot caption
@@ -1008,11 +1056,11 @@ the live checks below**.
       (`FRAME_MIN_INTERVAL_SECONDS`, fast changes) nor the cap (`FRAME_MAX_COUNT`, 300
       in the owner's `.env`). Cost of the cap: nano $0.18, mini $0.67. The owner chose
       this one.
-- [ ] **First real run of the one-day cleanup.** On 2026-10-03 it had not run yet: the
-      owner's app last worked on 2026-09-30 16:32, just before the cleanup was added, and
-      was not running. `uploads/` held 16 files (2.67 GB, back to 2026-09-14) and `temp/`
-      45 (880 MB: 13 WAV, 14 MP3, 18 TXT). The first page opened should remove everything
-      but the TXT files older than a day — check the sizes afterwards (totals only).
+- [x] **First real run of the one-day cleanup** — verified 2026-10-20 (totals only): the
+      oldest working copies left were from 2026-10-19 15:15, just over a day old, so they
+      go at the next page opened; `uploads/` held 6 files (894 MB) instead of 16 (2.67 GB,
+      back to 2026-09-14) on 2026-10-03. The transcripts (`.txt`) in `temp/` stay, as
+      decided. A page left open for days does not clean again until it is reloaded.
 - [ ] **Live check of 📂 Browse… with a real choice** — the window was opened and
       cancelled from scripts only; choosing a file in it is the owner's to try.
 - [x] **The key and the credit were on different accounts** — resolved 2026-09-25: the
@@ -1136,6 +1184,11 @@ the live checks below**.
       update (2026-09-29 review).
 
 ### P5 — features and later
+- [ ] **"The last 15 minutes are silent — leave them out?"** (S). The loudness the
+      picture of the sound is drawn from (`waveform.loudness`) already shows a long
+      quiet tail or head; a one-line suggestion with a button that sets the slider
+      would save the drag. Needs a threshold that ignores a Teams waiting room and
+      hold music — check on real recordings first (aggregates only).
 - [ ] **Meeting summary and action items** (R38, M). An explicit button, gpt-5.4-mini, stored
       in a new nullable `summary` column; hidden for very short transcripts. `titles.py`
       is the pattern (one chat request, usage record, failure only warns).
@@ -1150,6 +1203,75 @@ the live checks below**.
 ---
 
 ## 6. Journal
+
+### 2026-10-20 (part 2) — A picture of the sound, and a slider to leave part of it out
+
+The owner's request, from the Audio step: show the sound, and let the start or the end
+of a recording be left out of what goes to OpenAI — a recording left running for two
+hours after the meeting costs tokens for nothing. A prototype in the scratchpad settled
+the design first (a 75-minute synthetic WAV: pydub reads it in 0.1 s and 2,000 RMS
+buckets take 0.13 s; a time slider formatted `H:mm:ss`; `st.audio(start_time,
+end_time)`), the owner saw it and said "kreni". Decision and reasons in §3 (UI / flow).
+
+- **`waveform.py`** (new): `loudness(path, buckets)` — the app's own WAV read as it
+  is, anything else through one ffmpeg conversion — and `picture(levels, kept)`.
+- **`transcribe.py`**: `span` on both engines; chunk boundaries inside the stretch,
+  with the pause search stopping at its end; the checkpoint folder per stretch, with
+  parts of the whole recording or another stretch borrowed when their boundaries match
+  (`_saved_elsewhere`); the first line `⏭️ Transcribed 10:00–1:00:07 of the recording;
+  the rest was left out.`; `audio_seconds` of the stretch, also for a partial run. The
+  local engine cuts the stretch out with `audio.to_wav(start, duration)` and offsets
+  the segments.
+- **`frames.clip_scan`**: the frames and length of the stretch, for the caption and
+  the run alike (the whole video is still scanned once).
+- **`app.py`**: `render_audio` — the slider (its key carries the recording's id), the
+  picture, the player playing the stretch, the caption ("**0:00 – 1:06:40** is sent:
+  1:06:40 of 1:15:00; 8:20 left out — not sent, not paid for"), "Whole recording"; the
+  ceiling and the stored-scan count over the stretch; the resume hint per stretch;
+  `span` in the job's params and in the run's cost (and so in the history row); Start
+  held back while less than a second is left.
+- **Review** (one agent over the diff, with probes outside the repo): five findings,
+  all taken. The regression test for the bounded pause search passed with the bug put
+  back — the tail merge already absorbed a cut past the end, so the bound is a
+  refinement, and the test now checks what it really changes (a pause inside the
+  stretch wins over silence just past it); saved parts were kept apart from a stretch
+  starting at the same place, so a run stopped at part 9 and restarted with the tail
+  left out would have paid for 45 minutes again (now borrowed, see §3); a one-second
+  stretch at the rounded-up end could hold less than a second of audio (Start is held
+  back); a recording a hair under a day long raised `ValueError` from `time(24, 0, 0)`
+  (no slider from a day up); and the texts put the picture under the player (it is under
+  the slider).
+- **Tests: see §4** — the picture and its colours, the loudness of a square-wave WAV
+  written without ffmpeg (a `wav_file` fixture in conftest), a stretch's chunks and the
+  pause search that stops at its end, parts borrowed across stretches (and not across
+  different starts), the empty stretch, the partial stretch, the local cut and offset,
+  the clipped scan, the ceiling and the stored scan over a stretch, and the page: the
+  slider over the whole length, the run getting `span=(1, 4)` and the history row
+  recording it, the reset button, a new recording starting whole, ends together and a
+  fraction of a second holding Start back, a day-long recording getting no slider, an
+  unreadable recording getting no slider, the hint for parts that fit a stretch.
+- **Live**, on the isolated instance (port 8597, scratch folders, `OPENAI_BASE_URL`
+  pointing nowhere): the 75-minute WAV from the folder list draws its picture (an hour
+  of speech, a quiet quarter hour) at once; Page Down moves an end ten seconds a press;
+  the caption and "Whole recording" follow. Local `base` on 0:45–2:00 of a two-minute
+  Windows text-to-speech recording (sentences at 0:00, 1:00 and 1:30) finished in 3 s:
+  the transcript starts with the note and `(0:59) The second sentence…`, the first
+  sentence is absent, the cut WAV is gone from `temp/`, and the history row holds
+  `"span": [45, 120]`. In the browser pane the slider's thumbs could not be dragged by
+  coordinates (the pane scales the viewport); clicking a thumb and using the keys works.
+- Committed as 7f1ce76 (`feat`) plus a `docs` commit, and pushed on the owner's
+  "komituj i pušuj"; CI result in the next entry if it is not green.
+
+### 2026-10-20 — Status: cleanup works, credit topped up, daily use
+
+Checked as totals only (read-only history, file counts and sizes): the app has been in
+daily use since 2026-10-05 — 41 OpenAI runs to 2026-10-20 for $2.41, none with an AI
+title (the setting is off). On 2026-10-14 a run stopped with "OpenAI credit exhausted";
+after the owner topped up, runs went through again from 2026-10-14/15. The one-day
+cleanup works: no working copy older than 2026-10-19 15:15 was left, and `uploads/`
+was down from 2.67 GB to 894 MB. Uploads are still in use alongside the folder source
+(six recent files in `uploads/`, which the folder source never writes to). The live
+checks in §5 remain the owner's.
 
 ### 2026-10-03 (part 4) — CI red after the push: no ffprobe there
 
