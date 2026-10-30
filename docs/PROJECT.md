@@ -854,8 +854,15 @@ upload (identified by file_id, saved to uploads/)
 - **Launchers live in `scripts/`, not the repo root** — the root of a public Python repo
   stays clean and platform-neutral.
 - **No `.vbs`** — it carries a historical malware reputation and some AV products flag it.
-  Instead of hiding the console, the shortcut starts `run.bat` **minimised**
+  Instead of hiding the console, the shortcut starts the app **minimised**
   (`WindowStyle=7`).
+- **The Desktop shortcut runs `uv.exe` itself, not `run.bat`** *(2026-10-30)* — with the
+  same arguments (`run streamlit run app.py`, in the repo folder). Windows offers *Pin to
+  taskbar* only for shortcuts to an `.exe`, so the owner could not pin the old one.
+  `cmd.exe /c run.bat` would pin too, but a shortcut handing `cmd /c` a command is a
+  pattern some antivirus heuristics watch, and other console windows would group under
+  the pinned icon. The shortcut stores uv's absolute path (found with `Get-Command`), so
+  `create-shortcut.ps1` is run again if uv moves. `run.bat` stays for a double-click.
 - **Docker is optional and additive** — it bundles ffmpeg (the host needs nothing), but
   `make run` / `uv run` keep working exactly as before.
 - **The app listens on localhost only** *(2026-09-25)*. Transcripts are confidential and
@@ -1226,6 +1233,20 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-10-30 — The Desktop shortcut can be pinned to the taskbar
+
+The owner could pin a shortcut to a Python script (its target is `python.exe`) but not
+the app's: its target was `scripts\run.bat`, and Windows hides *Pin to taskbar* for
+shortcuts to batch files. `create-shortcut.ps1` now points the shortcut at `uv.exe` with
+`run streamlit run app.py` (the command `run.bat` runs), same icon, minimised console;
+the owner's shortcut was made again with it and read back (target, arguments, folder,
+icon), and the command checked with `uv run --no-sync streamlit --version` without
+starting a second app. The old shortcut also carried a leftover argument
+(`"…\run.vbs"`, ignored by `run.bat`); gone with the new one. Reasons for `uv.exe` over
+`cmd /c run.bat`: §3 Distribution. Pinning itself is the owner's click (Windows 11 has
+no supported way to pin from a script). Committed (`fix(scripts)`) and pushed on the
+owner's "komituj i pušuj", 2026-10-30.
 
 ### 2026-10-21 — README screenshots retaken, and the tool that takes them
 

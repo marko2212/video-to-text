@@ -151,7 +151,7 @@ The recordings, the transcripts and the older history entries below are made up 
 powershell -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1
 ```
 
-Then **double-click "Video & Audio Transcription"** on your Desktop — it starts the app (console minimized to the taskbar) and opens your browser automatically. You can also double-click `scripts\run.bat` directly.
+Then **double-click "Video & Audio Transcription"** on your Desktop — it starts the app (console minimized to the taskbar) and opens your browser automatically. To start it from the taskbar, right-click the icon → **Pin to taskbar** (Windows 11: *Show more options* first). The shortcut runs `uv run streamlit run app.py` itself and remembers where `uv.exe` is, so run the script again if you reinstall uv elsewhere. You can also double-click `scripts\run.bat` directly.
 
 **Linux / macOS** — run `bash scripts/run.sh` (or simply `make run`).
 
