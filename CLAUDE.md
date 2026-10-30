@@ -42,7 +42,7 @@ User-facing changes (formats, flags, `.env` keys, commands) must also land in RE
 
 ## Dev commands
 
-`make run` · `make lint` / `make format` · `make test` · `make check` (CI gate).
+`make run` · `make lint` / `make format` · `make test` · `make check` (CI gate) · README screenshots + demo GIF: `scripts/dev/readme-screenshots/run.ps1` (demo data, isolated copy).
 
 **Syncing:** `make sync` / `upgrade` / `reset` keep the offline backend when it is installed
 (`EXTRAS` in the Makefile); `make sync-local` adds it. **Plain `uv sync` uninstalls it**

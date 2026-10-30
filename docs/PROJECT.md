@@ -838,6 +838,17 @@ upload (identified by file_id, saved to uploads/)
 - **History was rewritten and cleaned** before the repo went public (22 messy commits → a
   clean root plus conventional commits). Verified: `.env` was never committed and no key
   material appears anywhere in the history.
+- **README images come from a script, on made-up recordings** *(2026-10-21)*. The real
+  recordings are client meetings, and hand-made screenshots went stale for five months.
+  `scripts/dev/readme-screenshots/run.ps1` makes the recordings (Windows
+  text-to-speech), runs a copy of the app with no key and its own folders, and takes
+  the three screenshots and the demo GIF in under three minutes. The GIF is **a real run
+  of the app**, not a composed video: HyperFrames (HTML → MP4) was considered and kept
+  for later — it would draw an imitation of the page unless it wrapped this recording,
+  and adds a toolchain. **GIF, not MP4**: a README shows a GIF playing in a loop, while a
+  video plays only when uploaded through GitHub's web editor (a committed MP4 is just a
+  link). Frames are screenshots with their own times, not Chrome's screencast, which
+  stopped sending frames once a run started.
 
 ### Distribution / running
 - **Launchers live in `scripts/`, not the repo root** — the root of a public Python repo
@@ -913,7 +924,11 @@ upload (identified by file_id, saved to uploads/)
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
 - **Docker**: `Dockerfile` + `docker-compose.yml` + `.dockerignore` (ffmpeg bundled, offline backend opt-in via `INSTALL_LOCAL=true`)
 - **Launchers**: `scripts/run.bat`, `scripts/run.sh`, `scripts/create-shortcut.ps1` + icon
-- **README**: badges, full-width screenshots, offline mode, Docker, quick launch
+- **README**: badges, full-width screenshots, offline mode, Docker, quick launch;
+  screenshots retaken and a **demo GIF** at the top *(2026-10-21)* — folder list, trim
+  slider over the picture of the sound, a Local run, history with titles and costs — by
+  `scripts/dev/readme-screenshots/run.ps1` (made-up recordings, an isolated copy of the
+  app; one command, under three minutes)
 - Repo is **public**, history cleaned, no `Co-authored-by` trailers
 - **Full review** of code, live UI, security, dependencies, API options, docs and real
   usage *(2026-09-25)* — 62 verified findings, prioritised in §5; Streamlit 1.64 assessed
@@ -1156,9 +1171,9 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       `.gitattributes` with `*.sh text eol=lf` (R54); current action versions and a pinned
       setup-uv (R33 rest); Docker cache, non-root user, `.env` passing and a `temp/` volume
       so checkpoints survive a recreated container (R53); openai SDK bump and jiter for
-      Python 3.14 (R27); drop pydub (R17); refresh the README screenshots (R35); privacy
-      wording and README fixes (R47, R55); Host allow-list (R30). (Auto-clean of old
-      uploads, R48 rest, was done 2026-09-30 — §3 Data.)
+      Python 3.14 (R27); drop pydub (R17); privacy wording and README fixes (R47, R55);
+      Host allow-list (R30). (Auto-clean of old uploads, R48 rest, was done 2026-09-30 —
+      §3 Data; the README screenshots, R35, were retaken 2026-10-21 — journal.)
 - [ ] **Transcript files in `temp/` (`transcript_*.txt` / `.srt`)** — left out of the
       one-day cleanup by the owner (2026-09-30, "to ćemo kasnije"). They are small and the
       Result panel reads them; decide whether they follow the same rule (the history
@@ -1167,6 +1182,14 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       with a fake, slow OpenAI client (every request logged with its thread) and
       puppeteer scenarios, kept only in the session scratchpad. Committing them (e.g.
       `scripts/dev/`, paths from env vars) would make "check it live" mechanical.
+      A start: `scripts/dev/readme-screenshots/` (2026-10-21) already copies the app,
+      starts it isolated, makes recordings and drives the page — a live check can grow
+      from it.
+- [ ] **The trim caption's total is a second longer than the recording elsewhere**
+      (S, low; seen in the 2026-10-21 screenshots). A 9:25.0x recording: the player and
+      the folder list say 9:25, the caption under the slider "1:40 of 9:26; 7:46 left
+      out" — `_trim_caption` gets `last = ceil(duration)`, the slider's end. Give it the
+      duration itself (formatted like the list) and keep `ceil` for the slider only.
 - [ ] Review leftovers (low): a stalled upload can wait 4 × 300 s before failing; the SDK
       may resend a chunk after a read timeout (possible double billing); a genuine Russian
       passage inside a Serbian meeting is transliterated too; Macedonian counts as Serbian;
@@ -1203,6 +1226,56 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-10-21 — README screenshots retaken, and the tool that takes them
+
+The owner asked whether the README needed updating after the recent work. Its text did
+not (every feature since the last check was already described); the three screenshots
+did — unchanged since 2026-05-31, they showed none of the folder source, the trim slider
+and picture of the sound, the cost and run time, the AI titles or the working-files
+sidebar. Retaken on the owner's "uradi".
+
+**How.** No real recording could be shown (client meetings), so everything is made up:
+Windows text-to-speech (Zira and David) reads a 1:36 sprint-planning dialogue, room
+noise runs on to 9:25 under a "Meeting ended" slide, and four files of silence give the
+folder list lengths and dates. A copy of the app's tracked files (no `.env`, so no key)
+ran on port 8597 with its own data, temp and upload folders and OpenAI pointed nowhere;
+puppeteer opened the recording list, moved the slider's right end to 1:40 and ran the
+**Local `base`** engine (11–26 s), and the history got four made-up older rows (OpenAI
+and local, with titles and costs) next to that real run. The folder field shows
+`C:\Users\you\Videos` — a label drawn over the field's text, since the demo folder is a
+long temp path; the README says the content is made up.
+
+**Kept as a tool**, since the screenshots go stale with every UI change:
+`scripts/dev/readme-screenshots/` — `run.ps1` (one command; ~100 s for the screenshots
+alone, verified from an empty folder), `demo.py` (recordings, app copy, preferences, history rows, crop;
+refuses a data folder inside the repo), `shoot.mjs` and a README. Findings on the way,
+all handled in the scripts: the folder list dates a recording by its **creation** time
+(`st_birthtime`), not the save time; the first select box on the page is the sidebar's
+title model, not the recording list; a Page Down can be lost while the page reruns, so
+the slider is read back and corrected; Streamlit scrolls inside its own container, so
+the page is captured by making the window as tall as the content; Windows PowerShell 5.1
+turns a program's stderr into a terminating error when output is captured.
+
+**Seen in the new screenshot:** the trim caption says "1:40 of 9:26" while the player
+and the list say 9:25 — §5 P4.
+
+**Then a demo GIF** (the owner asked about HyperFrames for a video turned into a GIF;
+recommendation taken: a real run first, HyperFrames maybe later — §3 Code and process).
+`shoot.mjs video` repeats the transcribe flow with the real mouse in a 1200×760 window
+with the sidebar folded, draws a pointer and a click ring (headless Chrome has none) and
+saves screenshots about every 0.1 s with their times; `demo.py gif` joins them 1.6×
+faster, squeezes the waits (preparing the recording, redraws, the 10–24 s run) and keeps
+the pauses to read at real speed: `docs/screenshots/demo.gif`, 960 px, 12 fps, ~27 s,
+~1 MB, at the top of the README with a line saying it is made up and sped up. Found on
+the way: puppeteer's `page.screencast` froze at the first frame after Start (Chrome
+stopped sending frames; the recorder repeated the last one, so the file ran 70 s for 60
+s of work); the page jumps to the top when Start is pressed, so the script scrolls to the
+progress; React writes the real folder path back on every rerun, so the short path is a
+label drawn over the field, not a replaced value. `run.ps1` gained `-NoVideo` and `-Keep`
+and stops a demo instance it left running; a full run from an empty folder: 159 s.
+
+Committed (`docs`, with the tool) and pushed on the owner's "komituj i pušuj", 2026-10-30.
 
 ### 2026-10-20 (part 2) — A picture of the sound, and a slider to leave part of it out
 

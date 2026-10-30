@@ -7,6 +7,10 @@
 
 A Streamlit web app that transcribes speech to text — using either the **OpenAI audio API** or a **local, offline Whisper model** (`faster-whisper`). It accepts both video files (the audio track is extracted automatically) and audio files directly, and can export subtitles (`.srt`).
 
+![Picking a recording from a folder, leaving its silent tail out with the slider, and transcribing the rest with the local engine](docs/screenshots/demo.gif)
+
+*A made-up meeting whose recorder ran on for eight minutes: the slider leaves the silent tail out, so it is neither sent nor paid for. The waits are sped up.*
+
 ## Features ✨
 
 * Upload **video** files in MKV, MP4, MOV, AVI, WebM, M4V, WMV, FLV, MPEG/MPG, 3GP, TS/MTS/M2TS, OGV, or VOB format.
@@ -34,17 +38,19 @@ A Streamlit web app that transcribes speech to text — using either the **OpenA
 
 ## Screenshots 📸
 
-**1. Upload & flexible API key** — drop in a video or audio file; the OpenAI key loads from `.env`, or type it into the sidebar (or skip it entirely and use the offline engine).
+The recordings, the transcripts and the older history entries below are made up for the screenshots.
 
-![Upload screen with the sidebar API key field](docs/screenshots/home.png)
+**1. Choose a recording** — upload a file, or pick one from a folder on this computer: newest first, each with its length, read where it lies. The OpenAI key loads from `.env`, or type it into the sidebar (or skip it entirely and use the offline engine).
 
-**2. Choose the engine, then transcribe** — OpenAI API (`gpt-4o-transcribe` / `whisper-1`) or a local, offline Whisper model, with the transcript shown right next to the controls.
+![The recording list of a folder, each recording with its length](docs/screenshots/home.png)
 
-![Engine selection and a live transcript result](docs/screenshots/transcribe.png)
+**2. Leave out what you don't need, then transcribe** — the picture of the sound shows where the talking stops; here the slider leaves out the tail of a recording nobody stopped, which is then neither sent nor paid for. Choose OpenAI API (`gpt-4o-transcribe` / `whisper-1`) or a local, offline Whisper model; the transcript appears next to the controls, with how long the run took and what it cost.
 
-**3. Persistent history** — browse, re-download (TXT/SRT), and delete past transcriptions.
+![The trim slider over the picture of the sound, the engine choice and the transcript](docs/screenshots/transcribe.png)
 
-![The transcription history list](docs/screenshots/history.png)
+**3. Persistent history** — browse, re-download (TXT/SRT), and delete past transcriptions; each entry shows what it took and cost, and with **AI title** on, a title made from its content.
+
+![The transcription history, one entry open](docs/screenshots/history.png)
 
 ## Requirements 🛠️
 
@@ -266,6 +272,8 @@ Common tasks are available as Makefile targets (run `make` for the full list):
 * `make test` — run the pytest suite
 * `make check` — lint + format check + tests (the same gate as CI)
 * `make lint` / `make format` — ruff
+
+To retake the [screenshots](#screenshots-) and the demo GIF after a change to the page, run `scripts\dev\readme-screenshots\run.ps1` (Windows): it makes up recordings, runs a copy of the app that never touches your own history or files, and replaces the images in `docs/screenshots` — see [its README](scripts/dev/readme-screenshots/README.md).
 
 Continuous integration (`.github/workflows/ci.yml`) runs these checks on every push and pull request.
 
