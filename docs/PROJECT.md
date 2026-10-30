@@ -863,6 +863,9 @@ upload (identified by file_id, saved to uploads/)
   pattern some antivirus heuristics watch, and other console windows would group under
   the pinned icon. The shortcut stores uv's absolute path (found with `Get-Command`), so
   `create-shortcut.ps1` is run again if uv moves. `run.bat` stays for a double-click.
+  It also stores the repo folder: after moving the repo, run it again, fix the pinned
+  taskbar copy separately, and reinstall `.venv` (`uv sync --frozen --reinstall`, plus
+  `--extra local`), whose `.exe` launchers hold the old path — journal 2026-10-30 (part 2).
 - **Docker is optional and additive** — it bundles ffmpeg (the host needs nothing), but
   `make run` / `uv run` keep working exactly as before.
 - **The app listens on localhost only** *(2026-09-25)*. Transcripts are confidential and
@@ -1237,6 +1240,27 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-10-30 (part 2) — The repo moved into the owner's workspace folder
+
+The owner keeps each project as a workspace folder with the repo inside and opens Claude
+sessions from the workspace, so the repo moved from `C:\Work\video-to-text` to
+`C:\Work\Video-to-text-doc\video-to-text`, next to the owner's notes. A one-off script
+outside the repo renamed the folder (same disk, so all or nothing), then: reinstalled the
+locked packages from uv's cache (`uv sync --frozen --reinstall --extra local`), because the
+`.venv\Scripts\*.exe` launchers hold the old python path; fixed the path in the `activate`
+scripts; ran `create-shortcut.ps1` again; and pointed the pinned taskbar copy (its own
+`.lnk`, which Windows does not update) at the new folder and icon. The first try was
+refused and moved nothing: an idle shell in the previous Claude session's terminal panel
+still had its current folder in the old repo (found by reading each process's current
+folder); it went through once that shell was closed. Checked after the move: no old path
+in tracked files or the venv's text scripts; ruff clean; 365 tests without ffmpeg; the app,
+started from the moved `.venv` on a test port with scratch `DATA_DIR`/`TEMP_DIR`/`UPLOAD_DIR`,
+rendered with no exception. Unchanged: history rows keep the old `audio_path` (the column
+is never read), and interrupted runs still resume (`checkpoint_dir` is keyed by the
+recording's SHA-256 and the model; `temp/` moved with the repo). Claude's memory for the
+project is keyed by folder, so it was copied to the workspace's key; sessions started in
+the old folder cannot be resumed. Not committed (docs only).
 
 ### 2026-10-30 — The Desktop shortcut can be pinned to the taskbar; Streamlit 1.66 assessed
 
