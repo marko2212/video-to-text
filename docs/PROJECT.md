@@ -1169,10 +1169,14 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       still named after the upload, so two tabs with the same file name share them.
 - [ ] `make backup` via `VACUUM INTO` / `Connection.backup()` plus an integrity check (R24);
       consider a backup before automatic schema migrations (R57).
-- [ ] **Streamlit 1.64.0** — safe to adopt (assessed 2026-09-25, see journal); needs
-      `wrap=True` on the checkboxes/buttons directly in the left column. If staying on
-      1.56, bump tornado and pillow instead (R31). Re-check the job/fragment/watchdog
-      behaviour (§3 UI) on the new version.
+- [ ] **Streamlit 1.66** (S–M, ~1 h; no urgency) — go straight to it, not 1.64: 1.64
+      was assessed safe 2026-09-25 and 1.65–1.66 add nothing that breaks the app
+      (assessed 2026-10-30, journal). Needs `wrap=True` on the checkboxes/buttons
+      directly in the left column; re-check the uploader CSS (`stFileUploaderDropzone…`),
+      the job/fragment/watchdog behaviour (§3 UI) and the screenshot tool's selectors,
+      then retake the screenshots with `run.ps1` and compare. Consider
+      `streamlit[performance]` (1.66 made `httptools` optional). If staying on 1.56, bump
+      tornado and pillow instead (R31).
 - [ ] Config and repo: `load_dotenv(override=True)` → `env_file=BASE_DIR / ".env"` (R34);
       `.env.example` without a fake key (R37); duplicated constants (R46 rest);
       `.gitattributes` with `*.sh text eol=lf` (R54); current action versions and a pinned
@@ -1234,7 +1238,7 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ## 6. Journal
 
-### 2026-10-30 — The Desktop shortcut can be pinned to the taskbar
+### 2026-10-30 — The Desktop shortcut can be pinned to the taskbar; Streamlit 1.66 assessed
 
 The owner could pin a shortcut to a Python script (its target is `python.exe`) but not
 the app's: its target was `scripts\run.bat`, and Windows hides *Pin to taskbar* for
@@ -1245,8 +1249,24 @@ icon), and the command checked with `uv run --no-sync streamlit --version` witho
 starting a second app. The old shortcut also carried a leftover argument
 (`"…\run.vbs"`, ignored by `run.bat`); gone with the new one. Reasons for `uv.exe` over
 `cmd /c run.bat`: §3 Distribution. Pinning itself is the owner's click (Windows 11 has
-no supported way to pin from a script). Committed (`fix(scripts)`) and pushed on the
-owner's "komituj i pušuj", 2026-10-30.
+no supported way to pin from a script). Committed as 828a7c1 (`fix(scripts)`) after
+18d50e1 (the screenshots, 2026-10-21 entry) and pushed on the owner's "komituj i
+pušuj"; CI run 41048965096 green (3.12, 3.13, offline engine), 365 tests locally with
+and without ffmpeg.
+
+**Streamlit 1.65 (2026-10-02) and 1.66 (2026-10-14) assessed** (asked by the owner, from
+the release notes; the app was not run on them). Nothing the app calls was removed or
+changed behaviour in a way that hurts it. Of use: Ctrl+C / SIGTERM stop a server whose
+script is stuck (1.65); `on_change="ignore"` for checkbox, radio, text_area and
+file_uploader (1.65; small — controls are locked during a run anyway); a keyed widget that
+first appears after a Session State write shows the stored value (1.65 — what the trim
+slider already relies on); AppTest for forms and progress (1.66). To watch: 1.66 adds
+`<main>`/`<nav>` landmarks (CSS like `section[data-testid="stMain"]` must drop the tag;
+ours and the screenshot tool use attribute selectors only), the sidebar's buttons expose
+`aria-expanded` (state in `data-collapsed`), and `httptools` is optional. The real reason
+to move is still tornado's CVEs (gone since 1.57); the September costs stand (~0.5 s
+slower first load, smaller widget fonts, `wrap=True`). Verdict: no urgency; when done, go
+straight to 1.66 — §5 P4.
 
 ### 2026-10-21 — README screenshots retaken, and the tool that takes them
 
@@ -1296,7 +1316,8 @@ progress; React writes the real folder path back on every rerun, so the short pa
 label drawn over the field, not a replaced value. `run.ps1` gained `-NoVideo` and `-Keep`
 and stops a demo instance it left running; a full run from an empty folder: 159 s.
 
-Committed (`docs`, with the tool) and pushed on the owner's "komituj i pušuj", 2026-10-30.
+Committed as 18d50e1 (`docs`, with the tool) and pushed on the owner's "komituj i
+pušuj", 2026-10-30; CI green.
 
 ### 2026-10-20 (part 2) — A picture of the sound, and a slider to leave part of it out
 
