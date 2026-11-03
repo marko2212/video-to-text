@@ -10,7 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 3.12 is the floor; 3.13 is what the owner runs (with audioop-lts).
+        # 3.12 is the floor; 3.13 is what the owner runs (with audioop-lts) and
+        # what .python-version pins. setup-uv's python-version sets UV_PYTHON,
+        # which overrides that file, so each job really runs its own version.
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
