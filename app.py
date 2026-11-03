@@ -215,7 +215,7 @@ def render_sidebar(disabled: bool) -> None:
         disabled: True while a job runs, so editing the key cannot stop it.
     """
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header(":material/settings: Settings")
         if get_settings().openai_api_key:
             st.success("OpenAI API key loaded from environment.")
         else:
@@ -227,12 +227,9 @@ def render_sidebar(disabled: bool) -> None:
                 disabled=disabled,
                 help=(
                     "Needed only for the OpenAI API provider. Stored only for "
-                    "this session — never written to disk."
+                    "this session — never written to disk. Set `OPENAI_API_KEY` "
+                    "in a `.env` file to load it automatically every run."
                 ),
-            )
-            st.caption(
-                "Tip: set `OPENAI_API_KEY` in a `.env` file to load it "
-                "automatically every run."
             )
         render_title_settings(disabled)
 
@@ -266,7 +263,7 @@ def render_working_files(disabled: bool) -> None:
     Args:
         disabled: True while a job runs.
     """
-    st.subheader("🧹 Working files")
+    st.subheader(":material/cleaning_services: Working files")
     size = checkpoints.working_files_size()
     st.caption(f"**{_format_size(size)}** in use." if size else "Nothing to clean.")
     st.button(
@@ -341,7 +338,7 @@ def render_title_settings(disabled: bool) -> None:
         disabled: True while a job runs, so a change cannot stop it.
     """
     _title_preferences()
-    st.subheader("🏷️ AI title")
+    st.subheader(":material/label: AI title")
     mode = st.radio(
         "Name each transcript from its content",
         options=list(TITLE_MODES),
@@ -365,17 +362,16 @@ def render_title_settings(disabled: bool) -> None:
         on_change=_save_preference,
         args=("title_model",),
         disabled=disabled or mode == TITLE_MODE_OFF,
+        help="Uses your OpenAI key, after OpenAI and Local runs alike.",
     )
     if mode == TITLE_MODE_OFF:
         return
     per_hour = titles.estimate_cost_per_hour(model)
-    cost = ""
     if per_hour:
-        cost = f" About {usage.format_usd(per_hour)} per hour of recording."
-    st.caption(
-        f"Uses your OpenAI key, after OpenAI and Local runs alike.{cost} Counted "
-        "in the run's cost."
-    )
+        st.caption(
+            f"About {usage.format_usd(per_hour)} per hour of recording, added to "
+            "the run's cost."
+        )
     if not resolve_openai_key():
         st.warning("An AI title needs an OpenAI API key.")
 
@@ -1050,7 +1046,7 @@ def render_visual_options(
         return None
 
     enabled = st.checkbox(
-        "🖥️ Describe what's on screen (slides, diagrams, code)",
+        ":material/desktop_windows: Describe what's on screen (slides, diagrams, code)",
         value=False,
         disabled=disabled,
         help=(
@@ -1782,8 +1778,9 @@ def _describe_cost(cost: dict[str, Any]) -> str:
         cost: The run's cost from :func:`_run_cost`.
 
     Returns:
-        E.g. ``💵 $0.0071 — transcription 1 request, 0:56 of audio, 1,210 → 240
-        tokens; screenshots 4 described, 2,580 → 190 tokens``.
+        E.g. ``:material/payments: $0.0071 — transcription 1 request, 0:56 of
+        audio, 1,210 → 240 tokens; screenshots 4 described, 2,580 → 190
+        tokens``.
     """
     parts = []
     transcription = cost.get("transcription")
@@ -1819,7 +1816,8 @@ def _describe_cost(cost: dict[str, Any]) -> str:
             "transcribed, the rest left out"
         )
     total = usage.format_usd(cost["cost_usd"], cost.get("estimated", False))
-    text = f"💵 {total} — " + "; ".join(parts) if parts else f"💵 {total}"
+    icon = ":material/payments:"
+    text = f"{icon} {total} — " + "; ".join(parts) if parts else f"{icon} {total}"
     if cost.get("partial"):
         text += " — spent so far, not saved to history."
         if transcription:
@@ -1842,7 +1840,7 @@ def render_results(disabled: bool = False) -> None:
         disabled: True while a job runs — editing the preview is a widget
             change, which would stop the job.
     """
-    st.subheader("📄 Result")
+    st.subheader(":material/description: Result")
     transcript_path: Path | None = st.session_state.transcript_path
     if not transcript_path or not transcript_path.exists():
         st.info("The transcript will appear here after you run a transcription.")
@@ -1856,13 +1854,13 @@ def render_results(disabled: bool = False) -> None:
         )
     elapsed: float | None = st.session_state.elapsed_seconds
     if elapsed is not None:
-        st.caption(f"⏱️ Finished in {_format_length(elapsed)}")
+        st.caption(f":material/timer: Finished in {_format_length(elapsed)}")
     cost: dict[str, Any] | None = st.session_state.get("run_cost")
     if cost is not None:
         st.caption(_describe_cost(cost))
     title: str | None = st.session_state.get("run_title")
     if title:
-        st.caption(f"🏷️ AI title: {title}")
+        st.caption(f":material/label: AI title: {title}")
 
     st.text_area(
         "Transcript preview:",
@@ -1872,23 +1870,25 @@ def render_results(disabled: bool = False) -> None:
     )
     filename: str | None = st.session_state.original_filename
     stem = _download_stem(filename, title) if filename else transcript_path.stem
-    st.download_button(
-        label="📥 Download Transcript",
-        data=transcript_path.read_bytes,
-        file_name=f"{stem}.txt",
-        mime="text/plain",
-        on_click="ignore",
-    )
-
     srt_path: Path | None = st.session_state.srt_path
-    if srt_path and srt_path.exists():
+    with st.container(horizontal=True):
         st.download_button(
-            label="📥 Download Subtitles (.srt)",
-            data=srt_path.read_bytes,
-            file_name=f"{stem}.srt",
+            label="Transcript (.txt)",
+            icon=":material/download:",
+            data=transcript_path.read_bytes,
+            file_name=f"{stem}.txt",
             mime="text/plain",
             on_click="ignore",
         )
+        if srt_path and srt_path.exists():
+            st.download_button(
+                label="Subtitles (.srt)",
+                icon=":material/download:",
+                data=srt_path.read_bytes,
+                file_name=f"{stem}.srt",
+                mime="text/plain",
+                on_click="ignore",
+            )
 
 
 def _download_stem(filename: str, title: str | None) -> str:
@@ -1987,8 +1987,7 @@ def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
     else:
         with_timestamps = False
         st.caption(
-            "ℹ️ Exact timestamps & subtitles are available only with the "
-            "whisper-1 model."
+            "Exact timestamps & subtitles are available only with the whisper-1 model."
         )
     return provider, model, with_timestamps
 
@@ -2012,15 +2011,16 @@ def render_resume_hint(
     if saved:
         what = "this stretch of the recording" if span else "this recording"
         st.caption(
-            f"↻ {saved} part(s) of an unfinished run of {what} are saved — "
-            "Start sends only the rest."
+            f":material/restore: {saved} part(s) of an unfinished run of {what} "
+            "are saved — Start sends only the rest."
         )
     elif span and transcribe.saved_parts_within(digest, model, span):
         # Saved for the whole recording or another stretch: reused only where
         # the part boundaries come out the same, which a run alone can tell.
         st.caption(
-            "↻ An unfinished run of this recording left saved parts — Start "
-            "reuses those whose boundaries match this stretch and sends the rest."
+            ":material/restore: An unfinished run of this recording left saved "
+            "parts — Start reuses those whose boundaries match this stretch and "
+            "sends the rest."
         )
 
 
@@ -2259,7 +2259,8 @@ def _choose_from_folder(disabled: bool) -> ChosenFile | None:
     # click that lands together with Start must not open it in the job's run.
     if st.session_state.pop("pick_pending", False) and not disabled:
         _pick_recording()
-    field, browse = st.columns([2, 1], vertical_alignment="bottom")
+    # 5:3, not 2:1: "Browse…" with its icon wrapped onto two lines at 1320 px.
+    field, browse = st.columns([5, 3], vertical_alignment="bottom")
     with field:
         st.text_input(
             "Recordings folder",
@@ -2269,7 +2270,7 @@ def _choose_from_folder(disabled: bool) -> ChosenFile | None:
             placeholder="e.g. C:\\Users\\you\\Videos",
             help=(
                 "The folder your recordings are saved in (OBS, Teams, a phone's "
-                "folder), as a full path — or use **📂 Browse…** to find one "
+                "folder), as a full path — or use **Browse…** to find one "
                 "recording in this computer's own file window. Pasting the path of "
                 "one recording works too (Explorer: Shift + right-click it → "
                 "*Copy as path*). Remembered for next time."
@@ -2277,8 +2278,9 @@ def _choose_from_folder(disabled: bool) -> ChosenFile | None:
         )
     with browse:
         st.button(
-            "📂 Browse…",
+            "Browse…",
             key="pick_file",
+            icon=":material/folder_open:",
             on_click=_request_pick,
             disabled=disabled,
             width="stretch",
@@ -2346,13 +2348,22 @@ def _choose_from_folder(disabled: bool) -> ChosenFile | None:
             "This recording has changed on disk since it was prepared — it may "
             "still be being recorded. The audio and result below are from before."
         )
-        st.button("↻ Load it again", on_click=_forget_source, disabled=disabled)
+        st.button(
+            "Load it again",
+            icon=":material/refresh:",
+            on_click=_forget_source,
+            disabled=disabled,
+        )
     st.caption(f"{recordings.summary(path)} · read from disk, not uploaded")
     return source_id, path.name, lambda: path, version
 
 
 def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
     """Render the main transcription workflow: upload, prepare, transcribe.
+
+    Each step is a bordered card — the recording, its audio, the transcription
+    settings with Start and the run's progress — and the result is a card of
+    its own on the right.
 
     Returns:
         The container under the Start button, where a requested job draws its
@@ -2363,10 +2374,13 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
     running = st.session_state.job is not None
     job_area = None
     params = None
-    left, right = st.columns([2, 3])
+    # 5:6, not 2:3: the source and the engine choices each fit on one line.
+    left, right = st.columns([5, 6], gap="medium")
 
     with left:
-        chosen = _choose_source(running)
+        with st.container(border=True):
+            st.subheader(":material/counter_1: Recording")
+            chosen = _choose_source(running)
 
         if chosen:
             source_id, name, obtain, version = chosen
@@ -2376,65 +2390,78 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
             is_audio = extension in AUDIO_FORMATS
             source_type = "audio" if is_audio else "video"
 
-            st.subheader("1️⃣ Audio")
-            prepare_audio(name, is_audio, obtain)
+            with st.container(border=True):
+                st.subheader(":material/counter_2: Audio")
+                prepare_audio(name, is_audio, obtain)
 
-            audio_path: Path | None = st.session_state.audio_path
-            span, stretch_ok = render_audio(
-                st.session_state.preview_path, audio_path, disabled=running
-            )
-            if not is_audio and audio_path and audio_path.exists():
-                st.download_button(
-                    label="📥 Download extracted audio (WAV)",
-                    # A callable is read only on click, not on every rerun.
-                    data=audio_path.read_bytes,
-                    file_name=audio_path.name,
-                    mime="audio/wav",
-                    on_click="ignore",
+                audio_path: Path | None = st.session_state.audio_path
+                span, stretch_ok = render_audio(
+                    st.session_state.preview_path, audio_path, disabled=running
                 )
+                if not is_audio and audio_path and audio_path.exists():
+                    st.download_button(
+                        label="Download extracted audio (WAV)",
+                        icon=":material/download:",
+                        # Rarely needed: a link-like button, not a third box.
+                        type="tertiary",
+                        # A callable is read only on click, not on every rerun.
+                        data=audio_path.read_bytes,
+                        file_name=audio_path.name,
+                        mime="audio/wav",
+                        on_click="ignore",
+                    )
 
             if st.session_state.audio_path:
-                st.subheader("2️⃣ Transcription")
-                provider, model, with_timestamps = render_engine_options(running)
-                visual = render_visual_options(source_type, disabled=running, span=span)
-                render_resume_hint(provider, model, span)
-                params = {
-                    "provider": provider,
-                    "model": model,
-                    "with_timestamps": with_timestamps,
-                    "source_type": source_type,
-                    "visual": visual,
-                    "span": span,
-                }
-
-                st.button(
-                    "Start Transcription",
-                    type="primary",
-                    disabled=running or not stretch_ok,
-                    on_click=_request_job,
-                )
-                if _owns_job():
-                    # The one control left enabled during a run. Not while an
-                    # earlier run's thread is still finishing (toolbar Stop):
-                    # that one is already stopping.
-                    st.button(
-                        "⏹ Stop",
-                        key="stop_job",
-                        on_click=_request_stop,
-                        help=(
-                            "Stops after the part in progress: a part already sent "
-                            "to OpenAI is paid for either way, so it is finished "
-                            "and kept, and Start later sends only the rest."
-                        ),
+                with st.container(border=True):
+                    st.subheader(":material/counter_3: Transcription")
+                    provider, model, with_timestamps = render_engine_options(running)
+                    visual = render_visual_options(
+                        source_type, disabled=running, span=span
                     )
-                    st.caption(
-                        "⏹ stops after the part in progress (it is kept) — "
-                        "usually within a minute."
-                    )
-                job_area = st.container()
-                render_run_notices()
+                    render_resume_hint(provider, model, span)
+                    params = {
+                        "provider": provider,
+                        "model": model,
+                        "with_timestamps": with_timestamps,
+                        "source_type": source_type,
+                        "visual": visual,
+                        "span": span,
+                    }
 
-    with right:
+                    owns_job = _owns_job()
+                    with st.container(horizontal=True):
+                        st.button(
+                            "Start Transcription",
+                            type="primary",
+                            icon=":material/play_arrow:",
+                            disabled=running or not stretch_ok,
+                            on_click=_request_job,
+                        )
+                        if owns_job:
+                            # The one control left enabled during a run. Not while
+                            # an earlier run's thread is still finishing (toolbar
+                            # Stop): that one is already stopping.
+                            st.button(
+                                "Stop",
+                                key="stop_job",
+                                icon=":material/stop:",
+                                on_click=_request_stop,
+                                help=(
+                                    "Stops after the part in progress: a part "
+                                    "already sent to OpenAI is paid for either "
+                                    "way, so it is finished and kept, and Start "
+                                    "later sends only the rest."
+                                ),
+                            )
+                    if owns_job:
+                        st.caption(
+                            ":material/stop: stops after the part in progress (it "
+                            "is kept) — usually within a minute."
+                        )
+                    job_area = st.container()
+                    render_run_notices()
+
+    with right, st.container(border=True):
         render_results(disabled=running)
     return job_area, params
 
@@ -2501,7 +2528,7 @@ def _retitle(record_id: int) -> None:
     title = full["title"]
     try:
         title, records = titles.make_title(full["transcript"], api_key, model)
-        message = ("success", f"🏷️ New title: {title}")
+        message = ("success", f"New title: {title}")
     except AppError as exc:
         records = list(getattr(exc, "usage_records", None) or [])
         message = ("warning", f"No new title: {exc}")
@@ -2522,7 +2549,7 @@ def _retitle(record_id: int) -> None:
 
 
 def _render_retitle(record_id: int, has_title: bool) -> None:
-    """Offer a (new) AI title for a History entry, and say how the last try went.
+    """Offer a (new) AI title for a History entry (its button only).
 
     Args:
         record_id: The transcription id.
@@ -2535,8 +2562,9 @@ def _render_retitle(record_id: int, has_title: bool) -> None:
     if per_hour:
         cost = f" — about {usage.format_usd(per_hour)} per hour of recording"
     st.button(
-        "🏷️ New title" if has_title else "🏷️ Make a title",
+        "New title" if has_title else "Make a title",
         key=f"hist_title_{record_id}",
+        icon=":material/label:",
         on_click=_request_retitle,
         args=(record_id,),
         disabled=not has_key,
@@ -2547,8 +2575,18 @@ def _render_retitle(record_id: int, has_title: bool) -> None:
             else "Needs an OpenAI API key (sidebar or `.env`)."
         ),
     )
-    # Kept while the entry stays open (a second click of a double click reruns
-    # the list and would otherwise wipe it); closing the entry clears it.
+
+
+def _render_retitle_message(record_id: int) -> None:
+    """Say how the last title request for a History entry went, if there was one.
+
+    Drawn under the entry's row of buttons, not inside it. Kept while the entry
+    stays open (a second click of a double click reruns the list and would
+    otherwise wipe it); closing the entry clears it.
+
+    Args:
+        record_id: The transcription id.
+    """
     message = st.session_state.get(f"hist_title_msg_{record_id}")
     if message:
         getattr(st, message[0])(message[1])
@@ -2563,7 +2601,7 @@ def render_history_tab() -> None:
     transcript is read from the database only while its entry is open, instead
     of all of them on every click anywhere in the app.
     """
-    st.subheader("📚 Transcription history")
+    st.subheader(":material/history: Transcription history")
     records = db.list_transcriptions()
     if not records:
         st.info("No transcriptions yet. Run one in the Transcribe tab.")
@@ -2579,11 +2617,13 @@ def render_history_tab() -> None:
             with st.spinner("Writing a title…", show_time=True):
                 _retitle(pending)
             record = db.get_transcription(pending) or record
-        flag = "⏱️ " if record["with_timestamps"] else ""
         name = (
             titles.display_name(_safe_stem(record["filename"]), record["title"], mode)
             or record["filename"]
         )
+        # Marks a transcript with timestamps (and subtitles). In the label, not
+        # the expander's `icon=`, which would replace its open/close arrow.
+        flag = ":material/timer: " if record["with_timestamps"] else ""
         label = f"{flag}{name} · {record['model']} · {record['created_at']}"
         if record["id"] == pending:
             reopen.add((pending, label))
@@ -2626,30 +2666,38 @@ def render_history_tab() -> None:
                 height=200,
                 key=f"hist_txt_{record['id']}",
             )
-            st.download_button(
-                label="📥 Download Transcript",
-                data=full["transcript"],
-                file_name=f"{base_name}.txt",
-                mime="text/plain",
-                key=f"hist_dl_txt_{record['id']}",
-                on_click="ignore",
-            )
-            if full["srt"]:
+            with st.container(horizontal=True):
                 st.download_button(
-                    label="📥 Download Subtitles (.srt)",
-                    data=full["srt"],
-                    file_name=f"{base_name}.srt",
+                    label="Transcript (.txt)",
+                    icon=":material/download:",
+                    data=full["transcript"],
+                    file_name=f"{base_name}.txt",
                     mime="text/plain",
-                    key=f"hist_dl_srt_{record['id']}",
+                    key=f"hist_dl_txt_{record['id']}",
                     on_click="ignore",
                 )
+                if full["srt"]:
+                    st.download_button(
+                        label="Subtitles (.srt)",
+                        icon=":material/download:",
+                        data=full["srt"],
+                        file_name=f"{base_name}.srt",
+                        mime="text/plain",
+                        key=f"hist_dl_srt_{record['id']}",
+                        on_click="ignore",
+                    )
+                if mode != TITLE_MODE_OFF:
+                    _render_retitle(record["id"], has_title=bool(full["title"]))
             if mode != TITLE_MODE_OFF:
-                _render_retitle(record["id"], has_title=bool(full["title"]))
-            # A callback, not `if st.button(...)` + a fragment-scoped rerun: the
-            # row is gone before the fragment redraws, in any kind of run.
+                _render_retitle_message(record["id"])
+            # Under the row, not in it, so a click meant for a download cannot
+            # land on it. A callback, not `if st.button(...)` + a fragment-scoped
+            # rerun: the row is gone before the fragment redraws, in any kind of
+            # run.
             st.button(
-                "🗑️ Delete",
+                "Delete",
                 key=f"hist_del_{record['id']}",
+                icon=":material/delete:",
                 on_click=db.delete_transcription,
                 args=(record["id"],),
             )
@@ -2687,10 +2735,14 @@ def main() -> None:
     running = st.session_state.job is not None
     render_sidebar(disabled=running)
 
-    st.title("📝 Video & Audio Transcription")
-    st.write("Transcribe video or audio — OpenAI API or a local offline Whisper model")
+    st.title("Video & Audio Transcription")
+    st.caption(
+        "Transcribe video or audio — OpenAI API or a local offline Whisper model"
+    )
 
-    tab_transcribe, tab_history = st.tabs(["🎙️ Transcribe", "📚 History"])
+    tab_transcribe, tab_history = st.tabs(
+        [":material/mic: Transcribe", ":material/history: History"]
+    )
     with tab_transcribe:
         job_area, params = render_transcribe_tab()
     with tab_history:
@@ -2698,8 +2750,8 @@ def main() -> None:
     with st.sidebar:
         render_working_files(disabled=running)
 
-    st.markdown("---")
-    st.markdown("Made with ❤️ by Marko A")
+    st.divider()
+    st.caption("Made with ❤️ by Marko A")
     _execute_job(job_area, params)
 
 

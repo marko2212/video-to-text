@@ -512,7 +512,7 @@ def test_the_cost_of_a_run_is_shown_and_saved(monkeypatch):
     _start(test)
 
     assert any(
-        "💵 $0.06" in c.value and "12,000 → 3,000 tokens" in c.value
+        ":material/payments: $0.06" in c.value and "12,000 → 3,000 tokens" in c.value
         for c in test.caption
     )
     [row] = db.list_transcriptions()
@@ -542,7 +542,8 @@ def test_a_partial_run_shows_what_it_has_spent_so_far(monkeypatch):
     _start(test)
 
     assert any(
-        "💵 $0.04" in c.value and "spent so far, not saved to history" in c.value
+        ":material/payments: $0.04" in c.value
+        and "spent so far, not saved to history" in c.value
         for c in test.caption
     )
     assert db.list_transcriptions() == []

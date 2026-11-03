@@ -393,7 +393,7 @@ async function recordVideo(end) {
   await hold(600); // the progress under Start
   frames.every = 400;
   await squeeze(2.5, async () => {
-    await waitText("Download Transcript", 600000);
+    await waitText("Transcript (.txt)", 600000);
     await idle();
   });
   frames.every = 100;
@@ -439,7 +439,7 @@ if (mode === "home") {
   await idle();
   await clickText("button", "Start Transcription");
   await sleep(2000);
-  await waitText("Download Transcript", 600000);
+  await waitText("Transcript (.txt)", 600000);
   await idle();
   await fullHeight();
   await maskFolder();

@@ -108,7 +108,9 @@ def test_an_openai_run_is_named_and_the_title_counted(
     assert row["cost_usd"] == pytest.approx(0.061)
     saved = json.loads(row["usage_json"])
     assert saved["title"]["input_tokens"] == 3_000
-    assert any("🏷️ AI title: Budget review" in c.value for c in test.caption)
+    assert any(
+        ":material/label: AI title: Budget review" in c.value for c in test.caption
+    )
     assert any("title 3,000 → 5 tokens" in c.value for c in test.caption)
 
 
@@ -314,7 +316,7 @@ def test_a_saved_transcript_gets_a_title_from_history(title_requests):
     _prefer(config.TITLE_MODE_REPLACE)
     row_id = _saved_row()
     test = _open_entry(row_id)
-    assert _title_button(test).label == "🏷️ Make a title"
+    assert _title_button(test).label == "Make a title"
 
     _click_title(test)
 
@@ -329,7 +331,7 @@ def test_a_saved_transcript_gets_a_title_from_history(title_requests):
     # unless it is drawn open).
     assert test.expander[0].label.startswith("Budget review · ")
     assert any("New title: Budget review" in s.value for s in test.success)
-    assert _title_button(test).label == "🏷️ New title"
+    assert _title_button(test).label == "New title"
 
 
 def test_a_second_click_right_after_a_title_is_not_paid_again(title_requests):
@@ -402,7 +404,7 @@ def test_history_offers_no_title_while_titles_are_off(title_requests):
     test = _open_entry(row_id)
 
     assert _title_button(test) is None
-    assert any(b.label == "🗑️ Delete" for b in test.button)
+    assert any(b.label == "Delete" for b in test.button)
 
 
 def test_without_a_key_the_history_title_button_is_disabled(monkeypatch):

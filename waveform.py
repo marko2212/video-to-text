@@ -30,10 +30,11 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
-# Colours of the bars: the stretch that will be transcribed (Streamlit's red)
-# and the stretch left out, grey and faint, under a light shade. The background
-# stays transparent, so the picture suits the light and the dark theme alike.
-_KEPT = (255, 75, 75, 255)
+# Colours of the bars: the stretch that will be transcribed (the theme's indigo
+# accent, #6366F1 in .streamlit/config.toml) and the stretch left out, grey and
+# faint, under a light shade. The background stays transparent, so the picture
+# suits the light and the dark theme alike.
+_KEPT = (99, 102, 241, 255)
 _LEFT_OUT = (150, 150, 150, 110)
 _SHADE = (128, 128, 128, 40)
 # Bars grow with loudness to this power, so speech and pauses both stay visible.

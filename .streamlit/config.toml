@@ -10,3 +10,48 @@ address = "localhost"
 [browser]
 # Do not send usage statistics to Streamlit.
 gatherUsageStats = false
+
+[client]
+# No "Deploy" button: the app is run locally, never deployed to Streamlit's cloud.
+toolbarMode = "minimal"
+
+# The look: an indigo accent instead of Streamlit's red, the system's own font,
+# bordered fields, smaller headings and a lighter sidebar with a border. Light
+# and dark are both set, so the menu's theme choice (and "use system setting")
+# keeps working. waveform.py draws the kept stretch in the dark theme's accent
+# (#6366F1), which reads on both backgrounds; change it there too.
+[theme]
+font = "Segoe UI, system-ui, -apple-system, sans-serif"
+headingFont = "Segoe UI, system-ui, -apple-system, sans-serif"
+headingFontSizes = ["2rem", "1.5rem", "1.25rem"]
+headingFontWeights = [700, 600, 600]
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+showWidgetBorder = true
+showSidebarBorder = true
+
+[theme.light]
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F5F9"
+textColor = "#1E2230"
+borderColor = "#E2E5ED"
+linkColor = "#4338CA"
+codeTextColor = "#4338CA"
+
+[theme.light.sidebar]
+backgroundColor = "#F8F9FC"
+secondaryBackgroundColor = "#FFFFFF"
+
+[theme.dark]
+primaryColor = "#6366F1"
+backgroundColor = "#111319"
+secondaryBackgroundColor = "#1C1F28"
+textColor = "#E6E8EF"
+borderColor = "#2B2F3B"
+linkColor = "#A5B4FC"
+codeTextColor = "#A5B4FC"
+
+[theme.dark.sidebar]
+backgroundColor = "#161922"
+secondaryBackgroundColor = "#20242F"

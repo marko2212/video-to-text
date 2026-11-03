@@ -175,7 +175,7 @@ def test_a_recording_that_changes_on_disk_keeps_the_result_and_says_so(
 
     assert test.session_state.transcript_path == transcript
     assert any("changed on disk" in w.value for w in test.warning)
-    reload = next(b for b in test.button if b.label == "↻ Load it again")
+    reload = next(b for b in test.button if b.label == "Load it again")
 
     reload.click().run()
 
@@ -304,7 +304,7 @@ def test_a_recording_that_grows_during_the_run_leaves_no_saved_parts(
     assert len(db.list_transcriptions()) == 1
 
 
-# --- 📂 Browse… --------------------------------------------------------------
+# --- Browse… -----------------------------------------------------------------
 
 
 def _choose_with_window(test: AppTest) -> AppTest:
