@@ -469,7 +469,7 @@ upload (identified by file_id, saved to uploads/)
     it needs a language model or a dictionary, and the observed failure was the script.
     Not caught: a Latin title in the wrong Latin language.
 - **Titles for saved rows come from a History button, and cost is added to the row**
-  *(2026-09-29)*. "🏷️ Make a title" / "🏷️ New title" in an open entry, only while the
+  *(2026-09-29)*. "Make a title" / "New title" in an open entry, only while the
   mode is on (Off shows no titles), disabled without a key. The request's usage joins
   the row's `title` part of `usage_json` and `cost_usd` (`usage.add_to_cost`) — also
   when no title came back, since it was paid. Rows saved before costs were recorded
@@ -554,7 +554,7 @@ upload (identified by file_id, saved to uploads/)
   unlocked ~2 s later, the restart re-sent nothing already finished. A background
   worker thread (the "M" option for R05) was not needed: with checkpoints, a stopped
   or reloaded run costs only the chunk in flight.
-- **A visible ⏹ Stop button, the same mechanism as the toolbar's Stop**
+- **A visible Stop button, the same mechanism as the toolbar's Stop**
   *(2026-09-30)*. The owner did not notice the toolbar's Stop. The button, under
   Start, is the one control left enabled during a run (only in the run that owns the
   job — not while an earlier run's thread is already stopping), with a caption that it
@@ -582,7 +582,7 @@ upload (identified by file_id, saved to uploads/)
 - **Transcription checkpoints are deleted only after the history row is written** —
   in the app, not in the pipeline, for the same reason: a run stopped between writing
   the transcript and saving it must be able to finish without paying again.
-- **"Clean temporary files" sits in the sidebar, in a "🧹 Working files" section** that
+- **"Clean temporary files" sits in the sidebar, in a "Working files" section** that
   says how much space `temp/` and `uploads/` take *(2026-10-03, the owner's call)*.
   With the one-day cleanup it is rarely needed; it is maintenance, not a transcription
   step; and under Start/Stop it was a click away from deleting the saved parts of
@@ -629,7 +629,7 @@ upload (identified by file_id, saved to uploads/)
   of 1,200 equal stretches (pydub: 0.1 s to read a 75-minute WAV, 0.13 s for the
   buckets; other formats go through one ffmpeg conversion to a mono 16 kHz WAV and are
   never decoded at their own rate — a two-hour stereo file would take over a gigabyte)
-  and draws them with Pillow: the part to transcribe in Streamlit's red, the rest grey
+  and draws them with Pillow: the part to transcribe in the theme's indigo, the rest grey
   under a light shade, on a transparent background so both themes work; the bars are
   scaled to the 98th percentile, not to the loudest moment (one clap would flatten the
   rest). The control is a plain `st.slider` of two `datetime.time` values (`H:mm:ss`, a
@@ -693,7 +693,7 @@ upload (identified by file_id, saved to uploads/)
   like an upload's `file_id`; a recording still being written (OBS, a OneDrive sync)
   then had a new identity on every click, which wiped a finished transcript from the
   page and extracted the video again. Now the size and mtime at the moment of choosing
-  are kept (`source_version`), and a later change shows a warning with "↻ Load it
+  are kept (`source_version`), and a later change shows a warning with "Load it
   again". The checkpoint and screenshot-cache digests are taken when the run starts
   and reused at its end, so a file that grows during the run does not leave its saved
   parts behind.
@@ -706,7 +706,7 @@ upload (identified by file_id, saved to uploads/)
   a chosen file that disappeared says so instead of being forgotten silently (a Start at
   that moment did nothing); a path pasted in another letter case finds its file
   (`os.path.normcase`).
-- **📂 Browse… opens the computer's own file window, in a process of its own**
+- **Browse… opens the computer's own file window, in a process of its own**
   *(2026-09-30, the owner: recordings live in different folders, and pasting paths is
   clumsy)*. The app runs on the owner's machine, so the server can show Windows' *Open*
   window (tkinter's `askopenfilename`, which is the native dialog); the chosen file's
@@ -725,7 +725,9 @@ upload (identified by file_id, saved to uploads/)
     several fixed folders: it goes anywhere, looks like every other program, and needs
     no dependency (tkinter ships with the uv Python). Only where the folder source is
     offered (loopback), since the window opens on the machine that runs the app.
-  - Labelled "📂 Browse…": "Choose file…" wrapped onto two lines at a 1440 px window.
+  - Labelled "Browse…" (with a folder icon): "Choose file…" wrapped onto two lines at a
+    1440 px window; with the icon, "Browse…" itself wrapped at 1320 px until its column
+    got wider (5:3 instead of 2:1).
 - **The folder list's labels: length first, then name and creation time — nothing that
   changes while a file grows.** Streamlit 1.56 keeps a keyed selectbox's value as the
   *formatted label*, so labels hold no size or modification time (they would change on
@@ -767,6 +769,51 @@ upload (identified by file_id, saved to uploads/)
 - **CSS hack for the uploader label** — Streamlit prints the full list of 27 extensions; it
   is hidden and replaced with short text. The element to target is a **`<span>`** (not
   `<small>` — established by inspecting the DOM).
+- **The look: a theme in `.streamlit/config.toml` and Material icons instead of emoji,
+  still Streamlit** *(2026-10-30; the owner found the UI "a bit ugly" and asked whether
+  React would be worth it)*. React + FastAPI would not need two ports in use (FastAPI
+  serves the built bundle; two processes only while the frontend is developed), but it
+  means rewriting the 2,700-line UI and adding an API, a job worker, Stop and chunked
+  uploads; NiceGUI (Python, event-driven, one port) would also drop the rerun workarounds
+  in this section, in days rather than weeks. The theme was the cheap first step:
+  - an indigo accent instead of Streamlit's red (#4F46E5 light; #6366F1 dark, where
+    white text on the lighter indigo would be too faint), the system font (Segoe UI on
+    Windows, `system-ui` elsewhere: nothing is fetched from the internet, the app also
+    runs offline), bordered fields, smaller headings (h1 2rem), a lighter sidebar with a
+    border; `[theme.light]` and `[theme.dark]` are both set, so the menu's theme choice
+    and "use system setting" keep working; `client.toolbarMode = "minimal"` drops the
+    Deploy button;
+  - the UI's emoji (Windows draws them as colour pictures of uneven size) became
+    Material icons — `:material/…:` in headings, captions, tabs and History labels,
+    `icon=` on buttons — which take the text colour. A History entry with timestamps
+    carries `:material/timer:` in its label, not as the expander's `icon=`, which
+    replaces the open/close arrow (seen in a screenshot). The transcript's own markers
+    (🖥️, ⚠️, ⏭️) stay: they are part of the saved text and the downloads;
+  - `waveform.py` draws the kept stretch in #6366F1, which reads on both backgrounds.
+  What would change this: if the look is still not enough, or the rerun model's limits
+  (the locked page, a Stop that waits for the part in flight, uploads held in memory)
+  start to matter more — then NiceGUI before React.
+- **The layout: a bordered card per step, the result in a card of its own**
+  *(2026-10-30, after the theme; the owner: "okej kreni sada to sledeće")*. The theme
+  changed the colours, not the page — one long column of controls was the rest of what
+  looked untidy. Now:
+  - cards "1 Recording" (source, folder or upload), "2 Audio" (slider, sound, player)
+    and "3 Transcription" (engine, model, options, Start and Stop side by side, then the
+    run's progress and notices), and "Result" on the right; the columns are 5:6, not
+    2:3, so the engine choice fits on one line;
+  - the result's downloads in one row, labelled **Transcript (.txt)** and **Subtitles
+    (.srt)** with the download icon — "Download Transcript" and "Download Subtitles
+    (.srt)" did not fit side by side in the card and wrapped onto two rows; History uses
+    the same labels;
+  - the extracted WAV's download is a link-like (`tertiary`) button: rarely needed;
+  - in History the downloads and the title button share a row, and Delete stays alone
+    under it, so a click meant for a download cannot land on it (a confirmation is
+    still open in §5, P2); the title request's message is drawn under the row;
+  - the sidebar's `.env` tip went into the key field's help, and "uses your OpenAI key"
+    into the title model's help; the caption keeps only the price per hour.
+  Not done: a "More options" fold. The only optional block, on-screen context, already
+  shows its settings only when ticked, and a paid option folded away is easy to forget
+  while it is on.
 
 ### Data
 - **SQLite lives in `data/`, not `temp/`** — history **survives** "Clean temporary files"
@@ -889,8 +936,11 @@ upload (identified by file_id, saved to uploads/)
 - Upload **video** (16 formats) and **audio** (11 formats, incl. AMR); video audio is extracted automatically
 - **Or pick a recording from a folder on this computer** — read in place, no upload, no
   copy; for large files that an upload cannot hold in memory *(2026-09-29)*; found with
-  **📂 Browse…** in Windows' own file window, in any folder *(2026-09-30)*; each entry
+  **Browse…** in Windows' own file window, in any folder *(2026-09-30)*; each entry
   shows the recording's length *(2026-10-03)*
+- **A calmer look** — indigo theme (light and dark), system font, bordered fields, Material
+  icons instead of emoji, no Deploy button; a bordered card per step and for the result,
+  downloads in one row *(2026-10-30)*
 - **Audio player** before and after transcription, with **a picture of the sound and a
   slider to leave the start or the end of the recording out** of the run *(2026-10-20)*:
   only the chosen stretch is sent, described and paid for; its times stay the recording's
@@ -907,7 +957,7 @@ upload (identified by file_id, saved to uploads/)
   truncation at the output cap), checkpoints so a failed or stopped run resumes without
   paying again, partial transcripts clearly marked, one-sentence errors for a bad key
   or an empty balance, controls locked during a run with a watchdog after Stop, and a
-  visible ⏹ Stop button that stops after the part in progress *(2026-09-30)*
+  visible Stop button that stops after the part in progress *(2026-09-30)*
 - **Original script kept by default**; Serbian → Latin is opt-in (`SERBIAN_LATIN=true`)
   *(2026-09-25)*; one-off backfill script for saved records
 - **Playable previews** for AMR/WMA/AIFF, video and large files; fast History at 100+
@@ -1241,6 +1291,41 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ## 6. Journal
 
+### 2026-10-30 (part 4) — A card per step
+
+Asked whether red becoming blue was the only difference, the answer was no, but that the
+theme leaves the page's structure as it was; the owner then said to go ahead with the
+layout ("okej kreni sada to sledeće"). `render_transcribe_tab` now draws three bordered
+cards on the left (Recording, Audio, Transcription — Start and Stop in one row, the
+progress under them) and the result in a card on the right, at 5:6 instead of 2:3
+(§3 UI / flow). The first screenshots showed the two downloads wrapping onto two rows in
+the result card, so they became **Transcript (.txt)** and **Subtitles (.srt)** (also in
+History, `shoot.mjs` and the README). `_render_retitle` lost its message to
+`_render_retitle_message`, so History's row of buttons holds only buttons. Checked: ruff,
+365 tests (also without ffmpeg), screenshots of the demo instance in the light and the dark
+theme; the README screenshots and the demo GIF were retaken. Left uncommitted that evening,
+so the owner's other computer still showed red after a pull; committed with part 3 on
+2026-11-03 on "komituj i pušuj" (a `feat(ui)` commit for the code, tests and screenshot
+tool, a `docs` commit for README, screenshots and this file), after ruff and 365 tests
+without ffmpeg passed again. The README's last emoji label (🧹 Working files) went with it.
+
+### 2026-10-30 (part 3) — A calmer look: a theme and Material icons
+
+The owner found the Streamlit UI "a bit ugly" and asked whether React was worth it, given
+two services and two ports. Answer given: no two ports in use (FastAPI can serve the built
+React bundle), but a rewrite of the whole UI; first a theme, and NiceGUI before React if
+that is not enough. On "Probaj temu": `.streamlit/config.toml` got a theme (§3 UI / flow)
+and `toolbarMode = "minimal"`; `app.py`'s headings, tabs, captions and buttons swapped their
+emoji for Material icons; the waveform's kept stretch went from Streamlit red to the
+indigo; the Browse column went from 2:1 to 5:3, because "Browse…" with its icon wrapped
+onto two lines; the History timer went back into the label after the first screenshots
+showed the expander's `icon=` replacing its arrow. Tests that read labels (`Load it again`,
+`Make a title`, `Delete`, the cost and title captions) and the waveform colour follow the
+new text. Checked: ruff, 365 tests (also without ffmpeg, as CI runs them), and
+screenshots of a demo instance (`run.ps1`, scratch folders) in the light and the dark
+theme. The README screenshots and the demo GIF were retaken with the new look. Committed
+with part 4 (see there).
+
 ### 2026-10-30 (part 2) — The repo moved into the owner's workspace folder
 
 The owner keeps each project as a workspace folder with the repo inside and opens Claude
@@ -1260,7 +1345,7 @@ rendered with no exception. Unchanged: history rows keep the old `audio_path` (t
 is never read), and interrupted runs still resume (`checkpoint_dir` is keyed by the
 recording's SHA-256 and the model; `temp/` moved with the repo). Claude's memory for the
 project is keyed by folder, so it was copied to the workspace's key; sessions started in
-the old folder cannot be resumed. Not committed (docs only).
+the old folder cannot be resumed. Committed and pushed the same day (docs only).
 
 ### 2026-10-30 — The Desktop shortcut can be pinned to the taskbar; Streamlit 1.66 assessed
 
