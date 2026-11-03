@@ -21,6 +21,14 @@ class AudioProcessingError(AppError):
     """Raised when extracting or preparing audio fails (e.g. ffmpeg error)."""
 
 
+class FfmpegMissingError(AudioProcessingError):
+    """Raised when the ffmpeg program itself is not installed or not on PATH.
+
+    Without it Windows reports only "[WinError 2] The system cannot find the
+    file specified", which reads as if the recording were missing.
+    """
+
+
 class TranscriptionError(AppError):
     """Raised when the transcription pipeline or the OpenAI request fails."""
 

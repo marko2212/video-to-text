@@ -122,6 +122,13 @@ OPENAI_CONNECT_TIMEOUT_SECONDS: float = 10.0
 # Target audio parameters for transcription (mono, 16 kHz is plenty for speech).
 TARGET_CHANNELS: int = 1
 TARGET_SAMPLE_RATE: int = 16000
+# The programs that read every recording; any ffmpeg build brings both. Without
+# ffmpeg nothing can be prepared, without ffprobe the folder list shows no
+# lengths and on-screen context cannot read the video.
+FFMPEG_TOOLS: tuple[str, ...] = ("ffmpeg", "ffprobe")
+# The one-line Windows install the page and the README suggest (no admin
+# rights; winget puts both programs on PATH).
+FFMPEG_WINDOWS_INSTALL: str = "winget install --id Gyan.FFmpeg.Essentials -e"
 # Audio formats Chromium-based browsers cannot play. They, and every video, get
 # a small MP3 preview for the player instead of the raw file or the big WAV.
 BROWSER_UNPLAYABLE_AUDIO: set[str] = {"amr", "wma", "aiff", "aif"}

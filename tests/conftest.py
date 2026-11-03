@@ -31,6 +31,19 @@ def isolated_settings(tmp_path, monkeypatch):
     config.get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def ffmpeg_on_path(monkeypatch):
+    """Report ffmpeg and ffprobe as installed, so the page shows no warning.
+
+    CI has no ffmpeg and this machine does: without this, page tests that expect
+    no error box would pass here and fail there. Tests of the warning patch
+    ``audio.missing_tools`` again.
+    """
+    import audio
+
+    monkeypatch.setattr(audio, "missing_tools", lambda: [])
+
+
 @pytest.fixture
 def wav_file(tmp_path):
     """Write a 16-bit PCM WAV made of square-wave stretches, without ffmpeg.

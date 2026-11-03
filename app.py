@@ -2739,6 +2739,11 @@ def main() -> None:
     st.caption(
         "Transcribe video or audio — OpenAI API or a local offline Whisper model"
     )
+    missing = audio.missing_tools()
+    if missing:
+        # Without ffmpeg every recording fails with a bare "[WinError 2]", which
+        # reads as a missing file; say what is missing before anything is tried.
+        st.error(audio.missing_tools_message(missing))
 
     tab_transcribe, tab_history = st.tabs(
         [":material/mic: Transcribe", ":material/history: History"]

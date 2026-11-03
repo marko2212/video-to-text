@@ -8,16 +8,75 @@ imports Streamlit.
 """
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
 import ffmpeg
 
-from config import PREVIEW_BITRATE, TARGET_CHANNELS, TARGET_SAMPLE_RATE, get_settings
-from exceptions import AudioProcessingError
+from config import (
+    FFMPEG_TOOLS,
+    FFMPEG_WINDOWS_INSTALL,
+    PREVIEW_BITRATE,
+    TARGET_CHANNELS,
+    TARGET_SAMPLE_RATE,
+    get_settings,
+)
+from exceptions import AudioProcessingError, FfmpegMissingError
 from logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def missing_tools() -> list[str]:
+    """Return the ffmpeg programs this process cannot find on its PATH.
+
+    A process keeps the PATH it started with, so a program installed while the
+    app runs stays missing here until the app is started again.
+
+    Returns:
+        The names from :data:`config.FFMPEG_TOOLS` that are not found, in order.
+    """
+    return [tool for tool in FFMPEG_TOOLS if shutil.which(tool) is None]
+
+
+def missing_tools_message(missing: list[str]) -> str:
+    """Say which programs are missing and how to install them, for the page.
+
+    Args:
+        missing: Program names, as :func:`missing_tools` returns them.
+
+    Returns:
+        A Markdown sentence or three naming the programs, the Windows install
+        command and the restart the app needs afterwards.
+    """
+    names = " and ".join(f"**{name}**" for name in missing)
+    verb = "was" if len(missing) == 1 else "were"
+    return (
+        f"{names} {verb} not found on this computer, and the app needs ffmpeg "
+        f"and ffprobe to read recordings. Install them — on Windows: "
+        f"`{FFMPEG_WINDOWS_INSTALL}` — then close the app and start it again "
+        "(README → Installation → Install ffmpeg)."
+    )
+
+
+def _run(stream: Any) -> None:
+    """Run an ffmpeg command, saying so plainly when ffmpeg is not installed.
+
+    Args:
+        stream: The ffmpeg-python output stream to run.
+
+    Raises:
+        FfmpegMissingError: If the ffmpeg program cannot be started at all.
+        ffmpeg.Error: If ffmpeg ran and failed (its stderr is captured).
+    """
+    try:
+        ffmpeg.run(stream, overwrite_output=True, capture_stderr=True)
+    except FileNotFoundError as exc:
+        # Raised by subprocess before ffmpeg starts; a missing input file is
+        # reported by ffmpeg itself, as ffmpeg.Error.
+        logger.error("ffmpeg could not be started: %s", exc)
+        raise FfmpegMissingError(missing_tools_message(["ffmpeg"])) from exc
 
 
 def safe_name(filename: str) -> str:
@@ -76,6 +135,7 @@ def to_wav(
         Path to the written WAV file.
 
     Raises:
+        FfmpegMissingError: If ffmpeg is not installed.
         AudioProcessingError: If ffmpeg fails to decode or convert the input.
     """
     if output_path is None:
@@ -95,7 +155,7 @@ def to_wav(
             ac=TARGET_CHANNELS,
             ar=TARGET_SAMPLE_RATE,
         )
-        ffmpeg.run(stream, overwrite_output=True, capture_stderr=True)
+        _run(stream)
     except ffmpeg.Error as exc:
         detail = exc.stderr.decode(errors="replace") if exc.stderr else str(exc)
         logger.error("ffmpeg failed for %s: %s", input_path, detail)
@@ -120,6 +180,7 @@ def to_preview(input_path: Path, output_path: Path) -> Path:
         Path to the written MP3.
 
     Raises:
+        FfmpegMissingError: If ffmpeg is not installed.
         AudioProcessingError: If ffmpeg fails to decode or encode the input.
     """
     try:
@@ -135,7 +196,7 @@ def to_preview(input_path: Path, output_path: Path) -> Path:
             ar=TARGET_SAMPLE_RATE,
             vn=None,
         )
-        ffmpeg.run(stream, overwrite_output=True, capture_stderr=True)
+        _run(stream)
     except ffmpeg.Error as exc:
         detail = exc.stderr.decode(errors="replace") if exc.stderr else str(exc)
         logger.error("ffmpeg preview failed for %s: %s", input_path, detail)
