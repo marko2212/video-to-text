@@ -54,9 +54,9 @@ The recordings, the transcripts and the older history entries below are made up 
 
 ## Requirements 🛠️
 
-* **Python:** Version 3.12 or higher. (`uv` will fetch a matching interpreter automatically if you don't have one.)
+* **Python:** Version 3.12 or higher. The repo pins **3.13** in `.python-version` — the version tested and used day to day — and `uv` fetches it automatically if you don't have it.
 * **uv:** Used to manage the virtual environment and dependencies. Install from [the uv docs](https://docs.astral.sh/uv/getting-started/installation/).
-* **ffmpeg:** This external tool **must be installed and accessible** for the application to work. See installation instructions below. (**5.1 or newer** is recommended — older builds still work, but the on-screen context feature falls back to a deprecated flag.)
+* **ffmpeg:** This external tool (with `ffprobe`, which comes with it) **must be installed and accessible** for the application to work. See installation instructions below. (**5.1 or newer** is recommended — older builds still work, but the on-screen context feature falls back to a deprecated flag.)
 * **OpenAI API Key (optional):** only needed for the OpenAI engine. The local offline engine needs no key. You might incur costs depending on your OpenAI usage.
 * **Python Packages:** Declared in `pyproject.toml` and locked in `uv.lock` — installed via `uv sync` (`uv sync --extra local` for the offline backend; see the note in [Offline mode](#offline-mode-no-api-key-)).
 
@@ -71,7 +71,22 @@ The recordings, the transcripts and the older history entries below are made up 
 
 2. **Install ffmpeg:** `ffmpeg` must be installed system-wide and accessible via your system's `PATH`.
 
-    * **Windows:**
+    * **Windows — one command** (Windows 10/11; no administrator rights needed). In PowerShell or Command Prompt:
+
+        ```powershell
+        winget install --id Gyan.FFmpeg.Essentials -e
+        ```
+
+        winget puts `ffmpeg` and `ffprobe` on your `PATH`. Then **open a new terminal** and check both:
+
+        ```powershell
+        ffmpeg -version
+        ffprobe -version
+        ```
+
+        A terminal that was already open — and the app, if it was already running — keeps the old `PATH`: close it and start it again. If the app cannot find ffmpeg, it says so in a red box at the top of the page.
+
+    * **Windows — by hand** (if winget is not available):
         1. Go to the official FFmpeg download page: [https://ffmpeg.org/download.html](https://ffmpeg.org/download.html)
         2. Navigate to the Windows builds section (often linked under "Windows EXE Files"). Recommended sources are `gyan.dev` or `BtbN`.
         3. Download one of the builds (e.g., the "essentials" build from gyan.dev is usually sufficient). It will likely be a `.zip` or `.7z` archive.
@@ -84,7 +99,7 @@ The recordings, the transcripts and the older history entries below are made up 
             * Click "New".
             * Enter the **full path to the `bin` folder** inside your ffmpeg directory (e.g., `C:\ffmpeg\bin`).
             * Click "OK" on all open windows to save the changes.
-        7. **Verify:** Open a **new** Command Prompt or PowerShell window (important!) and type `ffmpeg -version`. If it shows version information, you're set.
+        7. **Verify:** Open a **new** Command Prompt or PowerShell window (important!) and type `ffmpeg -version`, then `ffprobe -version`. If both show version information, you're set (restart the app if it was running).
 
     * **macOS (using Homebrew):**
         If you don't have Homebrew, install it first from [https://brew.sh/](https://brew.sh/). Then, open Terminal and run:
@@ -256,7 +271,7 @@ Then in the app choose the **Local (offline)** engine and a model size (`base` i
 
 ## Troubleshooting ⚠️
 
-* **`ffmpeg not found` Error / Runtime Warning:** This is the most common issue. Double-check that `ffmpeg` is correctly installed using **one** of the methods described in the "Installation" section. If you installed it manually (Windows non-Conda), ensure the **correct `bin` folder** path is added to your system's PATH and **restart your terminal/VS Code** afterwards. Verify by running `ffmpeg -version` in a new terminal.
+* **"ffmpeg … was not found"** (a red box at the top of the page), **or `Couldn't find ffmpeg` in the console:** This is the most common issue. Install ffmpeg as in **Installation**, step 2 — on Windows, `winget install --id Gyan.FFmpeg.Essentials -e` — then **close the app and start it again**: a running app keeps the `PATH` it was started with. If you installed it by hand, make sure the **`bin` folder** is on your `PATH`. Verify with `ffmpeg -version` and `ffprobe -version` in a new terminal.
 * **"OpenAI rejected the API key":** check `OPENAI_API_KEY` in `.env` (in the folder you start the app from) or the key in the sidebar.
 * **"OpenAI credit exhausted":** the account has no prepaid balance left. Add credit at [platform.openai.com/settings/organization/billing](https://platform.openai.com/settings/organization/billing) — for the organization and project the key belongs to — or switch to the **Local (offline)** engine. A new balance can take a few minutes to reach the API.
 * **"Stopped after part N of M":** see step 4 under Usage — press Start again and only the missing parts are sent.

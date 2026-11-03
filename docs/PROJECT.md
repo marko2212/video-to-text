@@ -915,6 +915,31 @@ upload (identified by file_id, saved to uploads/)
   `--extra local`), whose `.exe` launchers hold the old path — journal 2026-10-30 (part 2).
 - **Docker is optional and additive** — it bundles ffmpeg (the host needs nothing), but
   `make run` / `uv run` keep working exactly as before.
+- **Python is pinned to 3.13 in `.python-version`** *(2026-11-03)* — `requires-python =
+  ">=3.12"` has no ceiling, so without a pin uv used whatever it found, or downloaded the
+  newest Python on a computer with none: a version nobody tested (3.14, or 3.15 from
+  October 2026), where wheels of the offline engine may be missing. 3.13 is what the owner
+  runs and CI tests. CI keeps its matrix because setup-uv's `python-version` sets
+  `UV_PYTHON`, which overrides the file (checked: the file alone gives 3.13.7,
+  `UV_PYTHON=3.12` gives 3.12.10). Docker ignores the file (`.dockerignore`): the image
+  runs its own 3.12. On a computer whose `.venv` is on another version, the next plain
+  `uv run` (what `run.bat` and the shortcut run) removes it and makes a new one on 3.13
+  with the default packages, so the offline engine needs `make sync-local` again;
+  `uv run --no-sync` only warns and keeps the old one (both checked on a copy). The
+  `.gitignore` template ignored `.python-version` (a pyenv habit); that line went, or the
+  pin would never have left this computer.
+- **A missing ffmpeg is named, at the top of the page** *(2026-11-03)* — without it every
+  recording failed with "Error preparing audio: [WinError 2] The system cannot find the
+  file specified", which reads as a missing recording, while the README's troubleshooting
+  looked for "ffmpeg not found", a message the app never showed. `audio.missing_tools()`
+  checks `ffmpeg` and `ffprobe` with `shutil.which` on every rerun (cheap; a process keeps
+  the PATH it started with, so the message says to start the app again), and `audio._run`
+  turns the `FileNotFoundError` of a missing program into `FfmpegMissingError` with the
+  same message. The Windows command is `winget install --id Gyan.FFmpeg.Essentials -e`
+  (`config.FFMPEG_WINDOWS_INSTALL`; no admin rights, puts both programs on PATH; package
+  checked with `winget show`, 9.0.1 on 2026-11-03), first in the README, the manual steps
+  after it. The tests report both programs as installed by default (conftest), because
+  CI has none and the page tests expect no error box.
 - **The app listens on localhost only** *(2026-09-25)*. Transcripts are confidential and
   there is no login, yet Streamlit binds every interface by default and the firewall let
   the LAN in. `.streamlit/config.toml` sets `server.address = "localhost"` (both
@@ -978,7 +1003,7 @@ upload (identified by file_id, saved to uploads/)
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 365 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 372 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1290,6 +1315,27 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-03 — Python pinned to 3.13; a missing ffmpeg is named, and the README gives one command for it
+
+The owner asked which Python the app uses (3.12 or newer; 3.13.7 on this computer, an
+interpreter uv downloaded, not the system 3.12; nothing pinned it) and whether the README
+lets an AI install ffmpeg on Windows by itself. Not quite: the Windows steps were clicks
+through a download page and the Environment Variables dialog, with no command, and a
+missing ffmpeg showed only "[WinError 2] The system cannot find the file specified"
+(reproduced with ffmpeg taken off PATH). On "Da, uradi": `.python-version` pins 3.13; the
+page names missing programs at the top with the winget command and the restart; the
+README puts `winget install --id Gyan.FFmpeg.Essentials -e` first, checks `ffprobe` too
+and says to restart the app; troubleshooting quotes the new message (§3 Distribution /
+running, both 2026-11-03 bullets). The owner's app was running from this checkout, so the
+change was made and tested in a copy and moved in when finished. Checked: ruff; 372 tests
+(7 new) with and without ffmpeg on PATH; the new tests fail with `to_wav` calling
+`ffmpeg.run` directly and with the page warning removed; UV_PYTHON overriding the pin;
+what `uv run` and `uv run --no-sync` do with a `.venv` on 3.12. The owner then asked
+whether the pin forces everyone onto 3.13: only uv users, as a default (uv downloads it
+if missing; pip ignores the file; `--python 3.12` or `uv python pin` overrides it). The
+alternative offered, no pin and `requires-python = ">=3.12,<3.14"`, was declined: "Zadrži
+i komituj". Committed in three parts (feat, build, docs); not pushed.
 
 ### 2026-10-30 (part 4) — A card per step
 
