@@ -1296,6 +1296,22 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       update (2026-09-29 review).
 
 ### P5 — features and later
+- [ ] **Show the OpenAI credit left** (asked 2026-11-03). The owner chose a read-only
+      Admin key to ask Claude about spend: `C:\Work\tools\openai-potrosnja.py` (outside
+      this repo; key in `C:\Work\.secrets`, see `C:\Work\PLAYBOOK-API-PRISTUPI.md`), so
+      nothing in the app yet. OpenAI has no
+      documented endpoint for the remaining prepaid balance (community request of
+      2025-11-05; OpenAI support on 2026-10-28: "I'll pass this feedback along").
+      The undocumented `GET /v1/dashboard/billing/credit_grants` is reported to answer
+      403 to project (`sk-proj-`) keys; the Costs API (`/v1/organization/costs`) needs
+      an Admin key (`sk-admin-`) and gives spend, not balance. Options: (a) the owner
+      types the balance once (and again after each top-up) and the app subtracts the
+      costs it recorded since — no new key, but blind to other apps on the same
+      organization; (b) the same subtraction with OpenAI's own spend from the Costs
+      API — needs an Admin key on this computer. Not tried against the live API.
+      Topping up cannot go through an API either (no payment endpoint was found); OpenAI's
+      **auto recharge** (Billing settings: a threshold, the amount, an optional monthly
+      cap; at least $5) does it without logging in — the owner's own setting.
 - [ ] **"The last 15 minutes are silent — leave them out?"** (S). The loudness the
       picture of the sound is drawn from (`waveform.loudness`) already shows a long
       quiet tail or head; a one-line suggestion with a button that sets the slider
