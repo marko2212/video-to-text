@@ -5,6 +5,7 @@ exercise the UI flow — the two-step Start, run notices, result state and the
 history fragment — not transcription itself.
 """
 
+import json
 import threading
 import tomllib
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 import app
+import audio
 import config
 import db
 import transcribe
@@ -318,6 +320,16 @@ def test_the_server_listens_on_localhost_only():
     )
     assert settings["server"]["address"] in {"localhost", "127.0.0.1"}
     assert settings["browser"]["gatherUsageStats"] is False
+
+
+def test_the_menu_with_the_theme_choice_is_kept():
+    # "minimal" hides the whole menu at the top right, and with it the System /
+    # Light / Dark theme choice; "viewer" drops only Deploy and the other
+    # developer items.
+    settings = tomllib.loads(
+        (config.BASE_DIR / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+    )
+    assert settings["client"]["toolbarMode"] == "viewer"
 
 
 _TWO_RUNS_SCRIPT = """
@@ -1064,3 +1076,468 @@ def test_an_uploaded_video_whose_copy_went_first_is_prepared_again(monkeypatch):
 
     assert video.read_bytes() == b"the video"  # saved again from the upload
     assert extracted == [b"the video", b"the video"]
+
+
+# --- what a run found out about its own answers ---------------------------------
+
+
+def _flagged_summary() -> dict:
+    return {
+        "requests": 1,
+        "seconds": 300.0,
+        "input_tokens": 1_000,
+        "output_tokens": 50,
+        "cost_usd": 0.003,
+        "estimated": False,
+        "audio_seconds": 300.0,
+        "chunks": [
+            {
+                "index": 0,
+                "part": "000",
+                "start": 0.0,
+                "end": 300.0,
+                "output_tokens": 50,
+                "chars": 20,
+                "words": 5,
+                "words_per_min": 1.0,
+                "request_id": "req_1",
+                "thin": True,
+                "capped": False,
+                "typical_words_per_min": 120,
+            }
+        ],
+    }
+
+
+def test_a_run_with_a_thin_part_warns_and_history_repeats_it(monkeypatch):
+    import json
+
+    def flagged(input_file, output_file, api_key, **kwargs):
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+        return _flagged_summary()
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", flagged)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    _start(test)
+
+    expected = "Speech may be missing in 1 part(s) — 0:00–5:00 (1 words/min against"
+    assert any(expected in w.value for w in test.warning)
+    [row] = db.list_transcriptions()
+    saved = json.loads(db.get_transcription(row["id"])["usage_json"])
+    assert saved["transcription"]["chunks"][0]["request_id"] == "req_1"
+
+    # The entry says so too, for as long as the row lives.
+    from streamlit.proto.WidgetStates_pb2 import WidgetState
+
+    fresh = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    [entry] = fresh.expander
+    states = fresh._tree.get_widget_states()
+    states.widgets.append(WidgetState(id=entry.proto.id, bool_value=True))
+    fresh._run(states)
+    assert any(expected in w.value for w in fresh.warning)
+
+
+def test_a_checked_run_says_what_the_local_pass_did(monkeypatch):
+    def checked(input_file, output_file, api_key, **kwargs):
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+        return {
+            **_flagged_summary(),
+            "chunks": [],
+            "verified": {
+                "model": "base",
+                "seconds": 782.0,
+                "paragraphs": 124,
+                "anchored": 118,
+                "gaps": 2,
+                "added_words": 312,
+            },
+        }
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", checked)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    _start(test)
+
+    assert not test.warning
+    assert any(
+        i.value == "Checked against local Whisper (base) in 13:02: 118 of 124 "
+        "paragraphs re-timed; 2 stretch(es) (312 words) the OpenAI answer lacked "
+        "were added, marked 🧩."
+        for i in test.info
+    )
+    assert any(
+        "checked with local Whisper (base, free)" in c.value for c in test.caption
+    )
+
+
+def test_a_failed_check_is_a_warning_not_a_failed_run(monkeypatch):
+    def unchecked(input_file, output_file, api_key, **kwargs):
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+        return {
+            **_flagged_summary(),
+            "chunks": [],
+            "verified": {"model": "base", "error": "model file corrupt"},
+        }
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", unchecked)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    _start(test)
+
+    assert any(
+        "check with local Whisper (base) failed: model file corrupt" in w.value
+        for w in test.warning
+    )
+    assert len(db.list_transcriptions()) == 1
+
+
+def test_the_parts_of_a_finished_run_are_kept_until_its_row_is_deleted(monkeypatch):
+    import checkpoints
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        digest = checkpoints.file_digest(Path(input_file))
+        parts = transcribe.checkpoint_dir(digest, kwargs["model"])
+        checkpoints.save(parts, "chunk_000", {"bounds": [0, 1000], "pieces": []})
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    _start(test)
+
+    [row] = db.list_transcriptions()
+    kept = checkpoints.kept_run_dir(row["id"])
+    assert checkpoints.load(kept, "chunk_000") == {"bounds": [0, 1000], "pieces": []}
+    # The run's own saved parts are gone, so Start would not reuse them.
+    digest = checkpoints.file_digest(test.session_state.audio_path)
+    assert transcribe.saved_chunk_count(digest, config.DEFAULT_MODEL) == 0
+
+    app._delete_entry(row["id"])
+
+    assert db.list_transcriptions() == []
+    assert not kept.exists()
+
+
+_ENGINE_SCRIPT = """
+import streamlit as st
+import app
+
+provider, model = app.render_engine_options(False)
+st.session_state.result = (
+    provider, model, *app.render_output_options(provider, model, False)
+)
+"""
+
+
+def test_the_check_is_offered_for_untimed_openai_runs_when_the_backend_is_there(
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    test = AppTest.from_string(_ENGINE_SCRIPT).run()
+
+    verify = next(b for b in test.checkbox if b.label == "Verify with local Whisper")
+    assert verify.value is False
+    assert test.session_state.result[3] is None
+
+    verify.set_value(True).run()
+
+    [chooser] = [s for s in test.selectbox if s.key == "verify_model"]
+    assert chooser.value == config.DEFAULT_VERIFY_MODEL
+    assert test.session_state.result[3] == config.DEFAULT_VERIFY_MODEL
+
+
+def test_the_check_is_not_offered_without_the_backend_or_for_timed_models(
+    monkeypatch,
+):
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", False)
+    test = AppTest.from_string(_ENGINE_SCRIPT).run()
+    assert not [b for b in test.checkbox if b.label == "Verify with local Whisper"]
+
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    test = AppTest.from_string(_ENGINE_SCRIPT).run()
+    test.selectbox[0].set_value("whisper-1").run()
+    assert not [b for b in test.checkbox if b.label == "Verify with local Whisper"]
+    assert test.session_state.result[3] is None
+
+
+def test_a_ticked_check_reaches_the_pipeline_with_the_loaded_model(monkeypatch):
+    seen = []
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        seen.append(kwargs["verify"])
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    monkeypatch.setattr(app, "_load_local_model", lambda name: f"model:{name}")
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    verify = next(b for b in test.checkbox if b.label == "Verify with local Whisper")
+    verify.set_value(True).run()
+
+    _start(test)
+
+    assert seen == [
+        (f"model:{config.DEFAULT_VERIFY_MODEL}", config.DEFAULT_VERIFY_MODEL)
+    ]
+
+
+def _copy_as_wav(source: Path, target: Path, **_: object) -> Path:
+    """Stands in for audio.to_wav: the "extracted" audio is a copy, no ffmpeg."""
+    target = Path(target)
+    target.write_bytes(Path(source).read_bytes())
+    return target
+
+
+def test_the_screen_option_comes_before_the_subtitle_option(monkeypatch):
+    monkeypatch.setattr(audio, "to_wav", _copy_as_wav)
+    monkeypatch.setattr(app, "_make_preview", lambda source, stem: source)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    test.file_uploader[0].set_value(("talk.mp4", b"talk video", "video/mp4")).run()
+    model = next(s for s in test.selectbox if s.label == "Transcription model")
+    model.set_value("whisper-1").run()
+
+    labels = [box.label for box in test.checkbox]
+    screen = next(i for i, label in enumerate(labels) if "on screen" in label)
+    subtitles = labels.index("Include timestamps & generate subtitles (.srt)")
+    assert screen < subtitles
+
+
+_BATCHED = "Faster local Whisper (batched, about 1.5×)"
+
+
+def _batched_box(test: AppTest) -> list:
+    return [box for box in test.checkbox if box.label == _BATCHED]
+
+
+def test_batched_decoding_is_offered_only_when_a_local_pass_runs(monkeypatch):
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    test = AppTest.from_string(_ENGINE_SCRIPT).run()
+    # gpt-4o-transcribe without the check: nothing runs locally.
+    assert not _batched_box(test)
+    assert test.session_state.result[4] is False
+
+    verify = next(b for b in test.checkbox if b.label == "Verify with local Whisper")
+    verify.set_value(True).run()
+    [box] = _batched_box(test)
+    assert box.value is False  # off unless ticked
+    box.set_value(True).run()
+    assert test.session_state.result[4] is True
+
+    test.radio[0].set_value(config.PROVIDER_LOCAL).run()
+    assert _batched_box(test)
+
+    test.radio[0].set_value(config.PROVIDER_OPENAI).run()
+    test.selectbox[0].set_value("whisper-1").run()
+    assert not _batched_box(test)
+    assert test.session_state.result[4] is False
+
+
+def test_a_ticked_batched_box_reaches_the_local_run_and_its_history_row(
+    monkeypatch,
+):
+    seen = []
+
+    def fake_local(input_file, output_file, whisper_model, **kwargs):
+        seen.append(kwargs["batched"])
+        Path(output_file).write_text("Local transcript.", encoding="utf-8")
+
+    monkeypatch.setattr(transcribe, "transcribe_local", fake_local)
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    monkeypatch.setattr(app, "_load_local_model", lambda name: f"model:{name}")
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    engine = next(r for r in test.radio if r.label == "Engine")
+    engine.set_value(config.PROVIDER_LOCAL).run()
+    _batched_box(test)[0].set_value(True).run()
+
+    _start(test)
+
+    assert seen == [True]
+    [row] = db.list_transcriptions()
+    assert json.loads(row["usage_json"])["local_batched"] is True
+
+
+def test_a_ticked_batched_box_reaches_the_cross_check(monkeypatch):
+    seen = []
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        seen.append((kwargs["verify"], kwargs["verify_batched"]))
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    monkeypatch.setattr(app, "_load_local_model", lambda name: f"model:{name}")
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    verify = next(b for b in test.checkbox if b.label == "Verify with local Whisper")
+    verify.set_value(True).run()
+    _batched_box(test)[0].set_value(True).run()
+
+    _start(test)
+
+    model = config.DEFAULT_VERIFY_MODEL
+    assert seen == [((f"model:{model}", model), True)]
+    [row] = db.list_transcriptions()
+    assert json.loads(row["usage_json"])["local_batched"] is True
+
+
+def _upload_several(test: AppTest, *files: tuple[str, bytes]) -> AppTest:
+    return (
+        test.file_uploader[0]
+        .set_value([(name, content, "audio/wav") for name, content in files])
+        .run()
+    )
+
+
+def _queue_lines(test: AppTest) -> list[str]:
+    """The list under the uploader that says where each upload stands."""
+    marks = (":material/schedule:", ":material/check_circle:")
+    for block in test.markdown:
+        if any(mark in block.value for mark in marks):
+            return block.value.splitlines()
+    return []
+
+
+def test_several_uploads_are_transcribed_one_after_another(fake_openai):
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload_several(
+        test, ("a.wav", b"a audio"), ("b.wav", b"b audio"), ("c.wav", b"c audio")
+    )
+
+    # The first is prepared and shown; the others wait their turn.
+    assert test.session_state.original_filename == "a.wav"
+    assert _queue_lines(test) == [
+        "- :material/play_arrow: a.wav — this one next",
+        "- :material/schedule: b.wav — waiting",
+        "- :material/schedule: c.wav — waiting",
+    ]
+    assert any("After this file: b.wav, c.wav" in c.value for c in test.caption)
+
+    _start(test)
+
+    # One Start, three runs in order, three rows — and the controls are back.
+    assert fake_openai == [b"a audio", b"b audio", b"c audio"]
+    assert sorted(r["filename"] for r in db.list_transcriptions()) == [
+        "a.wav",
+        "b.wav",
+        "c.wav",
+    ]
+    assert test.session_state.job is None
+    assert not _start_button(test).disabled
+    assert _queue_lines(test) == [
+        "- :material/check_circle: a.wav — done, in History",
+        "- :material/check_circle: b.wav — done, in History",
+        "- :material/check_circle: c.wav — done, in History",
+    ]
+    assert any(
+        "Transcribed before this file, one after another: a.wav, b.wav" in i.value
+        for i in test.info
+    )
+    # The page shows the last file and its result.
+    assert test.session_state.original_filename == "c.wav"
+    transcript = Path(test.session_state.transcript_path).read_text(encoding="utf-8")
+    assert transcript == "Transcript of c audio"
+
+
+def test_a_file_that_fails_stops_the_queue_and_start_goes_on_from_it(monkeypatch):
+    calls = []
+    failing = {b"b audio"}
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        content = Path(input_file).read_bytes()
+        calls.append(content)
+        if content in failing:
+            raise TranscriptionError("rate limited")
+        Path(output_file).write_text(
+            f"Transcript of {content.decode()}", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload_several(
+        test, ("a.wav", b"a audio"), ("b.wav", b"b audio"), ("c.wav", b"c audio")
+    )
+    _start(test)
+
+    # Stopped at b: its error is shown, a is saved, c was never sent.
+    assert calls == [b"a audio", b"b audio"]
+    assert [r["filename"] for r in db.list_transcriptions()] == ["a.wav"]
+    assert any("rate limited" in e.value for e in test.error)
+    assert any(
+        "Transcribed before this file, one after another: a.wav" in i.value
+        for i in test.info
+    )
+    assert any("Still waiting: c.wav" in i.value for i in test.info)
+    assert _queue_lines(test) == [
+        "- :material/check_circle: a.wav — done, in History",
+        "- :material/play_arrow: b.wav — this one next",
+        "- :material/schedule: c.wav — waiting",
+    ]
+    assert test.session_state.job is None
+
+    failing.clear()
+    _start(test)
+
+    assert calls == [b"a audio", b"b audio", b"b audio", b"c audio"]
+    assert sorted(r["filename"] for r in db.list_transcriptions()) == [
+        "a.wav",
+        "b.wav",
+        "c.wav",
+    ]
+
+
+def test_a_file_added_after_the_queue_finished_is_taken_next(fake_openai):
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload_several(test, ("a.wav", b"a audio"), ("b.wav", b"b audio"))
+    _start(test)
+    assert fake_openai == [b"a audio", b"b audio"]
+
+    # The browser keeps the files already there (and their ids) and adds one.
+    kept = [
+        (f.file_id, f.name, f.getvalue(), f.type)
+        for f in test.session_state["uploader_0"]
+    ]
+    test.file_uploader[0]._files = [*kept, ("id-c", "c.wav", b"c audio", "audio/wav")]
+    test.run()
+
+    assert test.session_state.original_filename == "c.wav"
+    assert test.session_state.transcript_path is None
+    assert _queue_lines(test) == [
+        "- :material/check_circle: a.wav — done, in History",
+        "- :material/check_circle: b.wav — done, in History",
+        "- :material/play_arrow: c.wav — this one next",
+    ]
+
+    _start(test)
+
+    assert fake_openai == [b"a audio", b"b audio", b"c audio"]
+    # A fresh Start, a fresh tally: nothing was transcribed before c this time.
+    assert not any("Transcribed before" in i.value for i in test.info)
+
+
+def test_a_stopped_queue_says_which_files_still_wait(fake_openai):
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload_several(test, ("a.wav", b"a audio"), ("b.wav", b"b audio"))
+    worker = threading.Thread(target=lambda: None)
+    worker.start()
+    worker.join()
+    test.session_state["job"] = {"params": _PARAMS, "worker": worker}
+    test.run()
+
+    assert any("stopped before it finished" in w.value for w in test.warning)
+    assert any("Still waiting: b.wav" in i.value for i in test.info)
+    assert fake_openai == []
+
+
+def test_cleaning_up_forgets_the_queue(fake_openai):
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload_several(test, ("a.wav", b"a audio"), ("b.wav", b"b audio"))
+    _start(test)
+    assert test.session_state.queue_done
+
+    next(b for b in test.button if b.label == "Clean temporary files").click().run()
+
+    assert test.session_state.queue_done is None
+    assert test.session_state.queue_waiting is None

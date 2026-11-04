@@ -103,6 +103,23 @@ DEFAULT_SEGMENT_MINUTES: int = 5
 # A response this long is treated as cut off by the output cap: the chunk is
 # split in two and both halves are transcribed again.
 OUTPUT_TOKEN_CAP_GUARD: int = 1900
+# A chunk whose answer has far fewer words per minute than the run's other
+# chunks is treated as incomplete too — the API can answer with part of a chunk
+# and no error. Measured 2026-11-03 on a 52:10 company presentation sent as 11
+# five-minute chunks to gpt-4o-transcribe, twice: every chunk came back at
+# about 120 words per minute, except chunk 08 (39:38–44:33), which one run
+# answered with almost nothing (1 word/min), and chunk 09 (44:33–49:43), which
+# both runs answered at 68 words/min — 2:16 of speech in its middle was
+# missing, as a local faster-whisper pass of the same audio showed (124
+# words/min there). Neither reached the output cap. A chunk below this share of
+# the running median of the chunks answered so far is split in two and both
+# halves are sent again, once; a half that is still thin is kept and marked in
+# the transcript.
+THIN_CHUNK_SHARE: float = 0.5
+# The guard stays silent while the median itself is under this: a recording
+# that is mostly silence, music or a demo has no typical rate to compare with,
+# and re-sending its quiet chunks would only cost money.
+THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE: float = 40.0
 # Chunks are never split below this length, so a runaway split cannot loop.
 MIN_SPLIT_SECONDS: float = 30.0
 # Chunk boundaries move to the quietest moment within this distance of the
@@ -313,6 +330,44 @@ LOCAL_MODEL_SIZES_MB: dict[str, float] = {
     "large-v3": 3090,
     "large-v3-turbo": 1620,
 }
+# How much faster than real time a local model transcribes on the owner's CPU
+# (int8): `small` did a 52-minute recording in about 13 minutes (2026-11-03).
+# `base` and `tiny` are faster; the others were not measured.
+LOCAL_SPEED_FACTORS: dict[str, float] = {"small": 3.9}
+# Batched decoding, an opt-in box on the page: faster-whisper cuts the recording
+# at pauses into pieces of up to 30 s and writes this many at once. Each piece is
+# written without the text before it and without a second try.
+LOCAL_BATCH_SIZE: int = 8
+
+# Cross-check of an OpenAI transcript against a local Whisper pass (opt-in for
+# gpt-4o-transcribe, whose paragraph times are estimated). The two texts are
+# aligned word by word; an API paragraph takes the local pass's time of its
+# words once a run of at least this many words in a row matches — shorter
+# matches ("and then the") occur anywhere.
+VERIFY_MIN_ANCHOR_WORDS: int = 4
+# A stretch the local pass has and the API answer lacks is added to the
+# transcript only from this many words: shorter differences are wording, not
+# missing speech (the two engines disagree on a word here and there).
+VERIFY_MIN_GAP_WORDS: int = 25
+# An added stretch is broken into paragraphs about this long, at sentence starts.
+VERIFY_GAP_PARAGRAPH_SECONDS: float = 40.0
+# The local model offered first for the cross-check: the smallest that reads
+# well enough to align on; `tiny` misses too many words.
+DEFAULT_VERIFY_MODEL: str = DEFAULT_LOCAL_MODEL
+
+# The application log: every run leaves one line per chunk sent (bounds, size,
+# request time and id, tokens, words per minute, guard flags), so an answer
+# that came back incomplete can be found afterwards. The console shows the
+# same lines but keeps nothing. Rotated so it cannot grow without bound.
+LOG_DIRNAME: str = "logs"
+LOG_FILENAME: str = "app.log"
+LOG_FILE_MAX_BYTES: int = 5 * 1024 * 1024
+LOG_FILE_BACKUPS: int = 5
+# The parts of every finished run (one JSON per chunk, with its text and its
+# record) are kept beside the history, in a folder named after the history
+# row, until that row is deleted: history keeps only the rendered transcript
+# and the run's totals, which is not enough to tell which chunk lost speech.
+RUNS_DIRNAME: str = "runs"
 
 
 class Settings(BaseSettings):
@@ -323,6 +378,8 @@ class Settings(BaseSettings):
         temp_dir: Directory for transient working files (segments, outputs).
         upload_dir: Directory where uploaded source files are stored.
         data_dir: Directory holding the SQLite history database.
+        log_dir: Directory of the rotating application log; ``data_dir/logs``
+            unless ``LOG_DIR`` says otherwise.
         whisper_model_dir: Download cache for local faster-whisper models.
         segment_duration_minutes: Chunk length for every model, overriding
             the per-model defaults; unset means per model.
@@ -340,6 +397,9 @@ class Settings(BaseSettings):
     temp_dir: Path = Field(default=BASE_DIR / "temp")
     upload_dir: Path = Field(default=BASE_DIR / "uploads")
     data_dir: Path = Field(default=BASE_DIR / "data")
+    # Relative to the history folder by default, so it is backed up with it
+    # and survives "Clean temporary files"; resolved in model_post_init.
+    log_dir: Path | None = Field(default=None)
     whisper_model_dir: Path = Field(default=BASE_DIR / "models")
     # Capped at 15 so a chunk stays under the 25 MB request limit.
     segment_duration_minutes: int | None = Field(default=None, ge=1, le=15)
@@ -369,13 +429,26 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         """Create the working directories as soon as settings are loaded."""
+        if self.log_dir is None:
+            self.log_dir = self.data_dir / LOG_DIRNAME
         for directory in (
             self.temp_dir,
             self.upload_dir,
             self.data_dir,
+            self.log_dir,
             self.whisper_model_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def log_path(self) -> Path:
+        """Return the application log file (``app.log`` in ``log_dir``)."""
+        return (self.log_dir or self.data_dir / LOG_DIRNAME) / LOG_FILENAME
+
+    @property
+    def runs_dir(self) -> Path:
+        """Return the folder that keeps the parts of finished runs, by row id."""
+        return self.data_dir / RUNS_DIRNAME
 
 
 @lru_cache

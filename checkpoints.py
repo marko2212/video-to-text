@@ -334,3 +334,59 @@ def discard(directory: Path) -> None:
         directory: Checkpoint directory from :func:`run_dir`.
     """
     shutil.rmtree(directory, ignore_errors=True)
+
+
+def kept_run_dir(row_id: int) -> Path:
+    """Return where the parts of a finished run are kept, by its history row.
+
+    Args:
+        row_id: The run's history row id.
+
+    Returns:
+        ``data/runs/<row_id>`` (not created until a run is kept).
+    """
+    return get_settings().runs_dir / str(row_id)
+
+
+def keep_run(directory: Path, row_id: int) -> Path | None:
+    """Copy a finished run's saved parts beside the history before they go.
+
+    History keeps the rendered transcript and the run's totals; the parts hold
+    each answer as it came back (text, usage, the per-chunk record), which is
+    what tells afterwards which chunk lost speech. They are copied, not moved:
+    the checkpoint folder is what a run stopped right after this point resumes
+    from, and it is discarded only once the row is written. A copy that fails
+    (disk full) is logged and costs nothing but the trace.
+
+    Args:
+        directory: The run's checkpoint directory from :func:`run_dir`.
+        row_id: The history row the run was saved as.
+
+    Returns:
+        The folder the parts were copied to, or ``None`` when there was
+        nothing to keep or the copy failed.
+    """
+    if not directory.is_dir():
+        return None
+    target = kept_run_dir(row_id)
+    try:
+        shutil.copytree(
+            directory,
+            target,
+            ignore=shutil.ignore_patterns("*.tmp"),
+            dirs_exist_ok=True,
+        )
+    except OSError as exc:
+        logger.warning("Could not keep the parts of run %d: %s", row_id, exc)
+        return None
+    logger.info("Kept the parts of run %d in %s", row_id, target)
+    return target
+
+
+def discard_run(row_id: int) -> None:
+    """Delete the kept parts of a run whose history row is being deleted.
+
+    Args:
+        row_id: The history row id.
+    """
+    shutil.rmtree(kept_run_dir(row_id), ignore_errors=True)

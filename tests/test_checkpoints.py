@@ -217,3 +217,35 @@ def test_a_folder_named_twice_is_counted_once(monkeypatch, tmp_path):
     _aged(shared / "call.amr", content=b"a" * 700)
 
     assert checkpoints.working_files_size() == 700
+
+
+def test_a_finished_run_s_parts_are_kept_beside_the_history_until_its_row_goes():
+    parts = checkpoints.run_dir("abc", "transcribe", "gpt-4o-transcribe", "5min", "v1")
+    checkpoints.save(parts, "chunk_000", {"bounds": [0, 1000], "pieces": []})
+    checkpoints.save(parts, "part_001", {"bounds": [1000, 2000], "split": 1500})
+    (parts / ".chunk_002-half.tmp").write_text("{", encoding="utf-8")
+
+    kept = checkpoints.keep_run(parts, 7)
+
+    assert kept == config.get_settings().data_dir / "runs" / "7"
+    assert checkpoints.load(kept, "chunk_000") == {"bounds": [0, 1000], "pieces": []}
+    assert checkpoints.load(kept, "part_001")["split"] == 1500
+    assert not list(kept.glob("*.tmp"))
+    # The run's own folder is untouched: the app discards it after the copy.
+    assert checkpoints.count(parts, "chunk_") == 1
+
+    checkpoints.discard_run(7)
+    assert not kept.exists()
+
+
+def test_keeping_nothing_or_failing_to_keep_is_not_an_error(monkeypatch, tmp_path):
+    assert checkpoints.keep_run(tmp_path / "never-saved", 8) is None
+
+    parts = checkpoints.run_dir("def", "transcribe")
+    checkpoints.save(parts, "chunk_000", {"pieces": []})
+
+    def full_disk(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(checkpoints.shutil, "copytree", full_disk)
+    assert checkpoints.keep_run(parts, 9) is None

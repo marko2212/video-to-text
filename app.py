@@ -12,6 +12,11 @@ exactly that — and History lives in a fragment, whose reruns wait for the job
 instead of cancelling it. A job records the thread doing it, because a stopped
 script keeps running until its next Streamlit call — possibly a minute later,
 after a paid request returns.
+
+Several uploads at once are a queue, taken one at a time: the page works on the
+first not yet transcribed, and the job that finished it requests the next one's
+job before rerunning — so each file gets a locked page, a run and a History row
+of its own, with the settings drawn once.
 """
 
 import importlib.util
@@ -45,6 +50,7 @@ from config import (
     DEFAULT_FRAME_DETAIL,
     DEFAULT_LOCAL_MODEL,
     DEFAULT_TITLE_MODEL,
+    DEFAULT_VERIFY_MODEL,
     FRAME_DETAIL_LEVELS,
     FRAME_INTERVAL_MAX_SECONDS,
     FRAME_INTERVAL_MIN_SECONDS,
@@ -52,6 +58,7 @@ from config import (
     FRAME_MAX_INTERVAL_SECONDS,
     FRAME_MIN_INTERVAL_SECONDS,
     JOB_WATCHDOG_SECONDS,
+    LOCAL_BATCH_SIZE,
     LOCAL_MODEL_SIZES_MB,
     LOCAL_MODELS,
     PREVIEW_ABOVE_MB,
@@ -78,7 +85,7 @@ from config import (
     get_settings,
 )
 from exceptions import AppError, IncompleteTranscriptionError, OpenAIAccountError
-from logger import get_logger
+from logger import enable_file_log, get_logger
 
 logger = get_logger(__name__)
 
@@ -105,9 +112,14 @@ _RUN_STATE_KEYS = (
 # ``upload_id`` is what detects a new file (an upload's id, or a folder file's
 # path) and ``source_version`` the folder file's size and time when it was
 # chosen; ``job`` is the run request, and ``uploader_generation`` is bumped to
-# empty the uploader after a cleanup.
+# empty the uploader after a cleanup. Several uploads at once are a queue:
+# ``queue_done`` holds the ids of those transcribed and saved in this session,
+# ``queue_waiting`` the names of those after the one the page works on, and
+# ``queue_finished`` the names a running queue has got through since Start.
+_QUEUE_KEYS = ("queue_done", "queue_waiting", "queue_finished")
 _SESSION_KEYS = (
     *_RUN_STATE_KEYS,
+    *_QUEUE_KEYS,
     "original_filename",
     "upload_id",
     "source_version",
@@ -502,7 +514,13 @@ def clean_temp_files() -> None:
         logger.warning("Cleanup failed: %s", exc)
         st.session_state.clean_message = ("error", f"Error during cleanup: {exc}")
         return
-    for key in (*_RUN_STATE_KEYS, "original_filename", "upload_id", "source_version"):
+    for key in (
+        *_RUN_STATE_KEYS,
+        *_QUEUE_KEYS,
+        "original_filename",
+        "upload_id",
+        "source_version",
+    ):
         st.session_state[key] = None
     # Empty the uploader and the folder pick too (a new uploader key is a new,
     # empty widget), or the next click would extract the same file again.
@@ -1244,6 +1262,8 @@ def _run_pipeline(
     progress: ProgressCallback,
     visual_notes: list[dict[str, Any]] | None,
     span: tuple[int, int] | None = None,
+    verify: str | None = None,
+    batched: bool = False,
 ) -> tuple[bool, dict[str, Any] | None]:
     """Run the chosen engine.
 
@@ -1255,6 +1275,8 @@ def _run_pipeline(
         progress: Progress callback for the pipeline.
         visual_notes: On-screen notes to place into the transcript.
         span: The stretch of the recording to transcribe, when not all of it.
+        verify: The local model to check an OpenAI transcript against, if any.
+        batched: Decode the local pass in batches.
 
     Returns:
         Whether the pipeline ran (False when no API key was available), and
@@ -1262,17 +1284,7 @@ def _run_pipeline(
     """
     transcript_path, srt_path = paths
     if provider == PROVIDER_LOCAL:
-        settings = get_settings()
-        if _model_is_cached(model):
-            spinner_msg = f"Loading model '{model}'…"
-        else:
-            size = LOCAL_MODEL_SIZES_MB.get(model)
-            hint = f" (~{size:.0f} MB)" if size else ""
-            spinner_msg = f"Downloading '{model}'{hint} — first run only, please wait…"
-        with st.spinner(spinner_msg, show_time=True):
-            whisper_model = load_whisper_model(
-                model, settings.local_device, settings.local_compute_type
-            )
+        whisper_model = _load_local_model(model)
         with st.spinner(
             "Transcribing locally… This may take a while on CPU.", show_time=True
         ):
@@ -1285,12 +1297,17 @@ def _run_pipeline(
                 progress_callback=progress,
                 visual_notes=visual_notes,
                 span=span,
+                model_name=model,
+                batched=batched,
             )
         return True, None
 
     api_key = resolve_openai_key()
     if not api_key:
         return False, None
+    # Loaded before the paid run, so a model that cannot be loaded (no disk,
+    # no download) fails before anything is spent.
+    local = (_load_local_model(verify), verify) if verify else None
     with st.spinner("Transcribing with the OpenAI API…", show_time=True):
         spent = transcribe.transcribe_openai(
             st.session_state.audio_path,
@@ -1302,8 +1319,90 @@ def _run_pipeline(
             progress_callback=progress,
             visual_notes=visual_notes,
             span=span,
+            verify=local,
+            verify_batched=batched,
         )
     return True, spent
+
+
+def _load_local_model(model: str) -> Any:
+    """Load a local Whisper model under a spinner that says what is happening.
+
+    Args:
+        model: The local model size.
+
+    Returns:
+        The loaded ``faster_whisper.WhisperModel``.
+    """
+    settings = get_settings()
+    if _model_is_cached(model):
+        spinner_msg = f"Loading model '{model}'…"
+    else:
+        size = LOCAL_MODEL_SIZES_MB.get(model)
+        hint = f" (~{size:.0f} MB)" if size else ""
+        spinner_msg = f"Downloading '{model}'{hint} — first run only, please wait…"
+    with st.spinner(spinner_msg, show_time=True):
+        return load_whisper_model(
+            model, settings.local_device, settings.local_compute_type
+        )
+
+
+def _run_warnings(spent: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """Say what a finished OpenAI run found out about its own answers.
+
+    Args:
+        spent: The pipeline's summary (``chunks``, ``verified``), if any.
+
+    Returns:
+        Notices: a warning for parts that may have lost speech, and a note or
+        warning on the cross-check against a local pass.
+    """
+    notices: list[tuple[str, str]] = []
+    if not spent:
+        return notices
+    flagged = transcribe.describe_flagged(spent.get("chunks") or [])
+    if flagged:
+        notices.append(("warning", flagged))
+    verified = spent.get("verified")
+    if verified and verified.get("error"):
+        notices.append(
+            (
+                "warning",
+                f"The check with local Whisper ({verified['model']}) failed: "
+                f"{verified['error']} The transcript keeps its estimated times.",
+            )
+        )
+    elif verified:
+        notices.append(("info", _describe_verified(verified)))
+    return notices
+
+
+def _describe_verified(verified: dict[str, Any]) -> str:
+    """Phrase what the cross-check against a local pass did.
+
+    Args:
+        verified: The ``verified`` part of a run's transcription summary.
+
+    Returns:
+        One sentence, e.g. ``Checked against local Whisper (base) in 13:02:
+        118 of 124 paragraphs re-timed; 2 stretches (312 words) the OpenAI
+        answer lacked were added``.
+    """
+    taken = (
+        f" in {_format_length(verified['seconds'])}" if verified.get("seconds") else ""
+    )
+    text = (
+        f"Checked against local Whisper ({verified['model']}){taken}: "
+        f"{verified['anchored']} of {verified['paragraphs']} paragraphs re-timed"
+    )
+    if verified.get("gaps"):
+        text += (
+            f"; {verified['gaps']} stretch(es) ({verified['added_words']} words) the "
+            "OpenAI answer lacked were added, marked 🧩"
+        )
+    else:
+        text += "; nothing the OpenAI answer lacked was found"
+    return text + "."
 
 
 def _with_span(cost: dict[str, Any], span: tuple[int, int] | None) -> dict[str, Any]:
@@ -1429,6 +1528,8 @@ def run_transcription(
     source_type: str,
     visual: dict[str, Any] | None = None,
     span: tuple[int, int] | None = None,
+    verify: str | None = None,
+    batched: bool = False,
 ) -> None:
     """Run the selected provider's pipeline and store result paths.
 
@@ -1443,6 +1544,10 @@ def run_transcription(
         visual: On-screen context settings, or None to skip that step.
         span: ``(start, end)`` in seconds when only that stretch of the
             recording is transcribed and described.
+        verify: The local Whisper model to check an OpenAI transcript
+            against, or None.
+        batched: Decode the local pass (the Local engine's run, or the
+            cross-check) in batches.
     """
     settings = get_settings()
     base_name = _safe_stem(st.session_state.original_filename)
@@ -1495,6 +1600,8 @@ def run_transcription(
             progress,
             visual_notes,
             span,
+            verify,
+            batched,
         )
         if not ran:
             notices.append(
@@ -1509,6 +1616,7 @@ def run_transcription(
             st.session_state.srt_path = (
                 srt_path if with_timestamps and srt_path.exists() else None
             )
+            notices += _run_warnings(transcription_spent)
             title_spent = _make_title(transcript_path, progress, notices)
             st.session_state.elapsed_seconds = time.monotonic() - started
             # Cleared only now: a retry that fails before writing anything still
@@ -1526,7 +1634,7 @@ def run_transcription(
                     vision_spent += vision.unbilled_usage(
                         cache, visual["model"], used_frames
                     )
-            st.session_state.run_cost = _with_span(
+            cost = _with_span(
                 _run_cost(
                     provider,
                     transcription_spent,
@@ -1535,17 +1643,24 @@ def run_transcription(
                 ),
                 span,
             )
+            # Recorded with the row, to tell batched runs apart later.
+            st.session_state.run_cost = (
+                {**cost, "local_batched": True} if batched else cost
+            )
             row_id = save_to_history(source_type, provider, model, with_timestamps)
             # Only now: a run stopped after its last chunk has already written
             # the transcript but not saved it, and must be able to resume free.
             # And straight after the row, with no Streamlit call in between: each
             # one (session state included) is where a Stop takes effect, and a
             # Stop between the row and the discard would let Start save the
-            # same transcript as a second row.
+            # same transcript as a second row. The parts are first copied
+            # beside the history (keep_run makes no Streamlit call either):
+            # they are the only record of what each chunk's answer held.
             if audio_digest:
-                checkpoints.discard(
-                    transcribe.checkpoint_dir(audio_digest, model, span)
-                )
+                parts = transcribe.checkpoint_dir(audio_digest, model, span)
+                if row_id is not None:
+                    checkpoints.keep_run(parts, row_id)
+                checkpoints.discard(parts)
             if cache is not None:
                 if visual_complete:
                     checkpoints.discard(cache)
@@ -1602,6 +1717,8 @@ def _request_job() -> None:
     """
     st.session_state.job = {"params": None, "worker": None}
     st.session_state.run_notices = None
+    # A fresh tally of the files a queue gets through from this click on.
+    st.session_state.queue_finished = None
 
 
 def _saved_parts_hint(
@@ -1647,7 +1764,10 @@ def _stopped_notice(job: dict[str, Any]) -> list[tuple[str, str]]:
         hint = _saved_parts_hint(params["model"], span=params.get("span"))
     else:
         hint = "Press Start to run it again."
-    return [("warning", f"The last run was stopped before it finished. {hint}")]
+    return [
+        ("warning", f"The last run was stopped before it finished. {hint}"),
+        *_queue_notices(),
+    ]
 
 
 def _request_stop() -> None:
@@ -1767,8 +1887,71 @@ def _execute_job(area: Any | None, params: dict[str, Any] | None) -> None:
             # Anything unexpected still has to release the disabled controls.
             logger.exception("Run failed")
             st.session_state.run_notices = [("error", f"Unexpected error: {exc}")]
+    if _advance_queue():
+        # The rerun draws the page for the next upload — still locked —
+        # prepares it, and runs its job at the end, as this one was run.
+        st.rerun()
+    st.session_state.run_notices = [
+        *(st.session_state.run_notices or []),
+        *_queue_notices(),
+    ]
     st.session_state.job = None
     st.rerun()
+
+
+def _advance_queue() -> bool:
+    """After a run, note the upload it finished and ask for the next one waiting.
+
+    Only a run that saved its row counts as finished: a failed, partial or
+    keyless run leaves its file where it is, so the page shows what went wrong
+    and Start takes that file again before the rest.
+
+    Returns:
+        True when another upload waits and its job has been requested.
+    """
+    if st.session_state.run_row_id is None:
+        return False
+    done: set[str] = st.session_state.queue_done or set()
+    done.add(st.session_state.upload_id)
+    st.session_state.queue_done = done
+    if not st.session_state.queue_waiting:
+        return False
+    finished: list[str] = st.session_state.queue_finished or []
+    finished.append(st.session_state.original_filename)
+    st.session_state.queue_finished = finished
+    st.session_state.job = {"params": None, "worker": None}
+    return True
+
+
+def _queue_notices() -> list[tuple[str, str]]:
+    """Say where a queue of uploads stands when its run ends, or stops at a file.
+
+    Returns:
+        A note naming the files got through before this one (the tally is
+        cleared with it), and one naming those still waiting — when there
+        are any.
+    """
+    notices: list[tuple[str, str]] = []
+    finished: list[str] = st.session_state.queue_finished or []
+    if finished:
+        st.session_state.queue_finished = None
+        notices.append(
+            (
+                "info",
+                "Transcribed before this file, one after another: "
+                f"{', '.join(finished)} — each is in History.",
+            )
+        )
+    waiting: list[str] = st.session_state.queue_waiting or []
+    if waiting:
+        notices.append(
+            (
+                "info",
+                f"Still waiting: {', '.join(waiting)} — Start takes this file "
+                "first, then those, one after another.",
+            )
+        )
+    return notices
 
 
 def _describe_cost(cost: dict[str, Any]) -> str:
@@ -1809,6 +1992,9 @@ def _describe_cost(cost: dict[str, Any]) -> str:
         parts.append(
             f"title {title['input_tokens']:,} → {title['output_tokens']:,} tokens"
         )
+    verified = (transcription or {}).get("verified")
+    if verified and not verified.get("error"):
+        parts.append(f"checked with local Whisper ({verified['model']}, free)")
     span = cost.get("span")
     if span:
         parts.append(
@@ -1930,14 +2116,17 @@ def _uploader_label_css() -> None:
     )
 
 
-def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
-    """Offer the engine, model and timestamp choices.
+def render_engine_options(disabled: bool) -> tuple[str, str]:
+    """Offer the engine and its model.
+
+    The choices that depend on them come after the on-screen option
+    (:func:`render_output_options`).
 
     Args:
         disabled: True while a job runs.
 
     Returns:
-        The provider, the model and whether subtitles were requested.
+        The provider and the model.
     """
     providers = PROVIDERS if LOCAL_AVAILABLE else [PROVIDER_OPENAI]
     provider = st.radio("Engine", providers, horizontal=True, disabled=disabled)
@@ -1956,13 +2145,7 @@ def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
                 "no key, no cost."
             ),
         )
-        # Local models all return native timestamps.
-        with_timestamps = st.checkbox(
-            "Include timestamps & generate subtitles (.srt)",
-            value=False,
-            disabled=disabled,
-        )
-        return provider, model, with_timestamps
+        return provider, model
 
     model = st.selectbox(
         "Transcription model",
@@ -1978,18 +2161,109 @@ def render_engine_options(disabled: bool) -> tuple[str, str, bool]:
             "timestamps & subtitles (.srt)."
         ),
     )
-    if model in TIMESTAMP_MODELS:
+    return provider, model
+
+
+def render_output_options(
+    provider: str, model: str, disabled: bool
+) -> tuple[bool, str | None, bool]:
+    """Offer subtitles or the local cross-check, then batched local decoding.
+
+    Args:
+        provider: The engine chosen.
+        model: The model chosen.
+        disabled: True while a job runs.
+
+    Returns:
+        Whether subtitles were requested, the local model to check an OpenAI
+        transcript against (``None`` unless asked for), and whether the local
+        pass is decoded in batches (offered only when one runs).
+    """
+    # Local models all return native timestamps.
+    if provider == PROVIDER_LOCAL or model in TIMESTAMP_MODELS:
         with_timestamps = st.checkbox(
             "Include timestamps & generate subtitles (.srt)",
             value=False,
             disabled=disabled,
         )
+        verify = None
     else:
         with_timestamps = False
         st.caption(
             "Exact timestamps & subtitles are available only with the whisper-1 model."
         )
-    return provider, model, with_timestamps
+        verify = _render_verify_option(disabled)
+    runs_locally = provider == PROVIDER_LOCAL or verify is not None
+    batched = _render_batched_option(disabled) if runs_locally else False
+    return with_timestamps, verify, batched
+
+
+def _render_batched_option(disabled: bool) -> bool:
+    """Offer batched decoding for the local Whisper pass (off unless ticked).
+
+    Args:
+        disabled: True while a job runs.
+
+    Returns:
+        Whether the local pass is decoded in batches.
+    """
+    return st.checkbox(
+        "Faster local Whisper (batched, about 1.5×)",
+        value=False,
+        disabled=disabled,
+        help=(
+            "Cuts the recording at pauses into pieces of up to 30 seconds and "
+            f"has the local model write {LOCAL_BATCH_SIZE} of them at once. "
+            "Measured on this computer with `base`: a 14-minute recording in "
+            "37 seconds instead of 62, with every word kept. The catch: each "
+            "piece is written without the text before it and without a second "
+            "try, so a name can be spelled differently from piece to piece and "
+            "a garbled piece stays garbled. Try it on a recording you know."
+        ),
+    )
+
+
+def _render_verify_option(disabled: bool) -> str | None:
+    """Offer a check of the OpenAI transcript against a local Whisper pass.
+
+    Only when the offline backend is installed: the check runs the recording
+    through a local model after the paid run, aligns the two texts, and gives
+    the transcript the recording's own times and any speech the API answer
+    lacked (see ``align``).
+
+    Args:
+        disabled: True while a job runs.
+
+    Returns:
+        The local model to check with, or ``None`` when the box is not ticked.
+    """
+    if not LOCAL_AVAILABLE:
+        return None
+    wanted = st.checkbox(
+        "Verify with local Whisper",
+        value=False,
+        disabled=disabled,
+        help=(
+            "After the OpenAI run, the same audio is transcribed by a local "
+            "Whisper model (free, on this computer) and the two texts are "
+            "compared word by word. Paragraphs then carry the recording's own "
+            "times, written (M:SS) instead of the estimated (~M:SS), and any "
+            "stretch the OpenAI answer lacks is added from the local pass, "
+            "marked 🧩. It takes time, not money: `small` ran at about 4× real "
+            "time on a CPU (a 52-minute recording in about 13 minutes); `base` "
+            "and `tiny` are faster, bigger models slower."
+        ),
+    )
+    if not wanted:
+        return None
+    return st.selectbox(
+        "Local Whisper model for the check",
+        options=list(LOCAL_MODELS),
+        index=list(LOCAL_MODELS).index(DEFAULT_VERIFY_MODEL),
+        format_func=lambda name: f"{name} · {LOCAL_MODELS[name]}",
+        disabled=disabled,
+        key="verify_model",
+    )
 
 
 def render_resume_hint(
@@ -2035,6 +2309,12 @@ _FORMATS_HELP = (
     "**Audio**\n\n"
     "- MP3, WAV, M4A, AAC, FLAC, OGG, Opus, WMA, AIFF, AMR"
 )
+# What several uploads at once mean, for the same help.
+_QUEUE_HELP = (
+    "\n\n**Several files at once:** they are transcribed one after another, in "
+    "the order listed, with the settings chosen once; each goes to History as "
+    "it finishes."
+)
 
 # A chosen file: what identifies it, its name, a function that returns it on
 # disk (saving an upload first), and its version on disk (a folder file only).
@@ -2057,6 +2337,69 @@ def _local_files_allowed() -> bool:
     return get_settings().allow_local_files and address in _LOOPBACK
 
 
+def _queue_position(uploads: list[Any]) -> tuple[Any, list[Any]]:
+    """Pick the upload the page works on, and those that wait after it.
+
+    The first not yet transcribed in this session, in the uploader's order —
+    a file added later joins the end. When every one is done, the last, so
+    its result stays on the page.
+
+    Args:
+        uploads: What the uploader holds.
+
+    Returns:
+        The current upload, and the ones waiting their turn.
+    """
+    done: set[str] = st.session_state.queue_done or set()
+    pending = [upload for upload in uploads if upload.file_id not in done]
+    if not pending:
+        return uploads[-1], []
+    return pending[0], pending[1:]
+
+
+def _render_queue(uploads: list[Any], current: Any, running: bool) -> None:
+    """List several uploads with where each stands, under the uploader.
+
+    Args:
+        uploads: What the uploader holds, in its order.
+        current: The one the page works on.
+        running: True while a job runs — the current one is being transcribed.
+    """
+    if len(uploads) < 2:
+        return
+    done: set[str] = st.session_state.queue_done or set()
+    lines = []
+    for upload in uploads:
+        if upload.file_id in done:
+            lines.append(f"- :material/check_circle: {upload.name} — done, in History")
+        elif upload.file_id == current.file_id:
+            state = "transcribing now" if running else "this one next"
+            lines.append(f"- :material/play_arrow: {upload.name} — {state}")
+        else:
+            lines.append(f"- :material/schedule: {upload.name} — waiting")
+    st.markdown("\n".join(lines))
+    st.caption(
+        "Transcribed one after another, in this order, with the settings below; "
+        "each goes to History as it finishes."
+    )
+
+
+def _queue_caption(waiting: list[str]) -> str:
+    """Say what follows the file on the page when more wait their turn.
+
+    Args:
+        waiting: The names of the uploads after this one.
+
+    Returns:
+        One sentence for the caption under Start.
+    """
+    return (
+        f":material/playlist_play: After this file: {', '.join(waiting)} — one "
+        "after another, with the settings above, each saved to History as it "
+        "finishes. The slider applies to this file only; the others are sent whole."
+    )
+
+
 def _choose_source(disabled: bool) -> ChosenFile | None:
     """Offer an upload, or a recording from a folder on this computer.
 
@@ -2067,6 +2410,8 @@ def _choose_source(disabled: bool) -> ChosenFile | None:
         The chosen file, or ``None`` while there is none.
     """
     local_files = _local_files_allowed()
+    # Filled in below when several uploads wait their turn.
+    st.session_state.queue_waiting = None
     source = SOURCE_UPLOAD
     if local_files:
         _preference("source")
@@ -2087,26 +2432,30 @@ def _choose_source(disabled: bool) -> ChosenFile | None:
     # window later, when the folder source is shown again.
     st.session_state.pop("pick_pending", None)
 
-    help_text = _FORMATS_HELP
+    help_text = _FORMATS_HELP + _QUEUE_HELP
     if local_files:
         help_text += (
             "\n\n**Large recordings:** choose *From a folder on this computer* "
             "instead. An upload is held in the app's memory while it arrives, and "
             "a big one fails when memory runs short."
         )
-    uploaded_file = st.file_uploader(
-        "Choose video or audio file",
+    uploads = st.file_uploader(
+        "Choose video or audio files",
         type=VIDEO_FORMATS + AUDIO_FORMATS,
+        accept_multiple_files=True,
         key=f"uploader_{st.session_state.uploader_generation or 0}",
         disabled=disabled,
         help=help_text,
     )
-    if not uploaded_file:
+    if not uploads:
         return None
+    current, waiting = _queue_position(uploads)
+    st.session_state.queue_waiting = [upload.name for upload in waiting]
+    _render_queue(uploads, current, disabled)
     return (
-        uploaded_file.file_id,
-        uploaded_file.name,
-        lambda: audio.save_uploaded_file(uploaded_file),
+        current.file_id,
+        current.name,
+        lambda: audio.save_uploaded_file(current),
         None,
     )
 
@@ -2414,9 +2763,13 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
             if st.session_state.audio_path:
                 with st.container(border=True):
                     st.subheader(":material/counter_3: Transcription")
-                    provider, model, with_timestamps = render_engine_options(running)
+                    provider, model = render_engine_options(running)
+                    # What is on screen first, then subtitles and the checks.
                     visual = render_visual_options(
                         source_type, disabled=running, span=span
+                    )
+                    with_timestamps, verify, batched = render_output_options(
+                        provider, model, running
                     )
                     render_resume_hint(provider, model, span)
                     params = {
@@ -2426,6 +2779,8 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
                         "source_type": source_type,
                         "visual": visual,
                         "span": span,
+                        "verify": verify,
+                        "batched": batched,
                     }
 
                     owns_job = _owns_job()
@@ -2458,6 +2813,9 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
                             ":material/stop: stops after the part in progress (it "
                             "is kept) — usually within a minute."
                         )
+                    waiting = st.session_state.queue_waiting
+                    if waiting:
+                        st.caption(_queue_caption(waiting))
                     job_area = st.container()
                     render_run_notices()
 
@@ -2489,6 +2847,40 @@ def _history_cost(record: Any) -> str | None:
     ):
         return "free (local)"
     return usage.format_usd(record["cost_usd"], bool(details.get("estimated")))
+
+
+def _history_checks(record: Any) -> tuple[str | None, str | None]:
+    """Read from a history row what its run found out about its answers.
+
+    Args:
+        record: A row from :func:`db.list_transcriptions`.
+
+    Returns:
+        A warning naming the parts that may have lost speech (``None`` when
+        none was flagged, or the row predates the records), and a note on the
+        cross-check against a local pass (``None`` when there was none).
+    """
+    try:
+        details = json.loads(record["usage_json"] or "{}")
+    except ValueError:
+        return None, None
+    transcription = details.get("transcription") or {}
+    flagged = transcribe.describe_flagged(transcription.get("chunks") or [])
+    verified = transcription.get("verified")
+    checked = None
+    if verified and not verified.get("error"):
+        checked = _describe_verified(verified)
+    return flagged, checked
+
+
+def _delete_entry(record_id: int) -> None:
+    """Delete a history row and the parts kept for its run (a callback).
+
+    Args:
+        record_id: The transcription id.
+    """
+    db.delete_transcription(record_id)
+    checkpoints.discard_run(record_id)
 
 
 def _request_retitle(record_id: int) -> None:
@@ -2651,6 +3043,11 @@ def render_history_tab() -> None:
             if cost_text:
                 meta_parts.append(cost_text)
             st.caption(" · ".join(meta_parts))
+            flagged, checked = _history_checks(record)
+            if flagged:
+                st.warning(flagged)
+            if checked:
+                st.caption(f":material/fact_check: {checked}")
 
             full = db.get_transcription(record["id"])
             if full is None:
@@ -2698,7 +3095,7 @@ def render_history_tab() -> None:
                 "Delete",
                 key=f"hist_del_{record['id']}",
                 icon=":material/delete:",
-                on_click=db.delete_transcription,
+                on_click=_delete_entry,
                 args=(record["id"],),
             )
 
@@ -2719,6 +3116,9 @@ def main() -> None:
     )
 
     get_settings()  # load settings and create working dirs (API key is optional)
+    # Every run leaves one line per part in data/logs/app.log; the console
+    # shows the same lines but keeps nothing once it is closed.
+    enable_file_log()
     db.init_db()
     init_session_state()
     if "checkpoints_pruned" not in st.session_state:

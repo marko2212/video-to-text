@@ -12,8 +12,12 @@ address = "localhost"
 gatherUsageStats = false
 
 [client]
-# No "Deploy" button: the app is run locally, never deployed to Streamlit's cloud.
-toolbarMode = "minimal"
+# "viewer" drops the developer items (Deploy, Rerun, Clear cache): the app is run
+# locally, never deployed to Streamlit's cloud. It keeps the menu at the top right
+# with the System / Light / Dark theme choice. Not "minimal": that hides the whole
+# menu, theme choice included (2026-11-04). The README screenshot script passes
+# "minimal" on its own command line, so its pictures show no menu.
+toolbarMode = "viewer"
 
 # The look: an indigo accent instead of Streamlit's red, the system's own font,
 # bordered fields, smaller headings and a lighter sidebar with a border. Light

@@ -134,6 +134,6 @@ data/transcriptions.db-*
 # Local Claude Code settings (machine-specific permissions)
 .claude/settings.local.json
 
-
-
-
+# Application log and the kept parts of finished runs (transcript text)
+data/logs/
+data/runs/

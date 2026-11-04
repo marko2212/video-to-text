@@ -730,3 +730,415 @@ def test_the_local_engine_cuts_the_stretch_out_and_keeps_the_recording_s_times(
     assert text.startswith("⏭️ Transcribed 10:00–12:00 of the recording")
     assert "(10:00) Hello there." in text
     assert not list(config.get_settings().temp_dir.glob("stretch-*.wav"))
+
+
+# --- a thin answer: part of a chunk missing, no error ----------------------------
+
+
+def _speech(words: int, start: int = 0) -> str:
+    # Distinct words, so a sentence can be told apart from a repeat of it.
+    return " ".join(f"w{start + i}" for i in range(words)) + "."
+
+
+def _thin_answer(name, ms):
+    # Two full chunks at 120 words/min; the third comes back almost empty, as
+    # chunk 08 of the owner's 52-minute presentation did (1 word/min).
+    if name == "chunk_002":
+        return _text("almost nothing here.", tokens=5)
+    if name.startswith("chunk_002"):
+        return _text(_speech(300), tokens=400)
+    return _text(_speech(600), tokens=800)
+
+
+def test_a_thin_answer_is_split_and_the_halves_replace_it(pipeline):
+    client = FakeClient(_thin_answer)
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert [name for name, _ in client.calls] == [
+        "chunk_000",
+        "chunk_001",
+        "chunk_002",
+        "chunk_002a",
+        "chunk_002b",
+    ]
+    assert "almost nothing here" not in text
+    assert "⚠️" not in text
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["part"] for r in records] == ["000", "001", "002a", "002b"]
+    assert [r["index"] for r in records] == [0, 1, 2, 2]
+    assert not any(r["thin"] or r["capped"] for r in records)
+    assert records[0]["words_per_min"] == pytest.approx(120, abs=5)
+    assert transcribe.describe_flagged(records) is None
+    # The thin answer was paid for and is counted with the halves.
+    assert pipeline.spent[-1]["requests"] == 5
+
+
+def test_a_half_that_is_still_thin_is_kept_and_marked(pipeline):
+    def still_thin(name, ms):
+        if name.startswith("chunk_002"):
+            return _text("almost nothing here.", tokens=5)
+        return _text(_speech(600), tokens=800)
+
+    client = FakeClient(still_thin)
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert [name for name, _ in client.calls][-3:] == [
+        "chunk_002",
+        "chunk_002a",
+        "chunk_002b",
+    ]
+    # Both halves are kept, each with a line that says it may be incomplete.
+    assert text.count("almost nothing here.") == 2
+    assert text.count("came back with far fewer words than expected") == 2
+    assert "against about 120 in the rest" in text
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["thin"] for r in records] == [False, False, True, True]
+    assert records[2]["typical_words_per_min"] == 120
+    warning = transcribe.describe_flagged(records)
+    assert warning.startswith("Speech may be missing in 2 part(s) — ")
+    assert warning.count("(1 words/min against about 120)") == 2
+    assert warning.endswith("The transcript marks them ⚠️.")
+
+
+def test_the_first_chunk_cannot_be_thin_and_a_quiet_recording_never_is(pipeline):
+    # No earlier chunk to compare with: the first answer is taken as it is.
+    first = FakeClient(lambda n, ms: _text("short.", tokens=5))
+    pipeline.run(_tone(5 * MINUTE), first)
+    assert [name for name, _ in first.calls] == ["chunk_000"]
+
+    # A recording with little speech (2 words/min throughout) has no typical
+    # rate worth a comparison, so an empty chunk is not re-sent either.
+    quiet = FakeClient(
+        lambda n, ms: _text("" if n == "chunk_002" else _speech(10), tokens=20)
+    )
+    pipeline.run(_tone(15 * MINUTE), quiet)
+    assert [name for name, _ in quiet.calls] == ["chunk_000", "chunk_001", "chunk_002"]
+    assert "⚠️" not in pipeline.output.read_text(encoding="utf-8")
+
+
+def test_a_thin_split_is_resumed_without_paying_for_the_thin_answer_again(pipeline):
+    audio = _tone(15 * MINUTE)
+
+    def first_try(name, ms):
+        if name == "chunk_002b":
+            raise _server_error()
+        return _thin_answer(name, ms)
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(audio, FakeClient(first_try))
+
+    second = FakeClient(_thin_answer)
+    pipeline.run(audio, second)
+
+    assert [name for name, _ in second.calls] == ["chunk_002b"]
+    # Two full chunks, the thin answer, and its two halves.
+    assert pipeline.spent[-1]["requests"] == 5
+
+
+def test_every_answered_part_leaves_one_log_line_and_the_plan_is_logged_once(
+    pipeline, caplog
+):
+    import logging
+
+    def answer(name, ms):
+        result = _text(_speech(600), tokens=800)
+        result._request_id = f"req_{name}"
+        return result
+
+    with caplog.at_level(logging.INFO, logger="transcribe"):
+        pipeline.run(_tone(10 * MINUTE), FakeClient(answer))
+
+    messages = [record.getMessage() for record in caplog.records]
+    plans = [m for m in messages if m.startswith("Chunk plan for meeting.wav with")]
+    assert len(plans) == 1
+    assert "gpt-4o-transcribe: 2 part(s): 0:00–" in plans[0]
+    lines = [m for m in messages if m.startswith("Part 00")]
+    assert len(lines) == 2
+    assert lines[0].startswith("Part 000 (0:00–")
+    assert "answered in" in lines[0]
+    assert "800 output tokens" in lines[0]
+    assert "600 words, 120 words/min, request req_chunk_000" in lines[0]
+    assert "thin" not in lines[0] and "capped" not in lines[0]
+    records = pipeline.spent[-1]["chunks"]
+    assert records[0]["request_id"] == "req_chunk_000"
+    assert records[0]["output_tokens"] == 800
+    assert records[0]["chars"] == len(_speech(600))
+
+
+def test_a_capped_answer_is_logged_and_recorded_as_such(pipeline, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="transcribe"):
+        pipeline.run(
+            _tone(5 * MINUTE),
+            FakeClient(lambda name, ms: _text(f"Loop {name}", tokens=2048)),
+        )
+
+    lines = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("Part")
+    ]
+    assert any(
+        line.startswith("Part 000 (") and ", capped, request" in line for line in lines
+    )
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["capped"] for r in records] == [True, True]
+    assert "stopped at the output cap" in transcribe.describe_flagged(records)
+
+
+def test_parts_saved_by_an_older_version_still_get_a_record():
+    pieces = [
+        {
+            "start": 300.0,
+            "duration": 300.0,
+            "text": _speech(500),
+            "usage": [{"output_tokens": 640}],
+            "thin": True,
+        }
+    ]
+
+    [record] = transcribe.chunk_records(pieces)
+
+    assert record["index"] == 0 and record["part"] is None
+    assert (record["start"], record["end"]) == (300.0, 600.0)
+    assert record["output_tokens"] == 640
+    assert record["words"] == 500 and record["words_per_min"] == 100.0
+    assert record["request_id"] is None
+    assert record["thin"] and not record["capped"]
+
+
+def test_a_thin_whisper_1_part_is_marked_among_its_timed_segments(pipeline):
+    def answer(name, ms):
+        if name.startswith("chunk_001"):
+            return _text(
+                "x", segments=[SimpleNamespace(start=1.0, end=2.0, text=" x ")]
+            )
+        words = [
+            SimpleNamespace(start=i * 0.5, end=i * 0.5 + 0.4, text=f" w{i} ")
+            for i in range(1200)
+        ]
+        return _text(_speech(1200), segments=words)
+
+    text = pipeline.run(_tone(20 * MINUTE), FakeClient(answer), model="whisper-1")
+
+    # The second 10-minute part answered with one word: split, both halves
+    # still thin, each marked at its end among the timed lines.
+    assert text.count("came back with far fewer words") == 2
+    assert "(10:0" in text
+
+
+# --- the cross-check against a local Whisper pass ---------------------------------
+
+
+class FakeWhisper:
+    """Stands in for faster_whisper.WhisperModel: fixed timed segments."""
+
+    def __init__(self, segments, duration=120.0):
+        self.segments = segments
+        self.duration = duration
+        self.calls = 0
+
+    def transcribe(self, path, vad_filter):
+        self.calls += 1
+        return iter(self.segments), SimpleNamespace(duration=self.duration)
+
+
+_SAID = [
+    (0.0, 4.0, "Good morning everyone and welcome to the quarterly review."),
+    (4.0, 8.0, "Today we look at the numbers for the third quarter."),
+    (60.0, 64.0, "Let us move on to the product roadmap for next year."),
+    (64.0, 68.0, "The migration to the new platform starts in January."),
+    (68.0, 72.0, "Every team gets a dedicated contact for the transition."),
+    (72.0, 76.0, "Questions about the timeline go to the programme office."),
+    (100.0, 104.0, "That is all for today, thank you for joining."),
+]
+
+
+def _whisper():
+    return FakeWhisper([SimpleNamespace(start=s, end=e, text=t) for s, e, t in _SAID])
+
+
+def test_the_local_pass_re_times_the_transcript_and_fills_what_the_api_lacked(
+    pipeline,
+):
+    # The API answer lacks the roadmap part; its second paragraph is stamped
+    # by character share near 1:00 although it was spoken at 1:40.
+    api_text = (
+        "Good morning everyone and welcome to the quarterly review. Today we "
+        "look at the numbers for the third quarter. That is all for today, "
+        "thank you for joining."
+    )
+    whisper = _whisper()
+    client = FakeClient(lambda n, ms: _text(api_text, tokens=60))
+
+    text = pipeline.run(_tone(2 * MINUTE), client, verify=(whisper, "base"))
+
+    assert whisper.calls == 1
+    lines = text.strip().split("\n\n")
+    assert lines[0].startswith("🔍 Checked against a local Whisper pass (base): ")
+    assert lines[1].startswith("(0:00) Good morning everyone")
+    assert lines[2].startswith("🧩 (1:00) Let us move on to the product roadmap")
+    assert "(~" not in text
+    verified = pipeline.spent[-1]["verified"]
+    assert verified["model"] == "base"
+    assert verified["gaps"] == 1 and verified["added_words"] == 38
+    assert verified["anchored"] == verified["paragraphs"] == 1
+    assert verified["seconds"] >= 0
+    assert "chunks" in pipeline.spent[-1]
+
+
+def test_a_failed_local_pass_leaves_the_paid_transcript_as_it_is(pipeline):
+    class Broken:
+        def transcribe(self, path, vad_filter):
+            raise RuntimeError("model file corrupt")
+
+    client = FakeClient(lambda n, ms: _text("Said in the meeting.", tokens=10))
+    text = pipeline.run(_tone(2 * MINUTE), client, verify=(Broken(), "base"))
+
+    assert "(~0:00) Said in the meeting." in text
+    assert "🔍" not in text
+    verified = pipeline.spent[-1]["verified"]
+    assert verified == {"model": "base", "error": "model file corrupt"}
+
+
+def test_a_model_with_its_own_times_is_not_checked(pipeline):
+    whisper = _whisper()
+    segment = SimpleNamespace(start=1.0, end=2.0, text=" Hello. ")
+    client = FakeClient(lambda n, ms: _text("unused", segments=[segment]))
+
+    text = pipeline.run(
+        _tone(2 * MINUTE), client, model="whisper-1", verify=(whisper, "base")
+    )
+
+    assert whisper.calls == 0
+    assert "(0:01) Hello." in text
+    assert "verified" not in pipeline.spent[-1]
+
+
+def test_a_partial_run_skips_the_check(pipeline):
+    whisper = _whisper()
+
+    def failing(name, ms):
+        if name == "chunk_001":
+            raise _server_error()
+        return _text("Said.")
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(_tone(12 * MINUTE), FakeClient(failing), verify=(whisper, "base"))
+
+    assert whisper.calls == 0
+
+
+# --- batched local decoding (opt-in) ---------------------------------------------
+
+
+def _word(start: float, end: float, word: str) -> SimpleNamespace:
+    return SimpleNamespace(start=start, end=end, word=word)
+
+
+class FakeBatched:
+    """Stands in for faster_whisper.BatchedInferencePipeline."""
+
+    def __init__(self, segments, duration=120.0):
+        self.segments = segments
+        self.duration = duration
+        self.kwargs = []
+
+    def transcribe(self, path, **kwargs):
+        self.kwargs.append(kwargs)
+        return iter(self.segments), SimpleNamespace(duration=self.duration)
+
+
+def test_a_batched_local_run_splits_each_piece_into_sentences(tmp_path, monkeypatch):
+    # One piece of up to 30 s, as batched decoding returns it, with word times.
+    piece = SimpleNamespace(
+        start=0.0,
+        end=7.0,
+        text=" Hello there. How are you? Fine thanks",
+        words=[
+            _word(0.0, 0.5, " Hello"),
+            _word(0.6, 1.2, " there."),
+            _word(1.5, 2.0, " How"),
+            _word(2.1, 2.4, " are"),
+            _word(2.5, 3.0, " you?"),
+            _word(6.0, 6.5, " Fine"),  # after a pause of three seconds
+            _word(6.6, 7.0, " thanks"),
+        ],
+    )
+    batched = FakeBatched([piece])
+    wrapped = []
+
+    def wrap(model):
+        wrapped.append(model)
+        return batched
+
+    monkeypatch.setattr(transcribe, "_batched_pipeline", wrap)
+    model = object()
+    output, srt = tmp_path / "out.txt", tmp_path / "out.srt"
+
+    transcribe.transcribe_local(
+        tmp_path / "meeting.wav",
+        output,
+        model,
+        with_timestamps=True,
+        srt_output_file=srt,
+        batched=True,
+    )
+
+    assert wrapped == [model]
+    # Word times, not the pieces' own timestamps: with those, faster-whisper
+    # 1.2.1 left out a piece's last sentence.
+    assert batched.kwargs == [
+        {
+            "vad_filter": True,
+            "batch_size": config.LOCAL_BATCH_SIZE,
+            "word_timestamps": True,
+        }
+    ]
+    cues = [
+        cue.splitlines()[1:] for cue in srt.read_text(encoding="utf-8").split("\n\n")
+    ]
+    assert cues == [
+        ["00:00:00,000 --> 00:00:01,200", "Hello there."],
+        ["00:00:01,500 --> 00:00:03,000", "How are you?"],
+        ["00:00:06,000 --> 00:00:07,000", "Fine thanks"],
+    ]
+
+
+def test_a_long_batched_piece_without_pauses_is_cut_into_short_lines():
+    words = [_word(i * 0.5, i * 0.5 + 0.4, f" w{i}") for i in range(50)]  # 25 s
+
+    lines = transcribe._split_by_words(
+        SimpleNamespace(start=0.0, end=25.0, text="", words=words)
+    )
+
+    assert len(lines) > 2
+    assert all(end - start <= 10.0 for start, end, _ in lines)
+    said = " ".join(text for *_, text in lines).split()
+    assert said == [f"w{i}" for i in range(50)]
+
+
+def test_a_batched_piece_without_word_times_is_kept_as_it_is():
+    piece = SimpleNamespace(start=1.0, end=2.0, text=" Hi.", words=None)
+
+    assert transcribe._split_by_words(piece) == [(1.0, 2.0, " Hi.")]
+
+
+def test_a_batched_cross_check_goes_through_the_batched_pipeline(pipeline, monkeypatch):
+    api_text = (
+        "Good morning everyone and welcome to the quarterly review. Today we "
+        "look at the numbers for the third quarter. That is all for today, "
+        "thank you for joining."
+    )
+    whisper = _whisper()
+    batched = FakeBatched(whisper.segments)
+    monkeypatch.setattr(transcribe, "_batched_pipeline", lambda model: batched)
+    client = FakeClient(lambda n, ms: _text(api_text, tokens=60))
+
+    text = pipeline.run(
+        _tone(2 * MINUTE), client, verify=(whisper, "base"), verify_batched=True
+    )
+
+    assert whisper.calls == 0
+    assert len(batched.kwargs) == 1
+    assert text.startswith("🔍 Checked against a local Whisper pass (base): ")
+    assert "🧩 (1:00) Let us move on to the product roadmap" in text

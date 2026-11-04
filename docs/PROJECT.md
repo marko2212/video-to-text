@@ -35,27 +35,29 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 ### Modules (thin UI, logic extracted)
 | File | Role |
 |---|---|
-| `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job). No ffmpeg/IO logic inline. |
+| `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job), several uploads as a queue of such jobs, one after another. No ffmpeg/IO logic inline. |
 | `config.py` | **Pydantic Settings + every constant** (single source of truth): formats, models, paths, limits |
 | `audio.py` | ffmpeg helpers: `save_uploaded_file`, `to_wav` (mono 16 kHz), `to_preview` (small MP3 for the player) — UI-agnostic |
 | `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, their lengths (ffprobe, cached per version), stable list labels, a file's identity — UI-agnostic |
 | `frames.py` | One-pass video scan (scene changes + 5 s grid, dHash), selection from the scan, single-frame extraction |
 | `vision.py` | Describes those frames with a vision model (cached per frame); cost estimates for the UI |
-| `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed) and `transcribe_local`; transcript rendering |
+| `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed, the output-cap and thin-answer guards, one log line and one record per answered chunk, the optional local cross-check) and `transcribe_local`; transcript rendering |
+| `align.py` | The cross-check: aligns the API text with a local pass word by word (`difflib`), re-times paragraphs, finds the stretches the API answer lacks; pure functions |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
-| `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; also the age-based clean-ups of `temp/` and `uploads/` and the space they take |
+| `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; the parts of a finished run kept in `data/runs/<row id>/`; also the age-based clean-ups of `temp/` and `uploads/` and the space they take |
 | `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions; opt-in) |
 | `titles.py` | AI title of a finished transcript: the chat request (with the transcript's script named, and one retry for a title in a foreign script), cleaning the answer into a safe file name, how a title is shown per mode |
 | `usage.py` | Per-request token and cost records (transcription, vision, title), totals, USD formatting; pure functions |
 | `db.py` | SQLite history (`data/transcriptions.db`) and the sidebar preferences stored with it |
 | `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `TitleError`, `OpenAIAccountError`) |
-| `logger.py` | `get_logger()` — stdlib logging (never `print()`) |
+| `logger.py` | `get_logger()` — stdlib logging (never `print()`); `enable_file_log()` — the rotating `data/logs/app.log`, keys blanked |
 | `scripts/` | Launchers: `run.bat` (Windows), `run.sh` (Linux/macOS), `create-shortcut.ps1`; one-off `serbian_latin_backfill.py` |
 | `tests/` | pytest — pure functions, SQLite, the pipeline with a fake client, headless UI (AppTest); no network, no ffmpeg |
 
 ### Data flow
 ```
-upload (identified by file_id, saved to uploads/)
+upload (identified by file_id, saved to uploads/) — several at once form a queue: the
+  first not yet transcribed is prepared and run, and the next one once it has finished
   OR a recording from a folder on this computer (path + size + mtime; read in place)
        → (video? ffmpeg to_wav mono-16k : use the file as-is)
        → audio player (MP3 preview for video, AMR/WMA/AIFF and files > 25 MB)
@@ -66,14 +68,20 @@ upload (identified by file_id, saved to uploads/)
           from the video again at its own time → vision model, each description
           cached under temp/checkpoints/)
        → OpenAI (5-min chunks for gpt-4o, 10 for whisper-1, cut in pauses; each
-          chunk checkpointed; an answer at the output cap is split and redone)
+          chunk checkpointed; an answer at the output cap, or with far fewer words
+          per minute than the run's median, is split and redone once; one line per
+          answered chunk in data/logs/app.log and one record in the history row)
           OR  local (whole file at once)
+       → (Verify with local Whisper, if ticked: the same audio through the local
+          engine, the two texts aligned word by word → paragraphs re-timed, missing
+          stretches added as 🧩 paragraphs)
        → rendering: (M:SS) or (~M:SS) + paragraphs, on-screen notes placed by time,
           Serbian Cyrillic → Latin only with SERBIAN_LATIN=true → .txt (+ .srt if requested)
        → (AI title, if on: a chat model names the finished transcript — after either
           engine; a title in a script the transcript never uses is sent back once;
           a failure only warns. History can title a saved row later.)
-       → write to SQLite history (a partial run is shown, marked, and not saved)
+       → write to SQLite history (a partial run is shown, marked, and not saved); the
+          run's chunk files are copied to data/runs/<row id>/ before they are discarded
 ```
 
 ### How the two engines differ
@@ -81,7 +89,7 @@ upload (identified by file_id, saved to uploads/)
 |---|---|---|
 | API key | required (`.env` or sidebar) | **not needed** |
 | Chunking | **yes** (5 min for gpt-4o — output cap; 10 for whisper-1) | **no** (whole file) |
-| Timestamps | exact with `whisper-1` (`verbose_json`); approximate `(~M:SS)` with gpt-4o | **always** (native) |
+| Timestamps | exact with `whisper-1` (`verbose_json`); approximate `(~M:SS)` with gpt-4o — exact after the optional local cross-check | **always** (native) |
 | Resume after a failure | **yes** (chunk checkpoints) | no (one pass) |
 | Cost | per token (gpt-4o-transcribe; per minute only as a `≈` estimate when no usage is reported) or per minute (whisper-1); recorded per run | free (costs CPU time) |
 
@@ -157,6 +165,121 @@ upload (identified by file_id, saved to uploads/)
   confirmed live on 2026-09-25: gpt-4o-transcribe returns it (300 input / 79 output
   tokens for a 30 s clip). If an answer ever lacks it, the guard stays silent and the
   shorter chunks are the protection.
+- **An answer with far too few words is split and redone the same way — the thin-chunk
+  guard** *(2026-11-03)*. Two paid gpt-4o-transcribe runs over a 52:10 company
+  presentation (11 five-minute chunks) each came back incomplete with no error: run 1
+  got almost nothing for chunk 08 (39:38–44:33: 1 word/min against about 120 in every
+  other chunk), and both runs lost 2:16 inside chunk 09 (44:33–49:43: 68 words/min
+  against 124 in a local faster-whisper pass of the same audio). Neither reached the
+  output cap, so the only guard there was never fired; a words-per-minute comparison per
+  chunk found them. Now `_transcribe_span` counts each answer's words per minute and
+  treats one under **50 % of the running median** of the chunks answered so far
+  (`THIN_CHUNK_SHARE`) as incomplete, exactly like a capped one: split in two, both
+  halves sent again, once; a half still thin is kept with a `⚠️ … far fewer words than
+  expected (1 a minute against about 120 in the rest)` line. Pieces already flagged thin
+  do not vote in the median, so one bad chunk cannot lower the bar for the next. The
+  guard is silent while the median is under 40 words/min
+  (`THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE`): a recording that is mostly silence,
+  music or a demo has no typical rate to compare with, and re-sending its quiet chunks
+  would only cost money. The first chunk cannot be thin (nothing to compare with). The
+  result panel warns with the stretches, History repeats the warning for as long as the
+  row lives (the records are in `usage_json`, see below). Cost of a false alarm: one
+  chunk sent again (~$0.03 for five minutes) and a marker the reader can check against
+  the audio. Rejected: an absolute floor (silence is legitimate), and comparing against
+  a local pass by default (minutes of CPU per run; it is the opt-in cross-check below).
+- **Every answered chunk leaves a trace: a log file, a record in the row, and its raw
+  answer kept beside the history** *(2026-11-03)*. The app's own traces could not find
+  the loss above: logging was console-only, the chunk checkpoints were discarded as soon
+  as the row was saved, and `usage_json` held only run totals. Now:
+  - `logger.enable_file_log()` (called once in `main()`) adds a `RotatingFileHandler`
+    on `data/logs/app.log` (5 MB × 5, `LOG_DIR` overrides the folder) next to the
+    console handler; a formatter blanks anything shaped like an OpenAI key (`sk-…`) in
+    both, as a second line of defence behind "never log the key". Importing a module
+    does not enable it — a script or a test opts in — so tests never write into the
+    real `data/`. **Plain text, not JSON** (the owner asked, with OpenTelemetry in
+    mind): OpenTelemetry would not parse this file but attach its own handler to the
+    same stdlib `logging` and send records from the source, so the file's format is
+    no bridge to it; the structured figures already live in `usage_json` and
+    `data/runs/`; a JSON line is harder to read in Notepad and needs a formatter the
+    stdlib lacks. If telemetry ever comes: spans around each chunk request with the
+    record as attributes, and the record passed as `extra` on the log line.
+  - `_transcribe_span` logs one INFO line per answered part: name, bounds, MP3 size,
+    request seconds, OpenAI's request id (`result._request_id`, which SDK 1.75 attaches
+    to parsed answers from the `x-request-id` header), output tokens, characters, words,
+    words per minute and the guard flags; the chunk plan (every boundary) is logged once
+    per run, reused parts say so, and the local engine logs its pass (segments, words,
+    words/min, seconds).
+  - The same figures are the piece's `record` (checkpointed with it) and reach the
+    history row as `usage_json["transcription"]["chunks"]` — `{index, part, start, end,
+    mp3_bytes, seconds, output_tokens, chars, words, words_per_min, request_id, thin,
+    capped, typical_words_per_min}` — through the summary `transcribe_openai` returns.
+    No new column, no migration: the column is JSON already, and rows saved before
+    have no records (`chunk_records` synthesises one from a piece's text and usage for
+    parts restored from older checkpoints, without a request id).
+  - **The raw answers are copied to `data/runs/<row id>/`, not kept in the checkpoint
+    folder.** The alternative — leaving the checkpoints until the 14-day prune — was
+    rejected because the resume logic reads them: the next run of the same file and
+    model would silently reuse every chunk (the "N already done, resuming" hint and
+    `_reusable_chunks` cannot tell a finished run from a stopped one), and
+    `_usage_records` would count their cost again in a second row — the double
+    counting the review of 2026-09-27 removed. `checkpoints.keep_run` copies the
+    folder (`copytree`, `.tmp` files left out) right after the row is written and
+    before `discard`, with no Streamlit call in between (the Stop rule of 2026-09-30
+    still holds); the folder goes with the row (`_delete_entry`), never by age — it is
+    the evidence, and small (a 52-minute run is about 60 KB). A copy that fails is a
+    warning. `data/logs/` and `data/runs/` are gitignored by name (not `*.db`).
+- **Verify with local Whisper: an opt-in cross-check that gives gpt-4o-transcribe
+  transcripts the recording's own times and the speech the API lacked**
+  *(2026-11-03)*. The `(~M:SS)` stamps are estimated by character share within a chunk,
+  so they bend by up to a minute around an omitted stretch — text before the hole is
+  stamped too late, text after it too early — and the guards above cannot fix that;
+  only a second transcription with real times can. The owner's hackathon script
+  (`merge.py`, a one-off) did exactly that for the 52-minute presentation; `align.py`
+  is its port, with tests. A checkbox under the model (OpenAI engine, gpt-4o-transcribe
+  only — whisper-1 has exact segment times natively — and only when the offline backend
+  is installed) picks a local model (`base` by default: `tiny` misses too many words to
+  align on; `small` ran at 3.9× real time on the owner's CPU, 52 minutes in 13); the
+  model is loaded before the paid run, so a model that cannot load costs nothing. After
+  the API chunks, `transcribe_openai` runs `_local_entries` (the core of
+  `transcribe_local`, now shared) over the same stretch and `_write_outputs` renders the
+  result through `build_verified_transcript`:
+  - *Alignment:* `difflib.SequenceMatcher(autojunk=False)` over normalised words
+    (casefolded, `\w` and apostrophes only — the hackathon's `[a-z0-9']` dropped every
+    Cyrillic letter). A paragraph takes the recording's own time when it has a matching
+    run of at least 4 words (`VERIFY_MIN_ANCHOR_WORDS`; "and then the" matches
+    anywhere): the local time of its first matched run that is not more than 2 s a word
+    earlier than its longest one (an earlier chance match of a common phrase is
+    ignored), less the paragraph's unmatched leading words at the local pass's own
+    seconds per word; within a local segment a word's time is its share of the segment.
+    Written plain `(M:SS)`. A paragraph without such a run keeps its estimate shifted by
+    the drift of its nearest re-timed neighbour (the earlier on a tie), still `(~M:SS)`;
+    times are then held non-decreasing in API order.
+  - *Gaps:* differences between two long matches are one region each (a chance match of
+    "of the" inside a missing stretch no longer cuts it in two, which broke the first
+    version on a synthetic case); a region with at least 25 local words
+    (`VERIFY_MIN_GAP_WORDS`) and at most a third as many API words is added as `🧩`
+    paragraphs of the local text — original wording put back token by token — broken
+    about every 40 s at a sentence end or at a segment that starts with a capital
+    (faster-whisper `base` left every sentence end unpunctuated on the synthetic
+    recording). Each goes after the last API paragraph whose time is not later. The
+    API's few words of a `replace` stay in their paragraph (a few duplicated words,
+    marked, beat a lost stretch). Stretches only the API has are counted, not removed.
+  - *Not ported:* the script's name fixes and the trimming of "thank you / yes" filler
+    at gap ends — specific to that recording and to English.
+  - *Record:* the transcript's first line says what was done (`🔍 Checked against a
+    local Whisper pass (base): 118 of 124 paragraphs carry the recording's own times;
+    2 stretch(es) with 312 words … were added from it, marked 🧩`); the run's summary
+    carries `verified` (model, seconds, paragraphs, anchored, shifted, clamped, gaps,
+    added words, API-only words, matched share) into `usage_json`, shown under the
+    result, in the cost caption ("checked with local Whisper (base, free)") and in
+    History. A local pass that fails leaves the paid transcript with its estimates and
+    a warning (`verified.error`); a partial run skips the check; the OpenAI text itself
+    is never changed.
+  - *Checked live* with the real `base` model on synthetic speech (nine TTS lines with
+    pauses, 1:47; the "API" answer was the script minus one 39-word line): all 5
+    paragraphs re-timed to the line starts (0:13, 0:37, 1:18, 1:29 where the estimates
+    said 0:18, 0:44, 1:15, 1:28), the missing line added at 0:49 (spoken at 0:49.8),
+    99 % of API words matched, 13 s for the pass. Not yet on a real meeting (§5).
 - **Chunks are cut in pauses, and tiny tails are merged** — each boundary moves to the
   quietest 250 ms window within ±10 s of the nominal cut, so shorter chunks do not
   mean more words cut in half; a final chunk under 10 s joins the previous one. The
@@ -506,6 +629,20 @@ upload (identified by file_id, saved to uploads/)
   inference with `RuntimeError: cublas64_12.dll not found` on an incomplete CUDA install.
   GPU is opt-in via `LOCAL_DEVICE=cuda`.
 - **The model downloads on demand** (first use) and is cached in `models/` (gitignored).
+- **Batched decoding is a box, off unless ticked** *(2026-11-04; the owner: "a third
+  option, not selected by default")*. faster-whisper's `BatchedInferencePipeline` cuts
+  the recording at pauses into pieces of up to 30 s and writes `LOCAL_BATCH_SIZE` (8)
+  at once: 1.70× on a 14-minute clip, every word kept. Each piece is written without
+  the text before it and without a second try (no temperature fallback), so a name can
+  be spelled differently from piece to piece and a garbled piece stays garbled — the
+  box's help says so. **Word times, not the pieces' own timestamps:** with
+  `without_timestamps=False` faster-whisper 1.2.1 left out a piece's last sentence (73
+  of 1,624 words on the 14-minute clip), and with no timestamps at all a segment is the
+  whole piece (up to 39 s: one subtitle per half minute, paragraph breaks only between
+  pieces). So `word_timestamps=True`, and `transcribe._split_by_words` cuts each piece
+  after a sentence end, before a word that follows a pause of 1 s, and before a line
+  passes 10 s. Offered wherever a local pass runs — the Local engine and the
+  cross-check — and recorded as `local_batched` in the row's usage.
 
 ### Configuration and API key
 - **Pydantic Settings** (`config.py`) — one source of truth. Constants used to be duplicated
@@ -617,6 +754,24 @@ upload (identified by file_id, saved to uploads/)
   names, and a new `call.wav` used to be ignored in favour of the old one, then
   transcribed, billed and saved under the new upload. Clearing the uploader keeps the
   last result on screen.
+- **Several uploads are a queue, taken one at a time — not in parallel** *(2026-11-03)*.
+  The uploader accepts several files. The page works on the first not yet transcribed
+  in this session (`queue_done`, their ids), prepares and shows it exactly as it would a
+  single upload, and lists the rest with where each stands. The job that finishes a
+  file notes it done, requests the next file's job and reruns, so the next file gets
+  the same locked page, run, notices and History row as a single one would — the
+  settings are read from the locked widgets each time (their values survive the rerun:
+  `disabled` is not part of a widget's identity, which the two-step run relies on
+  already), and the trim slider is keyed per file, so later files go whole. Parallel
+  runs were considered and rejected, as the owner suggested ("dovoljno je jedna po
+  jedan"): Streamlit runs one script at a time per session and Stop works by ending
+  that script; the OpenAI rate limits and the CPU-bound local engine gain nothing from
+  two at once; and the checkpoint, cost, resume and History logic is all per file. One
+  at a time keeps every bit of it as it is. A failed, partial or keyless run leaves its
+  file current, so the queue stops there with the error on the page and a note of what
+  still waits, and Start takes that file again before the rest; the files got through
+  are reported once the queue ends. Uploads only: the folder source still picks one
+  recording (a multi-pick there is a possible follow-up).
 - **The player gets a small MP3, not the working file** — videos, AMR/WMA/AIFF (which
   browsers cannot play: all 28 phone calls in the history are AMR) and uploads over
   25 MB get a 32 kbps mono preview (LAME's fastest mode: ~5 s for 90 minutes). The full
@@ -781,8 +936,12 @@ upload (identified by file_id, saved to uploads/)
     Windows, `system-ui` elsewhere: nothing is fetched from the internet, the app also
     runs offline), bordered fields, smaller headings (h1 2rem), a lighter sidebar with a
     border; `[theme.light]` and `[theme.dark]` are both set, so the menu's theme choice
-    and "use system setting" keep working; `client.toolbarMode = "minimal"` drops the
-    Deploy button;
+    (System / Light / Dark) works; `client.toolbarMode = "viewer"` drops Deploy, Rerun
+    and Clear cache but keeps that menu. *Corrected 2026-11-04:* it was `"minimal"`,
+    which hides the whole menu when nothing else adds to it, so no theme could be
+    chosen and the page followed the browser's or Windows' setting; a test now holds
+    `"viewer"`. The README screenshot script still passes `"minimal"` on its own
+    command line, so the pictures show no menu;
   - the UI's emoji (Windows draws them as colour pictures of uneven size) became
     Material icons — `:material/…:` in headings, captions, tabs and History labels,
     `icon=` on buttons — which take the text colour. A History entry with timestamps
@@ -963,9 +1122,18 @@ upload (identified by file_id, saved to uploads/)
   copy; for large files that an upload cannot hold in memory *(2026-09-29)*; found with
   **Browse…** in Windows' own file window, in any folder *(2026-09-30)*; each entry
   shows the recording's length *(2026-10-03)*
+- **Several files at once** *(2026-11-03)*: uploaded together, they are transcribed one
+  after another with the settings chosen once, each saved to History as it finishes;
+  the page lists them with where each stands, a failure stops the queue at that file
+  and Start goes on from it
+- **Faster local Whisper (batched)** *(2026-11-04)*: an opt-in box wherever a local
+  pass runs (the Local engine, or the cross-check) — pieces cut at pauses, 8 written
+  at once, split back into sentences by their word times; 1.7× on a 14-minute clip with
+  every word kept. "Describe what's on screen" now comes before the subtitle box
 - **A calmer look** — indigo theme (light and dark), system font, bordered fields, Material
   icons instead of emoji, no Deploy button; a bordered card per step and for the result,
-  downloads in one row *(2026-10-30)*
+  downloads in one row *(2026-10-30)*; the theme is chosen in the menu at the top right
+  (System / Light / Dark) *(2026-11-04)*
 - **Audio player** before and after transcription, with **a picture of the sound and a
   slider to leave the start or the end of the recording out** of the run *(2026-10-20)*:
   only the chosen stretch is sent, described and paid for; its times stay the recording's
@@ -983,6 +1151,15 @@ upload (identified by file_id, saved to uploads/)
   paying again, partial transcripts clearly marked, one-sentence errors for a bad key
   or an empty balance, controls locked during a run with a watchdog after Stop, and a
   visible Stop button that stops after the part in progress *(2026-09-30)*
+- **An incomplete answer is noticed** *(2026-11-03)*: a chunk with far fewer words per
+  minute than the run's median is split and redone like one at the output cap, and
+  what is still thin is marked `⚠️` in the transcript, under the result and in History;
+  every answered chunk leaves a line in `data/logs/app.log` and a record in the history
+  row, and a finished run's raw answers are kept in `data/runs/<row id>/`
+- **Verify with local Whisper** *(2026-11-03)*: an opt-in local pass after an OpenAI
+  run re-times every paragraph of a gpt-4o-transcribe transcript to the recording's own
+  time and adds the stretches the API answer lacked, marked `🧩`, with the figures in the
+  transcript's first line, under the result and in History
 - **Original script kept by default**; Serbian → Latin is opt-in (`SERBIAN_LATIN=true`)
   *(2026-09-25)*; one-off backfill script for saved records
 - **Playable previews** for AMR/WMA/AIFF, video and large files; fast History at 100+
@@ -1001,9 +1178,9 @@ upload (identified by file_id, saved to uploads/)
 - **Wide layout + tabs** (Transcribe / History), two-column arrangement
 
 **Quality / infrastructure**
-- Modular refactor (config/audio/transcribe/db/exceptions/logger), type hints + docstrings
+- Modular refactor (config/audio/transcribe/align/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 372 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, checkpoints, transliteration, the backfill, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 425 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue, batched local decoding, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1102,6 +1279,24 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ### Waiting for the owner
 **Next step: the owner tries the live checks below** (the app is in daily use since
 2026-10-05, and the one-day cleanup is verified).
+- [ ] **Review and commit the tracing, the thin-chunk guard, the local cross-check,
+      the upload queue, the theme menu and batched local decoding** (2026-11-03 and
+      -04, left uncommitted on purpose): `logger.py`,
+      `config.py`, `transcribe.py`, `align.py` (new), `checkpoints.py`, `app.py`,
+      `db`-free (no migration), tests, README and this file. The queue (several files
+      in the uploader, transcribed one after another) is in `app.py` and
+      `tests/test_app_flow.py` only; try it with two short recordings first. Batched
+      local decoding: run a recording you know with the box ticked and without it,
+      and compare the two transcripts. Then the live checks: the next OpenAI
+      run should leave one `Part NNN (…)` line per chunk in `data/logs/app.log` and a
+      `data/runs/<row id>/` folder; a run over the 2026-11-03 presentation with
+      **Verify with local Whisper** (`base`, then `small`) ticked should re-time the
+      paragraphs and add the 2:16 of chunk 09 as `🧩` paragraphs — compare with the
+      hand-merged transcript from the hackathon folder; and watch whether the thin guard
+      fires on a real thin chunk (it never did in the app yet, only in tests) or gives a
+      false alarm on a quiet stretch (the median floor of 40 words/min is a guess).
+      Checked here only with fakes, and the cross-check with the real `base` model on
+      synthetic English speech.
 - [ ] **The trim slider on a real recording** (2026-10-20, §3 UI): a Teams recording
       with a long empty tail — does the picture show where the meeting ended, is Page
       Down (ten seconds a press) enough to reach it, and does the OpenAI run's cost drop
@@ -1332,6 +1527,57 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ## 6. Journal
 
+### 2026-11-04 (part 2) — The on-screen option first, and batched local decoding as a box
+
+The owner asked for "Describe what's on screen" above "Include timestamps & generate
+subtitles (.srt)", and for batched decoding as a third option, off by default.
+`render_engine_options` now draws only the engine and the model; `render_output_options`
+draws the subtitle box or the cross-check, then the new box, and is called after
+`render_visual_options`, so on a video the screen option comes first (a test fails with
+the old order).
+
+Batched decoding was measured again first, with the app's own settings (`base`, int8,
+default threads, `vad_filter=True`), on the 1:47 synthetic clip and on a 14:17 clip made
+of it eight times:
+
+| mode | 1:47 | 14:17 | words | segments |
+|---|---|---|---|---|
+| plain (as before) | 6.3 s | 62.4 s | all | sentences, up to 6 s |
+| batched, no timestamps | 4.6 s | — | all | whole pieces, up to 39 s |
+| batched, timestamps kept | 5.1 s | 39.5 s | 197 of 203; 1,551 of 1,624 | up to 11 s |
+| batched, word times | 5.1 s | 36.8 s | all, each timed | split by the app |
+
+The 1.5× of 2026-11-03 compared batched decoding with a plain run *without* the silence
+filter; with it, the short clip gains only 1.24× (its four pieces do not fill one batch
+of 8) and the long one 1.70×. Keeping the pieces' own timestamps left out a whole
+sentence at a piece's end ("I can take the history page", at 1:10.8), so the box uses
+word times and splits the pieces itself (§3 Offline engine). Code: `LOCAL_BATCH_SIZE` in
+`config.py`; `_batched_pipeline`, `_split_by_words` and a `batched` flag on
+`transcribe_local` and `_local_entries` (`verify_batched` on `transcribe_openai`) in
+`transcribe.py`; `run_transcription` and `_run_pipeline` pass it on and record
+`local_batched` in the row's usage. 8 new tests (418, also without ffmpeg); README
+(features, usage step 2, offline mode). Not measured: Serbian speech, real meetings,
+other models — hence off by default. For the owner's own try, three synthetic test
+videos (English speech by two Windows voices, slides, a diagram and code; 1:44, 2:34
+and 11:12) were put in `C:\Users\MarkoA\Videos\video-to-text-probe\`. On the first,
+`base` wrote "Dragana Petrovik" twice in a plain run, and "Petrovik" then "Petrovic" in
+a batched one: the trade-off the box's help names.
+
+### 2026-11-04 — The theme choice is back in the menu
+
+The owner asked why the page offered no light theme. `client.toolbarMode = "minimal"`,
+set on 2026-10-30 to drop the Deploy button, hides the whole menu at the top right when
+nothing else adds an item to it (Streamlit 1.56's own description of the option), so the
+System / Light / Dark choice went with it, although §3 said it kept working. The page
+followed whatever the browser reported, with no way to change it from the app.
+`"viewer"` hides only the developer items (Deploy, Rerun, Clear cache) and keeps the
+menu. Tried on a scratch instance (port 8598, scratch `DATA_DIR`/`TEMP_DIR`/`UPLOAD_DIR`):
+the menu showed System / Light / Dark, Print and Record screen, no Deploy, and Light
+switched the page to the light theme with its indigo accent. `config.toml` changed and
+commented, §3 and §4 corrected, and a test fails if the mode goes back to `"minimal"`
+(410 tests). A running app picks the change up only after a restart, since Streamlit
+reads `config.toml` when it starts.
+
 ### 2026-11-03 — Python pinned to 3.13; a missing ffmpeg is named, and the README gives one command for it
 
 The owner asked which Python the app uses (3.12 or newer; 3.13.7 on this computer, an
@@ -1352,6 +1598,113 @@ whether the pin forces everyone onto 3.13: only uv users, as a default (uv downl
 if missing; pip ignores the file; `--python 3.12` or `uv python pin` overrides it). The
 alternative offered, no pin and `requires-python = ">=3.12,<3.14"`, was declined: "Zadrži
 i komituj". Committed in three parts (feat, build, docs); not pushed.
+
+### 2026-11-03 (part 3) — How fast local Whisper can go on the owner's laptop
+
+Asked how local Whisper works, whether its speed comes from the GPU or the CPU, how slow
+the biggest models would be here, and whether running several processes over the cores
+would help. Measured rather than guessed where it was cheap:
+
+- **The laptop:** Intel Core 7 150U (2 performance + 8 efficient cores, 12 threads, a
+  15 W part), 32 GB RAM, Intel integrated graphics only — no NVIDIA, so no CUDA
+  (`ctranslate2.get_cuda_device_count()` is 0); CTranslate2 cannot use an Intel iGPU.
+  Every local run is CPU, `int8`, and the app leaves `cpu_threads` at faster-whisper's
+  default of 4.
+- **How it works:** log-mel spectrogram → 30 s windows → the encoder reads a window once
+  (fixed cost) → the decoder writes token by token, each depending on the last (the
+  bulk of the time, inherently serial); faster-whisper is the same model run by
+  CTranslate2 with 8-bit weights and silence skipped.
+- **Threads:** `base` on the 1:47 synthetic clip — 4 threads 10.3 s (10.4× real time),
+  10 threads 10.0 s (10.7×), 12 threads 11.0 s (9.8×). The matmuls are already
+  multi-threaded; the limit is memory bandwidth and the chip's power budget, not cores.
+  Several processes over pieces of a file hit the same limit, load the model N times
+  and lose the previous window's context, so that was advised against.
+- **Batched decoding:** `BatchedInferencePipeline(batch_size=8)` with 10 threads — 6.8 s
+  (15.8×), the same 203 words. The one real speed-up available; offered as a P2 item.
+- **Estimates for a 52-minute recording** (anchored on the measured `small` 3.9× and
+  `base` 8–10×, scaled by model size — a rough order): tiny 3–4 min, base 5–7, small 13
+  (measured), medium 35–50, large-v3-turbo 20–35, large-v3 75–100; turbo is the biggest
+  model worth running here (large-v3's encoder with a 4-layer decoder, close to its
+  quality). An NVIDIA GPU would make even large-v3 5–20× real time.
+
+Nothing changed in the code; the benchmark script and clip live in the session's
+scratchpad. Documented at the owner's request before a context compaction.
+
+### 2026-11-03 (part 2) — Several uploads, one after another
+
+The owner asked whether several videos could be uploaded and transcribed in a queue,
+one by one — "parallel is too much, one at a time is enough, what do you think?". Agreed,
+for the reasons in §3 (one script per session, Stop ends it, per-file checkpoints and
+cost, no gain from two API or CPU runs at once), and built in `app.py` only: the
+uploader takes several files; the page works on the first not yet transcribed and lists
+the rest with where each stands; the job that finishes a file requests the next file's
+job before its rerun, so each file gets the same locked page, run, notices and History
+row as a single upload — the settings are read from the locked widgets each time. A
+failed file stops the queue with its error and a note of what still waits; Start retries
+it and goes on; a stop reports the waiting files too; the files got through are reported
+once the queue ends; "Clean temporary files" forgets the queue with the uploader. Five
+AppTest tests (three in order and saved, a failure stops and Start resumes, a file added
+later is next, a stopped queue names what waits, clean-up forgets it); 409 tests pass
+with and without ffmpeg; ruff clean. README: a feature bullet and the queue in usage
+steps 1 and 3. Checked live too, on scratch folders (`DATA_DIR`/`TEMP_DIR`/`UPLOAD_DIR`
+under the session's scratchpad, port 8599) with the Local engine (`base`) and three
+short WAVs cut from the synthetic speech: the list under the uploader showed "this one
+next / waiting", then "transcribing now", then three "done, in History"; one Start gave
+three runs (19 s, 5 s, 3 s), three History rows with the right texts, the last file's
+result on the page and the "Transcribed before this file" note; `app.log` has one
+"Local pass" line per file. Left uncommitted with the rest of the day's work (§5). Not done: a
+multi-pick for the folder source, and the same-name case (two uploads named alike in one
+queue overwrite each other's working copy — each is transcribed from its own bytes in
+turn, and History keeps each text, so only the `uploads/` copy is lost).
+
+### 2026-11-03 — A silently incomplete chunk made visible, and a local cross-check
+
+Two paid gpt-4o-transcribe runs over a 52:10 presentation each came back incomplete with
+no error: run 1 lost nearly all of chunk 08, both lost 2:16 inside chunk 09, and the
+`(~M:SS)` stamps bent by up to a minute around the hole. A local faster-whisper pass and
+a words-per-minute comparison per chunk found it, and the owner's hackathon script merged
+the API text with the local pass's times; the app's own traces could not have (console
+logging, checkpoints discarded on success, run totals only). Implemented in one pass, as
+asked, and left uncommitted for review:
+
+1. **Log file** — `logger.enable_file_log()`: `data/logs/app.log`, 5 MB × 5, `LOG_DIR`
+   in `.env`; keys blanked by the formatter. Enabled in `main()`, never on import.
+2. **One line per answered part** in `_transcribe_span` (bounds, MP3 size, request
+   seconds and id, tokens, chars, words, words/min, flags), the chunk plan once per run,
+   reused parts, and the local engine's pass. The request id is `result._request_id`
+   (SDK 1.75 sets it from `x-request-id`).
+3. **Thin-chunk guard** beside the cap guard: under 50 % of the running median → split
+   once through the same path; a thin half is kept and marked `⚠️`. Silent below a
+   40 words/min median and for the first chunk. Constants in `config.py` with the
+   measured numbers.
+4. **Per-chunk records** in `usage_json["transcription"]["chunks"]` (no migration) and a
+   warning under the result and in History (`transcribe.describe_flagged`); the raw
+   answers copied to `data/runs/<row id>/` before the discard (`checkpoints.keep_run`),
+   deleted with the row. Keeping the checkpoints instead was rejected: the resume logic
+   would reuse them silently and count their cost twice (§3).
+5. **Verify with local Whisper** — `align.py` (the hackathon `merge.py` ported, with
+   `\w` instead of `[a-z0-9']`, regions instead of raw opcodes for gaps, the paragraph's
+   first trustworthy match instead of its longest, and no filler trimming or name
+   fixes), `transcribe.build_verified_transcript`, `_local_entries` shared with the
+   local engine, a checkbox for gpt-4o-transcribe runs when the backend is installed,
+   `base` by default; the figures in the transcript header, under the result, in the
+   cost caption and in History; a failed pass only warns. README notes that whisper-1
+   returns exact segment times natively.
+
+Checked: ruff, 404 tests with and without ffmpeg (39 new: the guard, the records, the
+log lines and file, the kept parts, the alignment on synthetic transcripts, the History
+warning, the checkbox and the pass-through to the pipeline), and the cross-check live
+with the real `base` model on 1:47 of synthetic speech (§3: every paragraph re-timed to
+the spoken line, the missing 39-word line added at the right place, 13 s). Two things
+the synthetic check taught: a chance match of common words inside a missing stretch
+split it below the 25-word threshold until gaps were computed over whole regions
+between long matches, and `base` punctuates nothing on this audio, so added paragraphs
+also break at a segment that starts with a capital. Not checked: a real OpenAI run
+(costs money, the owner's call — §5). Asked afterwards whether the log should be JSON
+for a possible OpenTelemetry later: no, kept as text (§3, the log-file decision). The
+pinned taskbar and Desktop shortcuts were checked to point at `C:\Work\video-to-text`
+(`uv.exe run streamlit run app.py`), and no app instance was running, so the next
+start from the icon runs the new code; no new dependency, no database migration.
 
 ### 2026-10-30 (part 4) — A card per step
 
