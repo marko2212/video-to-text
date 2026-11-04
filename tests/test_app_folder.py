@@ -138,8 +138,8 @@ def test_a_folder_that_does_not_exist_is_reported(tmp_path):
 def test_cleaning_up_forgets_the_pick_but_keeps_the_recording(folder, fake_openai):
     test = _pick(_in_folder_mode(folder), folder / "call.wav")
 
-    clean = next(b for b in test.button if b.label == "Clean temporary files")
-    clean.click().run()
+    next(b for b in test.button if b.label == "Clean temporary files").click().run()
+    next(b for b in test.button if b.label == "Yes, clean up").click().run()
 
     assert test.selectbox(key="folder_file").value is None
     assert test.session_state.audio_path is None
@@ -506,6 +506,8 @@ def test_cleaning_up_is_offered_in_the_sidebar_with_the_space_it_frees(folder):
     assert "**0.3 MB** in use." in [c.value for c in test.sidebar.caption]
 
     test.sidebar.button[0].click().run()
+    assert (uploads / "old call.amr").exists()  # it asks first
+    next(b for b in test.sidebar.button if b.label == "Yes, clean up").click().run()
 
     assert not (uploads / "old call.amr").exists()
     assert "Nothing to clean." in [c.value for c in test.sidebar.caption]

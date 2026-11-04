@@ -455,3 +455,34 @@ def test_a_new_title_for_the_row_just_made_renames_its_downloads_too(
     test.run()
 
     assert test.session_state.stem == "Second title"
+
+
+def _click_in_entry(test: AppTest, label: str) -> AppTest:
+    """Click a button in the open entry; the browser still sends it open."""
+    open_entries = list(test.expander)
+    next(b for b in test.button if b.label == label).click()
+    return _run_as_browser(test, open_entries)
+
+
+def test_deleting_a_history_entry_asks_once(title_requests):
+    row_id = _saved_row()
+    test = _open_entry(row_id)
+
+    test = _click_in_entry(test, "Delete")
+
+    assert db.get_transcription(row_id) is not None  # only asked so far
+    assert any("Delete this transcript for good?" in w.value for w in test.warning)
+    keys = [b.key for b in test.button]
+    # Cancel first, where Delete was: a double click lands on it.
+    assert keys.index(f"hist_keep_{row_id}") < keys.index(f"hist_del_yes_{row_id}")
+
+    test = _click_in_entry(test, "Cancel")
+
+    assert db.get_transcription(row_id) is not None
+    assert any(b.label == "Delete" for b in test.button)
+
+    test = _click_in_entry(test, "Delete")
+    test = _click_in_entry(test, "Yes, delete")
+
+    assert db.get_transcription(row_id) is None
+    assert not test.expander

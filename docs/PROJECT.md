@@ -771,7 +771,25 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   file current, so the queue stops there with the error on the page and a note of what
   still waits, and Start takes that file again before the rest; the files got through
   are reported once the queue ends. Uploads only: the folder source still picks one
-  recording (a multi-pick there is a possible follow-up).
+  recording (a multi-pick there is a possible follow-up). *Shown (2026-11-04, the
+  owner):* each file carries a Streamlit badge — green *done*, yellow *transcribing*,
+  *next* in the primary colour (the Start button's), grey *waiting* — so the colour
+  comes from the theme, readable in light and dark; the file name stays plain text. A
+  **2 / 5 done** line heads the list and **File 3 of 5** stands under Start
+  (`queue_place`, set while the page is drawn, like `queue_waiting`).
+- **A button that deletes something is tinted red and asks once** *(2026-11-04, the
+  owner: "destruktivne radnje da budu blago crvene i možda da pitaju jednom pre
+  deleta")*. History's **Delete** and the sidebar's **Clean temporary files** (it also
+  deletes saved parts of unfinished, paid runs) first show a warning with **Cancel**
+  and **Yes, delete** / **Yes, clean up**; Cancel comes first, where the button was,
+  so a double click lands on it rather than confirming. The question is a session
+  value (`delete_asked` with the row id, `clean_asked`), set and cleared by button
+  callbacks like the delete itself. The tint is CSS picked by the buttons' keys
+  (Streamlit's `st-key-<key>` class) with `light-dark()`: Streamlit sets
+  `color-scheme: dark` on `.stApp` in the dark theme, so the red is #c92a2a on light
+  and #ff8a8a on dark (checked live: the computed colours switch with the menu's
+  theme); disabled buttons keep Streamlit's grey. A coloured label (`:red[...]`) was
+  the alternative, but it would change the labels the tests and the clicks look for.
 - **The player gets a small MP3, not the working file** — videos, AMR/WMA/AIFF (which
   browsers cannot play: all 28 phone calls in the history are AMR) and uploads over
   25 MB get a 32 kbps mono preview (LAME's fastest mode: ~5 s for 90 minutes). The full
@@ -1130,6 +1148,10 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   pass runs (the Local engine, or the cross-check) — pieces cut at pauses, 8 written
   at once, split back into sentences by their word times; 1.7× on a 14-minute clip with
   every word kept. "Describe what's on screen" now comes before the subtitle box
+- **Clearer queue and safer deletes** *(2026-11-04)*: coloured marks per file in the
+  queue with a **2 / 5 done** count and **File 3 of 5** under Start; downloads say
+  **Download transcript (.txt)** / **Download subtitles (.srt)**; **Delete** and
+  **Clean temporary files** are tinted red and ask once (Cancel first)
 - **A calmer look** — indigo theme (light and dark), system font, bordered fields, Material
   icons instead of emoji, no Deploy button; a bordered card per step and for the result,
   downloads in one row *(2026-10-30)*; the theme is chosen in the menu at the top right
@@ -1180,7 +1202,7 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/align/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 425 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue, batched local decoding, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 428 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1279,15 +1301,11 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ### Waiting for the owner
 **Next step: the owner tries the live checks below** (the app is in daily use since
 2026-10-05, and the one-day cleanup is verified).
-- [ ] **Review and commit the tracing, the thin-chunk guard, the local cross-check,
-      the upload queue, the theme menu and batched local decoding** (2026-11-03 and
-      -04, left uncommitted on purpose): `logger.py`,
-      `config.py`, `transcribe.py`, `align.py` (new), `checkpoints.py`, `app.py`,
-      `db`-free (no migration), tests, README and this file. The queue (several files
-      in the uploader, transcribed one after another) is in `app.py` and
-      `tests/test_app_flow.py` only; try it with two short recordings first. Batched
-      local decoding: run a recording you know with the box ticked and without it,
-      and compare the two transcripts. Then the live checks: the next OpenAI
+- [ ] **Live checks of the 2026-11-03/04 work** (committed and pushed 2026-11-04 as
+      `feat: chunk tracing, local cross-check, upload queue, batched decoding`). The
+      queue: try it with two short recordings first. Batched local decoding: run a
+      recording you know with the box ticked and without it, and compare the two
+      transcripts. The next OpenAI
       run should leave one `Part NNN (…)` line per chunk in `data/logs/app.log` and a
       `data/runs/<row id>/` folder; a run over the 2026-11-03 presentation with
       **Verify with local Whisper** (`base`, then `small`) ticked should re-time the
@@ -1526,6 +1544,34 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-04 (part 3) — Download labels, a coloured queue with a count, deletes that ask once; committed and pushed
+
+The owner asked whether the download button should say "download", for the queue's marks
+in colour (green done, yellow while transcribing, grey waiting, "or a better
+suggestion"), for a "3/5" count somewhere, for destructive buttons in a light red that
+ask once before deleting, and to commit and push everything so far.
+
+- **Committed and pushed first.** `main` was 5 commits behind GitHub (another session's
+  ffmpeg check, Python 3.13 pin and notes). The day's work went in as one commit, rebased
+  onto them; the only conflict was this file (the test count, and both sides' new
+  journal entries, kept newest first). 425 tests passed with and without ffmpeg after
+  the rebase; pushed as `907a96f`. The `.venv` was already on 3.13, so the pin changes
+  nothing here.
+- **Downloads:** **Download transcript (.txt)** / **Download subtitles (.srt)**, in the
+  result and in History.
+- **Queue:** Streamlit badges rather than coloured icons — the colour follows the theme
+  and the name stays plain; *next* takes the primary colour, a better fit than grey for
+  the file Start sends first. **2 / 5 done** heads the list, **File 3 of 5** stands under
+  Start (§3 UI / flow, the queue bullet).
+- **Deletes:** History's Delete and Clean temporary files are tinted red and ask once,
+  Cancel first (§3, new bullet).
+- Checked: ruff; 428 tests (3 new: each question, and the count after a failed file)
+  with and without ffmpeg; live on scratch folders (port 8598) with three 25-second
+  clips on the Local engine: 0 / 3 → 2 / 3 → 3 / 3 done, yellow *transcribing* then green
+  *done*, "File 3 of 3. The last one in the queue." under Start, the delete question in the dark theme, a confirmed
+  delete removing the row; the computed red switched from #c92a2a to #ff8a8a with the
+  theme. `.claude/launch.json` was changed for the check and restored.
 
 ### 2026-11-04 (part 2) — The on-screen option first, and batched local decoding as a box
 

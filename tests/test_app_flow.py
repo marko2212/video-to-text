@@ -40,6 +40,12 @@ def _upload(test: AppTest, name: str, content: bytes) -> AppTest:
     return test.file_uploader[0].set_value((name, content, "audio/wav")).run()
 
 
+def _clean_up(test: AppTest) -> AppTest:
+    """Press "Clean temporary files" and answer its question with yes."""
+    next(b for b in test.button if b.label == "Clean temporary files").click().run()
+    return next(b for b in test.button if b.label == "Yes, clean up").click().run()
+
+
 @pytest.fixture
 def fake_openai(monkeypatch):
     """Replace the OpenAI pipeline; each call writes a transcript of the input."""
@@ -373,8 +379,7 @@ def test_cleaning_up_empties_the_uploader_instead_of_preparing_it_again():
     uploads = config.get_settings().upload_dir
     assert (uploads / "talk.wav").exists()
 
-    clean = next(b for b in test.button if "Clean temporary files" in b.label)
-    clean.click().run()
+    _clean_up(test)
 
     assert not (uploads / "talk.wav").exists()
     assert test.session_state.audio_path is None
@@ -1409,11 +1414,13 @@ def test_several_uploads_are_transcribed_one_after_another(fake_openai):
     # The first is prepared and shown; the others wait their turn.
     assert test.session_state.original_filename == "a.wav"
     assert _queue_lines(test) == [
-        "- :material/play_arrow: a.wav — this one next",
-        "- :material/schedule: b.wav — waiting",
-        "- :material/schedule: c.wav — waiting",
+        "- :primary-badge[:material/play_arrow: next] a.wav",
+        "- :gray-badge[:material/schedule: waiting] b.wav",
+        "- :gray-badge[:material/schedule: waiting] c.wav",
     ]
     assert any("After this file: b.wav, c.wav" in c.value for c in test.caption)
+    assert any("**0 / 3 done**" in m.value for m in test.markdown)
+    assert any("**File 1 of 3.**" in c.value for c in test.caption)
 
     _start(test)
 
@@ -1427,9 +1434,9 @@ def test_several_uploads_are_transcribed_one_after_another(fake_openai):
     assert test.session_state.job is None
     assert not _start_button(test).disabled
     assert _queue_lines(test) == [
-        "- :material/check_circle: a.wav — done, in History",
-        "- :material/check_circle: b.wav — done, in History",
-        "- :material/check_circle: c.wav — done, in History",
+        "- :green-badge[:material/check_circle: done] a.wav",
+        "- :green-badge[:material/check_circle: done] b.wav",
+        "- :green-badge[:material/check_circle: done] c.wav",
     ]
     assert any(
         "Transcribed before this file, one after another: a.wav, b.wav" in i.value
@@ -1471,9 +1478,9 @@ def test_a_file_that_fails_stops_the_queue_and_start_goes_on_from_it(monkeypatch
     )
     assert any("Still waiting: c.wav" in i.value for i in test.info)
     assert _queue_lines(test) == [
-        "- :material/check_circle: a.wav — done, in History",
-        "- :material/play_arrow: b.wav — this one next",
-        "- :material/schedule: c.wav — waiting",
+        "- :green-badge[:material/check_circle: done] a.wav",
+        "- :primary-badge[:material/play_arrow: next] b.wav",
+        "- :gray-badge[:material/schedule: waiting] c.wav",
     ]
     assert test.session_state.job is None
 
@@ -1505,9 +1512,9 @@ def test_a_file_added_after_the_queue_finished_is_taken_next(fake_openai):
     assert test.session_state.original_filename == "c.wav"
     assert test.session_state.transcript_path is None
     assert _queue_lines(test) == [
-        "- :material/check_circle: a.wav — done, in History",
-        "- :material/check_circle: b.wav — done, in History",
-        "- :material/play_arrow: c.wav — this one next",
+        "- :green-badge[:material/check_circle: done] a.wav",
+        "- :green-badge[:material/check_circle: done] b.wav",
+        "- :primary-badge[:material/play_arrow: next] c.wav",
     ]
 
     _start(test)
@@ -1537,7 +1544,42 @@ def test_cleaning_up_forgets_the_queue(fake_openai):
     _start(test)
     assert test.session_state.queue_done
 
-    next(b for b in test.button if b.label == "Clean temporary files").click().run()
+    _clean_up(test)
 
     assert test.session_state.queue_done is None
     assert test.session_state.queue_waiting is None
+
+
+def test_cleaning_up_asks_once_and_cancel_keeps_the_files():
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    uploads = config.get_settings().upload_dir
+
+    next(b for b in test.button if b.label == "Clean temporary files").click().run()
+
+    assert (uploads / "talk.wav").exists()  # only asked so far
+    assert any("Delete all working files now?" in w.value for w in test.warning)
+    labels = [b.label for b in test.sidebar.button]
+    # Cancel first, where the button was: a double click lands on it.
+    assert labels == ["Cancel", "Yes, clean up"]
+
+    next(b for b in test.button if b.label == "Cancel").click().run()
+
+    assert (uploads / "talk.wav").exists()
+    assert [b.label for b in test.sidebar.button] == ["Clean temporary files"]
+
+
+def test_the_count_and_the_file_number_follow_the_queue(monkeypatch):
+    def fails_on_b(input_file, output_file, api_key, **kwargs):
+        if Path(input_file).read_bytes() == b"b audio":
+            raise TranscriptionError("rate limited")
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fails_on_b)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload_several(test, ("a.wav", b"a audio"), ("b.wav", b"b audio"))
+
+    _start(test)  # a.wav is done, b.wav fails and stays on the page
+
+    assert any("**1 / 2 done**" in m.value for m in test.markdown)
+    assert any("**File 2 of 2.** The last one" in c.value for c in test.caption)

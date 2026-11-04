@@ -116,7 +116,7 @@ _RUN_STATE_KEYS = (
 # ``queue_done`` holds the ids of those transcribed and saved in this session,
 # ``queue_waiting`` the names of those after the one the page works on, and
 # ``queue_finished`` the names a running queue has got through since Start.
-_QUEUE_KEYS = ("queue_done", "queue_waiting", "queue_finished")
+_QUEUE_KEYS = ("queue_done", "queue_waiting", "queue_finished", "queue_place")
 _SESSION_KEYS = (
     *_RUN_STATE_KEYS,
     *_QUEUE_KEYS,
@@ -125,6 +125,8 @@ _SESSION_KEYS = (
     "source_version",
     "job",
     "uploader_generation",
+    "delete_asked",
+    "clean_asked",
 )
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -278,21 +280,57 @@ def render_working_files(disabled: bool) -> None:
     st.subheader(":material/cleaning_services: Working files")
     size = checkpoints.working_files_size()
     st.caption(f"**{_format_size(size)}** in use." if size else "Nothing to clean.")
-    st.button(
-        "Clean temporary files",
-        disabled=disabled or checkpoints.any_active_run(),
-        on_click=clean_temp_files,
-        help=(
-            "Deletes everything in `temp/` and `uploads/` now: uploads, extracted "
-            "audio, transcripts and saved parts of unfinished runs. History is "
-            "kept. Uploads and extracted audio older than a day are deleted anyway "
-            "when the page is opened. Unavailable while a transcription runs."
-        ),
-    )
+    locked = disabled or checkpoints.any_active_run()
+    if st.session_state.clean_asked:
+        st.warning(
+            "Delete all working files now? Saved parts of unfinished runs go too, "
+            "so such a run would start again from the beginning. History stays.",
+            icon=":material/delete_sweep:",
+        )
+        # Cancel first, where the button was: a double click lands on it.
+        with st.container(horizontal=True):
+            st.button(
+                "Cancel",
+                key="keep_temp",
+                on_click=_set_asked,
+                args=("clean_asked", None),
+            )
+            st.button(
+                "Yes, clean up",
+                key="clean_temp_yes",
+                disabled=locked,
+                on_click=clean_temp_files,
+            )
+    else:
+        st.button(
+            "Clean temporary files",
+            key="clean_temp",
+            disabled=locked,
+            on_click=_set_asked,
+            args=("clean_asked", True),
+            help=(
+                "Deletes everything in `temp/` and `uploads/` now: uploads, "
+                "extracted audio, transcripts and saved parts of unfinished runs. "
+                "History is kept. Asks once before it deletes. Uploads and "
+                "extracted audio older than a day are deleted anyway when the "
+                "page is opened. Unavailable while a transcription runs."
+            ),
+        )
     message = st.session_state.get("clean_message")
     if message:
         getattr(st, message[0])(message[1])
         st.session_state.clean_message = None
+
+
+def _set_asked(key: str, value: Any) -> None:
+    """Open or close a "delete for good?" question (a button callback).
+
+    Args:
+        key: ``clean_asked`` or ``delete_asked``.
+        value: What is asked about (True, or a History row's id), or ``None``
+            to close the question.
+    """
+    st.session_state[key] = value
 
 
 # Choices kept across sessions: session-state key (also the widget's key and
@@ -493,6 +531,7 @@ def clean_temp_files() -> None:
     too, so they go as well — which is why nothing is deleted while any
     transcription is running, in this tab or another one.
     """
+    st.session_state.clean_asked = None
     if checkpoints.any_active_run():
         st.session_state.clean_message = (
             "warning",
@@ -2059,7 +2098,7 @@ def render_results(disabled: bool = False) -> None:
     srt_path: Path | None = st.session_state.srt_path
     with st.container(horizontal=True):
         st.download_button(
-            label="Transcript (.txt)",
+            label="Download transcript (.txt)",
             icon=":material/download:",
             data=transcript_path.read_bytes,
             file_name=f"{stem}.txt",
@@ -2068,7 +2107,7 @@ def render_results(disabled: bool = False) -> None:
         )
         if srt_path and srt_path.exists():
             st.download_button(
-                label="Subtitles (.srt)",
+                label="Download subtitles (.srt)",
                 icon=":material/download:",
                 data=srt_path.read_bytes,
                 file_name=f"{stem}.srt",
@@ -2091,6 +2130,46 @@ def _download_stem(filename: str, title: str | None) -> str:
     stem = _safe_stem(filename)
     mode, _ = _title_preferences()
     return titles.display_name(stem, title, mode) or f"transcript_{stem}"
+
+
+# Buttons that delete something; their keys give the elements these classes.
+_DESTRUCTIVE_BUTTONS = (
+    ".st-key-clean_temp",
+    ".st-key-clean_temp_yes",
+    '[class*="st-key-hist_del_"]',
+)
+
+
+def _destructive_css() -> None:
+    """Tint the buttons that delete something a light red, in either theme.
+
+    Picked by their keys (Streamlit gives each element a ``st-key-<key>``
+    class). ``light-dark()`` follows the color scheme Streamlit sets for the
+    chosen theme. Disabled buttons keep Streamlit's own grey.
+    """
+    buttons = [f"{scope} button:not(:disabled)" for scope in _DESTRUCTIVE_BUTTONS]
+    pointed = [
+        f"{button}:{state}"
+        for button in buttons
+        for state in ("hover", "focus-visible")
+    ]
+    st.markdown(
+        f"""
+        <style>
+        {", ".join(buttons)} {{
+            color: light-dark(#c92a2a, #ff8a8a);
+            border-color: light-dark(#c92a2a59, #ff8a8a66);
+            background-color: light-dark(#c92a2a0f, #ff8a8a14);
+        }}
+        {", ".join(pointed)} {{
+            color: light-dark(#a51d1d, #ffa8a8);
+            border-color: light-dark(#c92a2a, #ff8a8a);
+            background-color: light-dark(#c92a2a1f, #ff8a8a29);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _uploader_label_css() -> None:
@@ -2368,15 +2447,20 @@ def _render_queue(uploads: list[Any], current: Any, running: bool) -> None:
     if len(uploads) < 2:
         return
     done: set[str] = st.session_state.queue_done or set()
+    finished = sum(upload.file_id in done for upload in uploads)
+    st.markdown(f":material/playlist_play: **{finished} / {len(uploads)} done**")
     lines = []
     for upload in uploads:
         if upload.file_id in done:
-            lines.append(f"- :material/check_circle: {upload.name} — done, in History")
+            badge = ":green-badge[:material/check_circle: done]"
+        elif upload.file_id == current.file_id and running:
+            badge = ":yellow-badge[:material/progress_activity: transcribing]"
         elif upload.file_id == current.file_id:
-            state = "transcribing now" if running else "this one next"
-            lines.append(f"- :material/play_arrow: {upload.name} — {state}")
+            # The accent of the Start button that sends it.
+            badge = ":primary-badge[:material/play_arrow: next]"
         else:
-            lines.append(f"- :material/schedule: {upload.name} — waiting")
+            badge = ":gray-badge[:material/schedule: waiting]"
+        lines.append(f"- {badge} {upload.name}")
     st.markdown("\n".join(lines))
     st.caption(
         "Transcribed one after another, in this order, with the settings below; "
@@ -2384,19 +2468,24 @@ def _render_queue(uploads: list[Any], current: Any, running: bool) -> None:
     )
 
 
-def _queue_caption(waiting: list[str]) -> str:
-    """Say what follows the file on the page when more wait their turn.
+def _queue_caption(place: tuple[int, int], waiting: list[str]) -> str:
+    """Say which file of the queue the page is on, and what follows it.
 
     Args:
+        place: The file's number in the queue and how many there are.
         waiting: The names of the uploads after this one.
 
     Returns:
-        One sentence for the caption under Start.
+        The caption under Start.
     """
+    number, total = place
+    text = f":material/playlist_play: **File {number} of {total}.**"
+    if not waiting:
+        return f"{text} The last one in the queue."
     return (
-        f":material/playlist_play: After this file: {', '.join(waiting)} — one "
-        "after another, with the settings above, each saved to History as it "
-        "finishes. The slider applies to this file only; the others are sent whole."
+        f"{text} After this file: {', '.join(waiting)} — one after another, with "
+        "the settings above, each saved to History as it finishes. The slider "
+        "applies to this file only; the others are sent whole."
     )
 
 
@@ -2412,6 +2501,7 @@ def _choose_source(disabled: bool) -> ChosenFile | None:
     local_files = _local_files_allowed()
     # Filled in below when several uploads wait their turn.
     st.session_state.queue_waiting = None
+    st.session_state.queue_place = None
     source = SOURCE_UPLOAD
     if local_files:
         _preference("source")
@@ -2451,6 +2541,10 @@ def _choose_source(disabled: bool) -> ChosenFile | None:
         return None
     current, waiting = _queue_position(uploads)
     st.session_state.queue_waiting = [upload.name for upload in waiting]
+    done: set[str] = st.session_state.queue_done or set()
+    if len(uploads) >= 2 and current.file_id not in done:
+        finished = sum(upload.file_id in done for upload in uploads)
+        st.session_state.queue_place = (finished + 1, len(uploads))
     _render_queue(uploads, current, disabled)
     return (
         current.file_id,
@@ -2813,9 +2907,10 @@ def render_transcribe_tab() -> tuple[Any | None, dict[str, Any] | None]:
                             ":material/stop: stops after the part in progress (it "
                             "is kept) — usually within a minute."
                         )
-                    waiting = st.session_state.queue_waiting
-                    if waiting:
-                        st.caption(_queue_caption(waiting))
+                    place = st.session_state.queue_place
+                    if place:
+                        waiting = st.session_state.queue_waiting or []
+                        st.caption(_queue_caption(place, waiting))
                     job_area = st.container()
                     render_run_notices()
 
@@ -2879,6 +2974,7 @@ def _delete_entry(record_id: int) -> None:
     Args:
         record_id: The transcription id.
     """
+    st.session_state.delete_asked = None
     db.delete_transcription(record_id)
     checkpoints.discard_run(record_id)
 
@@ -3065,7 +3161,7 @@ def render_history_tab() -> None:
             )
             with st.container(horizontal=True):
                 st.download_button(
-                    label="Transcript (.txt)",
+                    label="Download transcript (.txt)",
                     icon=":material/download:",
                     data=full["transcript"],
                     file_name=f"{base_name}.txt",
@@ -3075,7 +3171,7 @@ def render_history_tab() -> None:
                 )
                 if full["srt"]:
                     st.download_button(
-                        label="Subtitles (.srt)",
+                        label="Download subtitles (.srt)",
                         icon=":material/download:",
                         data=full["srt"],
                         file_name=f"{base_name}.srt",
@@ -3088,16 +3184,48 @@ def render_history_tab() -> None:
             if mode != TITLE_MODE_OFF:
                 _render_retitle_message(record["id"])
             # Under the row, not in it, so a click meant for a download cannot
-            # land on it. A callback, not `if st.button(...)` + a fragment-scoped
+            # land on it. Callbacks, not `if st.button(...)` + a fragment-scoped
             # rerun: the row is gone before the fragment redraws, in any kind of
-            # run.
-            st.button(
-                "Delete",
-                key=f"hist_del_{record['id']}",
-                icon=":material/delete:",
-                on_click=_delete_entry,
-                args=(record["id"],),
-            )
+            # run. It asks once before it deletes.
+            if st.session_state.delete_asked == record["id"]:
+                _render_delete_question(record["id"])
+            else:
+                st.button(
+                    "Delete",
+                    key=f"hist_del_{record['id']}",
+                    icon=":material/delete:",
+                    on_click=_set_asked,
+                    args=("delete_asked", record["id"]),
+                )
+
+
+def _render_delete_question(record_id: int) -> None:
+    """Ask once before a History entry is deleted for good.
+
+    Cancel comes first, where Delete was, so a double click lands on it.
+
+    Args:
+        record_id: The transcription id.
+    """
+    st.warning(
+        "Delete this transcript for good? It leaves History together with the "
+        "parts kept for its run, and cannot be brought back.",
+        icon=":material/delete_forever:",
+    )
+    with st.container(horizontal=True):
+        st.button(
+            "Cancel",
+            key=f"hist_keep_{record_id}",
+            on_click=_set_asked,
+            args=("delete_asked", None),
+        )
+        st.button(
+            "Yes, delete",
+            key=f"hist_del_yes_{record_id}",
+            icon=":material/delete:",
+            on_click=_delete_entry,
+            args=(record_id,),
+        )
 
 
 def init_session_state() -> None:
@@ -3133,6 +3261,7 @@ def main() -> None:
     _settle_job()
     _claim_job()
     running = st.session_state.job is not None
+    _destructive_css()
     render_sidebar(disabled=running)
 
     st.title("Video & Audio Transcription")
