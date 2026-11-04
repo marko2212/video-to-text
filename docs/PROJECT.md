@@ -1298,7 +1298,7 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ### P5 — features and later
 - [ ] **Show the OpenAI credit left** (asked 2026-11-03). The owner chose a read-only
       Admin key to ask Claude about spend: `C:\Work\tools\openai-potrosnja.py` (outside
-      this repo; key in `C:\Work\.secrets`, see `C:\Work\PLAYBOOK-API-PRISTUPI.md`), so
+      this repo; key in `C:\Work\.secrets`, see `PLAYBOOK-API-PRISTUPI.md`), so
       nothing in the app yet. OpenAI has no
       documented endpoint for the remaining prepaid balance (community request of
       2025-11-05; OpenAI support on 2026-10-28: "I'll pass this feedback along").
