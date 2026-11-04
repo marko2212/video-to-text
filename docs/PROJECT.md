@@ -791,8 +791,8 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   theme); disabled buttons keep Streamlit's grey. A coloured label (`:red[...]`) was
   the alternative, but it would change the labels the tests and the clicks look for.
   **Downloads get the same light tint in the accent colour** *(2026-11-04, the owner:
-  "da li i ovo dugme da zapobojiš")* — #4f46e5 on light, the dark theme's link colour
-  #a5b4fc on dark — rather than `type="primary"`: a filled button would compete with
+  "da li i ovo dugme da zapobojiš")* — #2563eb on light, the dark theme's link colour
+  #93c5fd on dark (indigo until the accent became blue the same day) — rather than `type="primary"`: a filled button would compete with
   Start, and in an open History entry it would stand next to the red Delete. The
   result's downloads got keys (`result_dl_txt`, `result_dl_srt`) for it; History's
   had them. One table, `_TINTED_BUTTONS` in `app.py`, holds both tints.
@@ -808,7 +808,7 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   of 1,200 equal stretches (pydub: 0.1 s to read a 75-minute WAV, 0.13 s for the
   buckets; other formats go through one ffmpeg conversion to a mono 16 kHz WAV and are
   never decoded at their own rate — a two-hour stereo file would take over a gigabyte)
-  and draws them with Pillow: the part to transcribe in the theme's indigo, the rest grey
+  and draws them with Pillow: the part to transcribe in the theme's accent, the rest grey
   under a light shade, on a transparent background so both themes work; the bars are
   scaled to the 98th percentile, not to the loudest moment (one clap would flatten the
   rest). The control is a plain `st.slider` of two `datetime.time` values (`H:mm:ss`, a
@@ -955,8 +955,11 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   means rewriting the 2,700-line UI and adding an API, a job worker, Stop and chunked
   uploads; NiceGUI (Python, event-driven, one port) would also drop the rerun workarounds
   in this section, in days rather than weeks. The theme was the cheap first step:
-  - an indigo accent instead of Streamlit's red (#4F46E5 light; #6366F1 dark, where
-    white text on the lighter indigo would be too faint), the system font (Segoe UI on
+  - a blue accent instead of Streamlit's red: #2563EB on light; #2F6FED on dark, a
+    lighter blue that still carries white text at 4.5:1 and stands out from the dark
+    background (4.1:1) as much as the indigo did. Links are #1D4ED8 / #93C5FD. *Changed
+    2026-11-04 from indigo (#4F46E5 / #6366F1):* the owner saw the indigo as violet and
+    asked for blue ("Da, plava #2563EB"). The system font (Segoe UI on
     Windows, `system-ui` elsewhere: nothing is fetched from the internet, the app also
     runs offline), bordered fields, smaller headings (h1 2rem), a lighter sidebar with a
     border; `[theme.light]` and `[theme.dark]` are both set, so the menu's theme choice
@@ -972,7 +975,8 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
     carries `:material/timer:` in its label, not as the expander's `icon=`, which
     replaces the open/close arrow (seen in a screenshot). The transcript's own markers
     (🖥️, ⚠️, ⏭️) stay: they are part of the saved text and the downloads;
-  - `waveform.py` draws the kept stretch in #6366F1, which reads on both backgrounds.
+  - `waveform.py` draws the kept stretch in the dark theme's accent (#2F6FED), which reads
+    on both backgrounds.
   What would change this: if the look is still not enough, or the rerun model's limits
   (the locked page, a Stop that waits for the part in flight, uploads held in memory)
   start to matter more — then NiceGUI before React.
@@ -1159,7 +1163,7 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   **Download transcript (.txt)** / **Download subtitles (.srt)**, tinted in the accent
   colour; **Delete** and **Clean temporary files** are tinted red and ask once (Cancel
   first)
-- **A calmer look** — indigo theme (light and dark), system font, bordered fields, Material
+- **A calmer look** — blue theme (light and dark; indigo until 2026-11-04), system font, bordered fields, Material
   icons instead of emoji, no Deploy button; a bordered card per step and for the result,
   downloads in one row *(2026-10-30)*; the theme is chosen in the menu at the top right
   (System / Light / Dark) *(2026-11-04)*
@@ -1551,6 +1555,28 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-04 (part 5) — The accent becomes blue
+
+*Personal laptop.* The three commits from the work laptop (907a96f, 688c749, f24c1a8) were
+pulled here as a fast-forward (428 tests, ruff). The owner then found the accent
+"tirkizna", not the blue they remembered, and asked for that blue back. The theme had
+never changed: the repo's history holds only the indigo of 2026-10-30, and the owner's
+screenshot measured #5348E9, the same #4F46E5 as drawn. The tinted downloads and the
+coloured queue from the work laptop only put more of it on the page. Shown three
+swatches, the owner chose "Da, plava #2563EB". `config.toml`, the download tint in
+`app.py`, `waveform.py` and its test, README and §3 (UI, the theme bullet) changed: #2563EB
+light, #2F6FED dark (white text 4.55:1, 4.08:1 on the dark background, like the
+indigo's 4.47 and 4.16), links #1D4ED8 / #93C5FD. A scratch instance in the dark
+theme (port 8599, scratch folders) computed the active tab as rgb(47, 111, 237).
+
+The README screenshots (from 2026-10-30, before the queue and the new download labels)
+were retaken, and the run first failed at the Local run: `shoot.mjs` waited for
+"Transcript (.txt)", which 688c749 renamed to **Download transcript (.txt)** (the search
+is case-sensitive), until puppeteer's 180-second protocol timeout. Both waits were
+updated. `%TEMP%\video-to-text-screenshots` holds an older run (28–29 October) without
+the script's marker, so the script refused it; it was left alone and the run used
+`-Out` in the session's scratchpad. 428 tests, ruff. Not committed.
 
 ### 2026-11-04 (part 4) — Download buttons in the accent colour
 
