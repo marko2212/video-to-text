@@ -2100,6 +2100,7 @@ def render_results(disabled: bool = False) -> None:
         st.download_button(
             label="Download transcript (.txt)",
             icon=":material/download:",
+            key="result_dl_txt",
             data=transcript_path.read_bytes,
             file_name=f"{stem}.txt",
             mime="text/plain",
@@ -2109,6 +2110,7 @@ def render_results(disabled: bool = False) -> None:
             st.download_button(
                 label="Download subtitles (.srt)",
                 icon=":material/download:",
+                key="result_dl_srt",
                 data=srt_path.read_bytes,
                 file_name=f"{stem}.srt",
                 mime="text/plain",
@@ -2132,44 +2134,48 @@ def _download_stem(filename: str, title: str | None) -> str:
     return titles.display_name(stem, title, mode) or f"transcript_{stem}"
 
 
-# Buttons that delete something; their keys give the elements these classes.
-_DESTRUCTIVE_BUTTONS = (
-    ".st-key-clean_temp",
-    ".st-key-clean_temp_yes",
-    '[class*="st-key-hist_del_"]',
+# Buttons tinted by what they do, picked by their keys (Streamlit gives each
+# element a ``st-key-<key>`` class): the scopes, then the colour on the light
+# theme and on the dark one. Downloads take the theme's accent (the dark
+# theme's link colour, readable on its background); deletes a red.
+_TINTED_BUTTONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (
+        ('[class*="st-key-result_dl_"]', '[class*="st-key-hist_dl_"]'),
+        "#4f46e5",
+        "#a5b4fc",
+    ),
+    (
+        (".st-key-clean_temp", ".st-key-clean_temp_yes", '[class*="st-key-hist_del_"]'),
+        "#c92a2a",
+        "#ff8a8a",
+    ),
 )
 
 
-def _destructive_css() -> None:
-    """Tint the buttons that delete something a light red, in either theme.
+def _tinted_buttons_css() -> None:
+    """Tint downloads in the accent colour and deletes in red, lightly.
 
-    Picked by their keys (Streamlit gives each element a ``st-key-<key>``
-    class). ``light-dark()`` follows the color scheme Streamlit sets for the
-    chosen theme. Disabled buttons keep Streamlit's own grey.
+    ``light-dark()`` follows the color scheme Streamlit sets for the chosen
+    theme. Disabled buttons keep Streamlit's own grey.
     """
-    buttons = [f"{scope} button:not(:disabled)" for scope in _DESTRUCTIVE_BUTTONS]
-    pointed = [
-        f"{button}:{state}"
-        for button in buttons
-        for state in ("hover", "focus-visible")
-    ]
-    st.markdown(
-        f"""
-        <style>
-        {", ".join(buttons)} {{
-            color: light-dark(#c92a2a, #ff8a8a);
-            border-color: light-dark(#c92a2a59, #ff8a8a66);
-            background-color: light-dark(#c92a2a0f, #ff8a8a14);
-        }}
-        {", ".join(pointed)} {{
-            color: light-dark(#a51d1d, #ffa8a8);
-            border-color: light-dark(#c92a2a, #ff8a8a);
-            background-color: light-dark(#c92a2a1f, #ff8a8a29);
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    rules = []
+    for scopes, light, dark in _TINTED_BUTTONS:
+        buttons = [f"{scope} button:not(:disabled)" for scope in scopes]
+        pointed = [
+            f"{button}:{state}"
+            for button in buttons
+            for state in ("hover", "focus-visible")
+        ]
+        rules.append(
+            f"{', '.join(buttons)} {{ color: light-dark({light}, {dark}); "
+            f"border-color: light-dark({light}59, {dark}66); "
+            f"background-color: light-dark({light}0f, {dark}14); }}"
+        )
+        rules.append(
+            f"{', '.join(pointed)} {{ border-color: light-dark({light}, {dark}); "
+            f"background-color: light-dark({light}1f, {dark}29); }}"
+        )
+    st.markdown(f"<style>{' '.join(rules)}</style>", unsafe_allow_html=True)
 
 
 def _uploader_label_css() -> None:
@@ -3261,7 +3267,7 @@ def main() -> None:
     _settle_job()
     _claim_job()
     running = st.session_state.job is not None
-    _destructive_css()
+    _tinted_buttons_css()
     render_sidebar(disabled=running)
 
     st.title("Video & Audio Transcription")

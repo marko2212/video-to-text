@@ -790,6 +790,12 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   and #ff8a8a on dark (checked live: the computed colours switch with the menu's
   theme); disabled buttons keep Streamlit's grey. A coloured label (`:red[...]`) was
   the alternative, but it would change the labels the tests and the clicks look for.
+  **Downloads get the same light tint in the accent colour** *(2026-11-04, the owner:
+  "da li i ovo dugme da zapobojiš")* — #4f46e5 on light, the dark theme's link colour
+  #a5b4fc on dark — rather than `type="primary"`: a filled button would compete with
+  Start, and in an open History entry it would stand next to the red Delete. The
+  result's downloads got keys (`result_dl_txt`, `result_dl_srt`) for it; History's
+  had them. One table, `_TINTED_BUTTONS` in `app.py`, holds both tints.
 - **The player gets a small MP3, not the working file** — videos, AMR/WMA/AIFF (which
   browsers cannot play: all 28 phone calls in the history are AMR) and uploads over
   25 MB get a 32 kbps mono preview (LAME's fastest mode: ~5 s for 90 minutes). The full
@@ -1150,8 +1156,9 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   every word kept. "Describe what's on screen" now comes before the subtitle box
 - **Clearer queue and safer deletes** *(2026-11-04)*: coloured marks per file in the
   queue with a **2 / 5 done** count and **File 3 of 5** under Start; downloads say
-  **Download transcript (.txt)** / **Download subtitles (.srt)**; **Delete** and
-  **Clean temporary files** are tinted red and ask once (Cancel first)
+  **Download transcript (.txt)** / **Download subtitles (.srt)**, tinted in the accent
+  colour; **Delete** and **Clean temporary files** are tinted red and ask once (Cancel
+  first)
 - **A calmer look** — indigo theme (light and dark), system font, bordered fields, Material
   icons instead of emoji, no Deploy button; a bordered card per step and for the result,
   downloads in one row *(2026-10-30)*; the theme is chosen in the menu at the top right
@@ -1544,6 +1551,15 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-04 (part 4) — Download buttons in the accent colour
+
+The owner asked for the download button in colour too. Downloads now carry a light
+indigo tint, the counterpart of the red one on deletes (§3 UI, the delete bullet: why
+not a filled primary button). Checked live on scratch folders after a 25-second Local
+run: the result's **Download transcript (.txt)** computed #4f46e5 on the light theme and
+#a5b4fc on the dark one. 428 tests with and without ffmpeg; no test change (the colour
+is CSS, which AppTest does not render).
 
 ### 2026-11-04 (part 3) — Download labels, a coloured queue with a count, deletes that ask once; committed and pushed
 
