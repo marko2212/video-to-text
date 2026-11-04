@@ -2141,8 +2141,8 @@ def _download_stem(filename: str, title: str | None) -> str:
 _TINTED_BUTTONS: tuple[tuple[tuple[str, ...], str, str], ...] = (
     (
         ('[class*="st-key-result_dl_"]', '[class*="st-key-hist_dl_"]'),
-        "#4f46e5",
-        "#a5b4fc",
+        "#2563eb",
+        "#93c5fd",
     ),
     (
         (".st-key-clean_temp", ".st-key-clean_temp_yes", '[class*="st-key-hist_del_"]'),

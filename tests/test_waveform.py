@@ -95,14 +95,14 @@ def test_the_picture_colours_the_kept_stretch_and_greys_the_rest():
     assert image.size == (10, 20)
     kept = image.getpixel((3, middle))
     left_out = image.getpixel((8, middle))
-    assert kept == (99, 102, 241, 255)
+    assert kept == (47, 111, 237, 255)
     assert left_out[0] == left_out[1] == left_out[2]  # grey
     assert left_out != kept
     # The background stays transparent, so both themes can show the picture.
     assert image.getpixel((3, 0))[3] == 0
 
     whole = Image.open(BytesIO(waveform.picture(levels, None, 10, 20)))
-    assert all(whole.getpixel((x, middle)) == (99, 102, 241, 255) for x in range(10))
+    assert all(whole.getpixel((x, middle)) == (47, 111, 237, 255) for x in range(10))
 
 
 def test_a_silent_stretch_still_shows_a_hairline():

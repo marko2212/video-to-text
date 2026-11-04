@@ -19,11 +19,11 @@ gatherUsageStats = false
 # "minimal" on its own command line, so its pictures show no menu.
 toolbarMode = "viewer"
 
-# The look: an indigo accent instead of Streamlit's red, the system's own font,
+# The look: a blue accent instead of Streamlit's red, the system's own font,
 # bordered fields, smaller headings and a lighter sidebar with a border. Light
 # and dark are both set, so the menu's theme choice (and "use system setting")
 # keeps working. waveform.py draws the kept stretch in the dark theme's accent
-# (#6366F1), which reads on both backgrounds; change it there too.
+# (#2F6FED), which reads on both backgrounds; change it there too.
 [theme]
 font = "Segoe UI, system-ui, -apple-system, sans-serif"
 headingFont = "Segoe UI, system-ui, -apple-system, sans-serif"
@@ -35,26 +35,26 @@ showWidgetBorder = true
 showSidebarBorder = true
 
 [theme.light]
-primaryColor = "#4F46E5"
+primaryColor = "#2563EB"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F4F5F9"
 textColor = "#1E2230"
 borderColor = "#E2E5ED"
-linkColor = "#4338CA"
-codeTextColor = "#4338CA"
+linkColor = "#1D4ED8"
+codeTextColor = "#1D4ED8"
 
 [theme.light.sidebar]
 backgroundColor = "#F8F9FC"
 secondaryBackgroundColor = "#FFFFFF"
 
 [theme.dark]
-primaryColor = "#6366F1"
+primaryColor = "#2F6FED"
 backgroundColor = "#111319"
 secondaryBackgroundColor = "#1C1F28"
 textColor = "#E6E8EF"
 borderColor = "#2B2F3B"
-linkColor = "#A5B4FC"
-codeTextColor = "#A5B4FC"
+linkColor = "#93C5FD"
+codeTextColor = "#93C5FD"
 
 [theme.dark.sidebar]
 backgroundColor = "#161922"
