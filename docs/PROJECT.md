@@ -41,7 +41,7 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, their lengths (ffprobe, cached per version), stable list labels, a file's identity — UI-agnostic |
 | `frames.py` | One-pass video scan (scene changes + 5 s grid, dHash), selection from the scan, single-frame extraction |
 | `vision.py` | Describes those frames with a vision model (cached per frame); cost estimates for the UI |
-| `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed, the output-cap and thin-answer guards, one log line and one record per answered chunk, the optional local cross-check) and `transcribe_local`; transcript rendering |
+| `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed, the output-cap and thin-answer guards, one log line and one record per answered chunk, the optional local cross-check) and `transcribe_local` (optionally batched, split back into sentences by word times); transcript rendering |
 | `align.py` | The cross-check: aligns the API text with a local pass word by word (`difflib`), re-times paragraphs, finds the stretches the API answer lacks; pure functions |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
 | `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; the parts of a finished run kept in `data/runs/<row id>/`; also the age-based clean-ups of `temp/` and `uploads/` and the space they take |
@@ -1439,8 +1439,16 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       mechanism as the toolbar's Stop (§3 UI).
 - [ ] **Transcript box** (R20, S). `st.code(text, language=None, wrap_lines=True, height=…)`:
       read-only, scrolls, has a copy button (the editable text_area silently drops edits).
-- [ ] **Delete needs a confirmation** (R11, S). `st.popover` with "Delete permanently",
-      placed to the right of the download buttons.
+- [x] **Delete needs a confirmation** (R11) — done 2026-11-04, inline rather than a
+      popover: Delete asks once with Cancel first, where the button was; Clean
+      temporary files asks too (§3 UI, the delete bullet).
+- [ ] **Several recordings from the folder source** (S–M). The queue takes uploads
+      only; the folder source still picks one recording. A multi-select there could
+      feed the same queue (`queue_done` by path instead of upload id).
+- [ ] **Same-name uploads in one queue** (S). Two uploads named alike overwrite each
+      other's copy in `uploads/`; each is still transcribed from its own bytes in turn
+      and History keeps each text, so only the working copy is lost. A suffix on the
+      second name would keep both.
 - [ ] **Search in history** (R23, S–M). Filename and text, with diacritic and script folding.
 - [ ] **Parallel API calls** (R16, M). Thread pools for chunks (3–4) and frames (6–8),
       progress reported on the script thread; start frame extraction while chunks run.
