@@ -16,10 +16,11 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from config import WORKING_COPY_TEMP_SUFFIXES, get_settings
 from logger import get_logger
@@ -31,13 +32,106 @@ _READ_BLOCK_BYTES = 1024 * 1024
 # Enough of the SHA-256 to make an accidental collision irrelevant, short enough
 # to keep directory names readable.
 _DIGEST_CHARS = 16
-# Per-run scratch folders (chunk MP3s, screenshots) and video scans.
-_SCRATCH_PATTERNS = ("segments-*", "frames-*", "scan-*")
+# Per-run scratch folders (chunk MP3s, screenshots), video scans, and the
+# working folder of a run started from the command line.
+_SCRATCH_PATTERNS = ("segments-*", "frames-*", "scan-*", "cli-*")
 
 # Runs in progress in this process, across every browser tab. Kept here, in an
 # imported module, because Streamlit re-executes app.py from scratch each run.
 _active_lock = threading.Lock()
 _active_runs = 0
+# Runs in other processes (the command line beside the page, or two command
+# lines) are seen through marker files in temp/: each run keeps one open and
+# locked. The lock is the signal, not the file: the operating system drops it
+# when the process ends, however it ends, so a killed run leaves a marker that
+# reads as free and is removed. A process id in the name would not do — on
+# Windows the only stdlib liveness test, os.kill(pid, 0), terminates the
+# process it asks about.
+_ACTIVE_DIRNAME = "active-runs"
+_MARKER_SUFFIX = ".run"
+
+
+def _try_lock(handle: IO[bytes]) -> bool:
+    """Take an exclusive lock on an open marker without waiting.
+
+    Args:
+        handle: The marker, open for writing.
+
+    Returns:
+        False when another open handle — in practice another process — holds it.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            # flock, not lockf: lockf's lock is dropped as soon as the process
+            # closes *any* handle to the file, such as the one a check opens.
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _hold_marker() -> IO[bytes] | None:
+    """Create this run's marker and keep it locked.
+
+    Returns:
+        The open marker, to be closed when the run ends; ``None`` when it
+        could not be made (a run must not fail over its marker).
+    """
+    try:
+        folder = get_settings().temp_dir / _ACTIVE_DIRNAME
+        folder.mkdir(parents=True, exist_ok=True)
+        marker = folder / f"{os.getpid()}-{uuid.uuid4().hex[:8]}{_MARKER_SUFFIX}"
+        handle = marker.open("w+b")
+    except OSError as exc:
+        logger.warning("No marker for this run: %s", exc)
+        return None
+    if not _try_lock(handle):
+        logger.warning("Could not lock %s", marker)
+    return handle
+
+
+def _release_marker(handle: IO[bytes] | None) -> None:
+    """Close and remove a run's marker."""
+    if handle is None:
+        return
+    handle.close()
+    with suppress(OSError):
+        Path(handle.name).unlink(missing_ok=True)
+
+
+def _run_in_another_process() -> bool:
+    """Return True while another process on this computer holds a run marker.
+
+    Markers nobody holds are leftovers of a killed process and are removed.
+    """
+    folder = get_settings().temp_dir / _ACTIVE_DIRNAME
+    own = f"{os.getpid()}-"
+    try:
+        markers = [
+            path
+            for path in folder.glob(f"*{_MARKER_SUFFIX}")
+            if not path.name.startswith(own)
+        ]
+    except OSError:
+        return False
+    for marker in markers:
+        try:
+            handle = marker.open("r+b")
+        except OSError:
+            continue  # removed meanwhile
+        with handle:
+            if not _try_lock(handle):
+                return True
+        with suppress(OSError):
+            marker.unlink(missing_ok=True)
+    return False
 
 
 @contextmanager
@@ -51,20 +145,24 @@ def active_run() -> Iterator[None]:
     global _active_runs
     with _active_lock:
         _active_runs += 1
+    marker = _hold_marker()
     try:
         yield
     finally:
+        _release_marker(marker)
         with _active_lock:
             _active_runs -= 1
 
 
 def any_active_run() -> bool:
-    """Return True while any transcription is running in this process.
+    """Return True while any transcription is running on this computer.
 
     "Clean temporary files" in one tab used to delete the checkpoints and
-    scratch files of a run in another tab, which then paid for them again.
+    scratch files of a run in another tab, which then paid for them again. A
+    run started from the command line (:mod:`cli`) is another process, which
+    the page sees through its marker file.
     """
-    return _active_runs > 0
+    return _active_runs > 0 or _run_in_another_process()
 
 
 def file_digest(path: Path) -> str:

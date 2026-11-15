@@ -136,6 +136,16 @@ OPENAI_MAX_RETRIES: int = 3
 # short connect timeout so an offline machine fails fast.
 OPENAI_TIMEOUT_SECONDS: float = 300.0
 OPENAI_CONNECT_TIMEOUT_SECONDS: float = 10.0
+# How long OpenAI takes to answer, in seconds per minute of audio sent: the
+# measure behind the "about M:SS left" of a run until its own first part is
+# back; after that the run's own parts are the measure. Read from the owner's
+# history on 2026-11-15 (159 parts of 19 runs): 2.3 s per minute of audio at
+# the median, 1.8 to 3.4 for four parts in five and 8.5 for the slowest — a
+# five-minute part answers in about 11 s. Within one run the parts usually
+# differ by a factor of 1.3 to 1.7, so the figure is an estimate, said as one.
+OPENAI_SECONDS_PER_AUDIO_MINUTE: float = 2.3
+# The time left is rounded to this many seconds, and never shown as less.
+REMAINING_ROUND_SECONDS: int = 5
 # Target audio parameters for transcription (mono, 16 kHz is plenty for speech).
 TARGET_CHANNELS: int = 1
 TARGET_SAMPLE_RATE: int = 16000
@@ -368,6 +378,19 @@ LOG_FILE_BACKUPS: int = 5
 # row, until that row is deleted: history keeps only the rendered transcript
 # and the run's totals, which is not enough to tell which chunk lost speech.
 RUNS_DIRNAME: str = "runs"
+
+# The command line (cli.py) — the same run as the page, started by a script or
+# an AI agent. Its engine names, and how a transcript is named when it is put
+# beside its recording: transcript_<the recording's name>.txt.
+CLI_ENGINES: dict[str, str] = {"openai": PROVIDER_OPENAI, "local": PROVIDER_LOCAL}
+TRANSCRIPT_PREFIX: str = "transcript_"
+# On the page nothing is sent to OpenAI before the Start click. The command
+# line has no click, so a run estimated above this is refused until it is
+# repeated with --yes: about 2 h 45 min of gpt-4o-transcribe at OpenAI's own
+# per-minute estimate. --max-cost changes it for one call.
+CLI_MAX_COST_USD: float = 1.0
+# How many recordings `latest` lists unless told otherwise.
+CLI_LATEST_COUNT: int = 10
 
 
 class Settings(BaseSettings):

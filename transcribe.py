@@ -37,7 +37,9 @@ from config import (
     MAX_SEGMENT_SIZE_MB,
     MIN_SPLIT_SECONDS,
     MIN_TAIL_SECONDS,
+    OPENAI_SECONDS_PER_AUDIO_MINUTE,
     OUTPUT_TOKEN_CAP_GUARD,
+    REMAINING_ROUND_SECONDS,
     SEGMENT_MINUTES_BY_MODEL,
     TARGET_CHANNELS,
     TARGET_SAMPLE_RATE,
@@ -1276,6 +1278,66 @@ def _write_outputs(
     return stats
 
 
+def estimate_remaining(
+    answered: list[tuple[float, float]], audio_seconds: float
+) -> float:
+    """Estimate how long the parts still to be sent will take.
+
+    The run's own parts are the measure: how long each took, MP3 and any
+    second attempt included, against the audio it covered. Before the first
+    one is back, the typical speed in :mod:`config` stands in.
+
+    Args:
+        answered: ``(seconds it took, seconds of audio)`` of each part this
+            run has got back.
+        audio_seconds: The audio still to be sent, the part in progress
+            included.
+
+    Returns:
+        The time left in seconds.
+    """
+    taken = sum(seconds for seconds, _ in answered)
+    covered = sum(audio for _, audio in answered)
+    rate = taken / covered if covered > 0 else OPENAI_SECONDS_PER_AUDIO_MINUTE / 60
+    return rate * audio_seconds
+
+
+def format_remaining(seconds: float) -> str:
+    """Phrase the time left for a progress message.
+
+    Args:
+        seconds: The estimate from :func:`estimate_remaining`.
+
+    Returns:
+        E.g. ``about 1:30 left``, rounded: it is an estimate.
+    """
+    step = REMAINING_ROUND_SECONDS
+    return f"about {_format_clock(max(step, round(seconds / step) * step))} left"
+
+
+def _is_saved(
+    checkpoint: Path,
+    index: int,
+    bound: tuple[int, int],
+    borrowed: dict[tuple[int, int], list[dict[str, Any]]] | None,
+) -> bool:
+    """Return True for a chunk that needs no request: saved, or lent by another run.
+
+    Args:
+        checkpoint: The checkpoint directory.
+        index: The chunk's place in the recording.
+        bound: Its ``(start_ms, end_ms)``.
+        borrowed: Chunks saved for other stretches, by bounds.
+
+    Returns:
+        Whether a saved answer with the same boundaries exists.
+    """
+    saved = checkpoints.load(checkpoint, f"chunk_{index:03d}")
+    return bool(saved and saved.get("bounds") == list(bound)) or bound in (
+        borrowed or {}
+    )
+
+
 def _transcribe_all(
     audio: AudioSegment,
     bounds: list[tuple[int, int]],
@@ -1285,6 +1347,7 @@ def _transcribe_all(
     work: tuple[Path, Path],
     progress_callback: ProgressCallback | None,
     borrowed: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
+    then: str = "",
 ) -> tuple[list[dict[str, Any]], tuple[int, AppError] | None]:
     """Transcribe every chunk in order, reusing and saving checkpoints.
 
@@ -1299,6 +1362,9 @@ def _transcribe_all(
         borrowed: Chunks saved for other stretches of the recording, by
             bounds (:func:`_saved_elsewhere`); one with the same bounds is
             taken instead of a request.
+        then: What follows the last part, added to the time left (e.g.
+            ``", then the check with local Whisper"``): the estimate
+            covers the parts only.
 
     Returns:
         The pieces transcribed so far, and ``(chunk index, error)`` if a chunk
@@ -1308,6 +1374,14 @@ def _transcribe_all(
     checkpoint = work[1]
     pieces: list[dict[str, Any]] = []
     total = len(bounds)
+    # The audio of each chunk that still needs a request, and how long the
+    # chunks sent so far took: what the time left is worked out from.
+    unsent = {
+        index: (end_ms - start_ms) / 1000
+        for index, (start_ms, end_ms) in enumerate(bounds)
+        if not _is_saved(checkpoint, index, (start_ms, end_ms), borrowed)
+    }
+    answered: list[tuple[float, float]] = []
     for index, (start_ms, end_ms) in enumerate(bounds):
         name = f"chunk_{index:03d}"
         saved = checkpoints.load(checkpoint, name)
@@ -1324,12 +1398,21 @@ def _transcribe_all(
             )
             pieces += lent
             continue
+        left = estimate_remaining(
+            answered,
+            sum(audio for later, audio in unsent.items() if later >= index),
+        )
         _report(
             progress_callback,
             status="progress",
-            message=f"Transcribing part {index + 1} of {total}…",
+            message=(
+                f"Transcribing part {index + 1} of {total}… "
+                f"{format_remaining(left)}{then}"
+            ),
             progress=index / total,
+            remaining_seconds=left,
         )
+        began = time.monotonic()
         try:
             new = _transcribe_span(
                 audio,
@@ -1353,6 +1436,7 @@ def _transcribe_all(
             checkpoint, name, {"bounds": [start_ms, end_ms], "pieces": new}
         )
         pieces += new
+        answered.append((time.monotonic() - began, (end_ms - start_ms) / 1000))
     return pieces, None
 
 
@@ -1418,13 +1502,8 @@ def _reusable_chunks(
         How many chunks need no request.
     """
     return sum(
-        1
-        for index, (start_ms, end_ms) in enumerate(bounds)
-        if (
-            (saved := checkpoints.load(checkpoint, f"chunk_{index:03d}"))
-            and saved.get("bounds") == [start_ms, end_ms]
-        )
-        or (start_ms, end_ms) in (borrowed or {})
+        _is_saved(checkpoint, index, bound, borrowed)
+        for index, bound in enumerate(bounds)
     )
 
 
@@ -1541,6 +1620,10 @@ def transcribe_openai(
             (temp_folder, checkpoint),
             progress_callback,
             borrowed,
+            # The check runs only for a model without its own times.
+            then=", then the check with local Whisper"
+            if verify is not None and not want_segments
+            else "",
         )
         timed_entries = [
             segment for piece in pieces for segment in piece.get("segments", [])

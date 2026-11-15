@@ -24,12 +24,13 @@ import json
 import shutil
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import time as clock_time
 from datetime import timedelta
 from math import ceil
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import streamlit as st
 
@@ -38,6 +39,7 @@ import checkpoints
 import db
 import frames
 import recordings
+import runs
 import titles
 import transcribe
 import usage
@@ -84,10 +86,16 @@ from config import (
     WORKING_COPY_MAX_AGE_HOURS,
     get_settings,
 )
-from exceptions import AppError, IncompleteTranscriptionError, OpenAIAccountError
+from exceptions import AppError
 from logger import enable_file_log, get_logger
 
 logger = get_logger(__name__)
+
+# Phrasing and naming shared with the command line live in runs.py.
+_describe_cost = runs.describe_cost
+_describe_verified = runs.describe_verified
+_format_length = runs.format_length
+_safe_stem = runs.safe_stem
 
 # faster-whisper is an optional dependency (install via `uv sync --extra local`).
 LOCAL_AVAILABLE = importlib.util.find_spec("faster_whisper") is not None
@@ -144,14 +152,7 @@ def load_whisper_model(model_name: str, device: str, compute_type: str) -> Any:
     Returns:
         A loaded ``faster_whisper.WhisperModel`` instance.
     """
-    from faster_whisper import WhisperModel
-
-    return WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-        download_root=str(get_settings().whisper_model_dir),
-    )
+    return runs.load_whisper_model(model_name, device, compute_type)
 
 
 def _model_is_cached(model_name: str) -> bool:
@@ -460,50 +461,6 @@ def make_progress_callback(container: Any) -> ProgressCallback:
     return update
 
 
-def save_to_history(
-    source_type: str, provider: str, model: str, with_timestamps: bool
-) -> int | None:
-    """Persist the just-finished transcription into the SQLite history.
-
-    Args:
-        source_type: Either ``"audio"`` or ``"video"``.
-        provider: Engine used (OpenAI API or local).
-        model: Transcription model used.
-        with_timestamps: Whether subtitles were generated.
-
-    Returns:
-        The new row's id, or ``None`` when there was no transcript to save.
-    """
-    transcript_path: Path | None = st.session_state.transcript_path
-    if not transcript_path or not transcript_path.exists():
-        return None
-    cost: dict[str, Any] | None = st.session_state.get("run_cost")
-
-    srt_path: Path | None = st.session_state.srt_path
-    srt_text = srt_path.read_text(encoding="utf-8") if srt_path else None
-
-    audio_path: Path | None = st.session_state.audio_path
-    file_size_mb = None
-    if audio_path and audio_path.exists():
-        file_size_mb = round(audio_path.stat().st_size / (1024 * 1024), 2)
-
-    return db.add_transcription(
-        filename=st.session_state.original_filename,
-        source_type=source_type,
-        model=model,
-        provider=provider,
-        with_timestamps=with_timestamps,
-        transcript=transcript_path.read_text(encoding="utf-8"),
-        srt=srt_text,
-        audio_path=str(audio_path) if audio_path else None,
-        file_size_mb=file_size_mb,
-        elapsed_seconds=st.session_state.elapsed_seconds,
-        cost_usd=cost["cost_usd"] if cost else None,
-        usage_json=json.dumps(cost) if cost else None,
-        title=st.session_state.get("run_title"),
-    )
-
-
 def _is_protected(path: Path) -> bool:
     """Return True for a path that holds, or lies inside, data that must survive.
 
@@ -535,8 +492,8 @@ def clean_temp_files() -> None:
     if checkpoints.any_active_run():
         st.session_state.clean_message = (
             "warning",
-            "A transcription is running (possibly in another tab) — clean up "
-            "when it has finished.",
+            "A transcription is running (possibly in another tab, or started "
+            "from the command line) — clean up when it has finished.",
         )
         return
     settings = get_settings()
@@ -591,18 +548,6 @@ def _track_source(
         st.session_state.upload_id = source_id
         st.session_state.source_version = version
     st.session_state.original_filename = name
-
-
-def _safe_stem(filename: str) -> str:
-    """Return an upload's name without extension, safe to build paths from.
-
-    Args:
-        filename: The uploaded file's name as the browser sent it.
-
-    Returns:
-        The stem of :func:`audio.safe_name`.
-    """
-    return Path(audio.safe_name(filename)).stem
 
 
 def _make_preview(source: Path, stem: str) -> Path | None:
@@ -919,21 +864,6 @@ def _format_ceiling(cost: float | None) -> str:
     return f"up to \\${cost:.2f}"
 
 
-def _format_length(seconds: float) -> str:
-    """Render a video duration as ``M:SS`` or ``H:MM:SS``.
-
-    Args:
-        seconds: Duration in seconds.
-
-    Returns:
-        The duration as a clock string.
-    """
-    total = max(0, int(seconds))
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
 def _scan_dir(video_path: Path) -> Path:
     """Return where the scan of a video is kept (named after its content).
 
@@ -943,7 +873,7 @@ def _scan_dir(video_path: Path) -> Path:
     Returns:
         A folder under ``temp_dir``, removed by clean-up or after a day.
     """
-    return get_settings().temp_dir / f"scan-{_digest(video_path)}"
+    return runs.scan_dir(video_path, _digest)
 
 
 def _video_subject(length: str, clipped: bool) -> str:
@@ -1179,12 +1109,7 @@ def collect_visual_notes(
     used: list[str] | None = None,
     span: tuple[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Extract key frames from the uploaded video and describe what they show.
-
-    Failures are reported, and whatever was described before them is kept — it
-    was paid for — because a transcript with some on-screen notes is still worth
-    having. An account failure (bad key, no credit) is raised instead when the
-    transcription itself would use OpenAI and be refused the same way.
+    """Describe what the uploaded video shows (:func:`runs.collect_visual_notes`).
 
     Args:
         visual: Settings from :func:`render_visual_options` (``model``,
@@ -1193,175 +1118,75 @@ def collect_visual_notes(
         notices: Messages for the user are appended here.
         stop_on_account_error: Raise account errors instead of warning.
         spent: Usage records of the descriptions are appended here.
-        used: The cache names of the selected frames are appended here, so
-            the caller can mark exactly those as counted.
-        span: The stretch of the video to transcribe, when not all of it: the
-            whole video is scanned (the scan is kept for any stretch), and only
-            the screenshots within the stretch are described.
+        used: The cache names of the selected frames are appended here.
+        span: The stretch of the video to transcribe, when not all of it.
 
     Returns:
         Notes with ``time`` and ``description`` (possibly empty), and whether
-        every screenshot was described — only then may the cache be discarded.
+        every screenshot was described.
 
     Raises:
         OpenAIAccountError: If OpenAI refuses the key or the account and
             ``stop_on_account_error`` is set.
     """
-    video_path: Path | None = st.session_state.video_path
-    api_key = resolve_openai_key()
-    if not video_path or not api_key:
-        return [], True
-
-    failed: list[float] = []
-    collected: list[dict[str, Any]] = []
-    total = 0
-    try:
-        with st.spinner(
-            "Looking through the video for screen changes — about a minute and a "
-            "half per hour of video…",
-            show_time=True,
-        ):
-            # The same scan and selection the caption counted, so the number
-            # described is the number that was shown.
-            scan = frames.scan_video(video_path, _scan_dir(video_path))
-            if span is not None:
-                scan = frames.clip_scan(scan, span)
-            keyframes = frames.select_from_scan(scan, visual["interval"])
-            if used is not None:
-                used.extend(vision.frame_name(frame["time"]) for frame in keyframes)
-            cache = vision.cache_dir(
-                _digest(video_path), visual["model"], visual["detail"]
-            )
-        if not keyframes:
-            notices.append(
-                ("info", "No on-screen changes were detected — nothing to describe.")
-            )
-            return [], True
-        total = len(keyframes)
-        with (
-            st.spinner(f"Describing {total} screenshots…", show_time=True),
-            frames.pictures(video_path) as picture,
-        ):
-            notes = vision.describe_keyframes(
-                keyframes,
-                api_key,
-                model=visual["model"],
-                detail=visual["detail"],
-                progress_callback=progress_callback,
-                cache=cache,
-                failed=failed,
-                collected=collected,
-                spent=spent,
-                picture=picture,
-            )
-        if failed:
-            notices.append(
-                (
-                    "warning",
-                    f"{len(failed)} of {len(keyframes)} screenshots could not be "
-                    "described and are missing from the transcript.",
-                )
-            )
-        return notes, not failed
-    except OpenAIAccountError as exc:
-        if stop_on_account_error:
-            raise
-        notices.append(("warning", _partial_context_notice(exc, collected, total)))
-    except (AppError, OSError) as exc:
-        notices.append(("warning", _partial_context_notice(exc, collected, total)))
-    return sorted(collected, key=lambda note: note["time"]), False
-
-
-def _partial_context_notice(
-    exc: Exception, collected: list[dict[str, Any]], total: int
-) -> str:
-    """Phrase why on-screen context stopped, and what was kept.
-
-    Args:
-        exc: The error that stopped it.
-        collected: Notes made before the stop.
-        total: Screenshots there were to describe (0 if extraction failed).
-
-    Returns:
-        A one-line warning.
-    """
-    if not collected:
-        return f"On-screen context skipped: {exc}"
-    return (
-        f"On-screen context incomplete: {exc} The {len(collected)} notes made "
-        f"before that (of {total} screenshots) are in the transcript."
+    return runs.collect_visual_notes(
+        st.session_state.video_path,
+        resolve_openai_key(),
+        visual,
+        notices,
+        stop_on_account_error,
+        _run_hooks(progress_callback),
+        spent=spent,
+        used=used,
+        span=span,
     )
 
 
-def _run_pipeline(
-    provider: str,
-    model: str,
-    with_timestamps: bool,
-    paths: tuple[Path, Path | None],
-    progress: ProgressCallback,
-    visual_notes: list[dict[str, Any]] | None,
-    span: tuple[int, int] | None = None,
-    verify: str | None = None,
-    batched: bool = False,
-) -> tuple[bool, dict[str, Any] | None]:
-    """Run the chosen engine.
+@contextmanager
+def _spinner(message: str) -> Iterator[None]:
+    """Show a spinner with its running time around a long step of a run."""
+    with st.spinner(message, show_time=True):
+        yield
+
+
+def _run_hooks(progress: ProgressCallback) -> runs.RunHooks:
+    """Return how a run talks to this page: spinners, cached models and hashes.
 
     Args:
-        provider: OpenAI API or local provider.
-        model: Selected model (API model name, or local model size).
-        with_timestamps: Whether to generate subtitles.
-        paths: Transcript path, and the SRT path or ``None``.
-        progress: Progress callback for the pipeline.
-        visual_notes: On-screen notes to place into the transcript.
-        span: The stretch of the recording to transcribe, when not all of it.
-        verify: The local model to check an OpenAI transcript against, if any.
-        batched: Decode the local pass in batches.
+        progress: Where the run reports its progress.
 
     Returns:
-        Whether the pipeline ran (False when no API key was available), and
-        what its OpenAI requests used (``None`` for the local engine).
+        The hooks for :func:`runs.run`.
     """
-    transcript_path, srt_path = paths
-    if provider == PROVIDER_LOCAL:
-        whisper_model = _load_local_model(model)
-        with st.spinner(
-            "Transcribing locally… This may take a while on CPU.", show_time=True
-        ):
-            transcribe.transcribe_local(
-                st.session_state.audio_path,
-                transcript_path,
-                whisper_model,
-                with_timestamps=with_timestamps,
-                srt_output_file=srt_path,
-                progress_callback=progress,
-                visual_notes=visual_notes,
-                span=span,
-                model_name=model,
-                batched=batched,
-            )
-        return True, None
+    return runs.RunHooks(
+        progress=progress,
+        stage=_spinner,
+        load_local_model=_load_local_model,
+        digest=_digest,
+        parts_hint=lambda request, total, _digest_fn: _saved_parts_hint(
+            request.model, total, request.span
+        ),
+        title_setting=_title_preferences,
+    )
 
-    api_key = resolve_openai_key()
-    if not api_key:
-        return False, None
-    # Loaded before the paid run, so a model that cannot be loaded (no disk,
-    # no download) fails before anything is spent.
-    local = (_load_local_model(verify), verify) if verify else None
-    with st.spinner("Transcribing with the OpenAI API…", show_time=True):
-        spent = transcribe.transcribe_openai(
-            st.session_state.audio_path,
-            transcript_path,
-            api_key,
-            model=model,
-            with_timestamps=with_timestamps,
-            srt_output_file=srt_path,
-            progress_callback=progress,
-            visual_notes=visual_notes,
-            span=span,
-            verify=local,
-            verify_batched=batched,
-        )
-    return True, spent
+
+class _SessionResults:
+    """Where a run leaves its results: the session state, one write per result.
+
+    Each write is a Streamlit call, and so a point where Stop takes effect —
+    :mod:`runs` sets its results one by one for exactly that reason.
+    """
+
+    _KEYS: ClassVar[dict[str, str]] = {
+        "cost": "run_cost",
+        "title": "run_title",
+        "row_id": "run_row_id",
+        "notices": "run_notices",
+    }
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Store one result under its session-state key."""
+        st.session_state[self._KEYS.get(name, name)] = value
 
 
 def _load_local_model(model: str) -> Any:
@@ -1386,180 +1211,6 @@ def _load_local_model(model: str) -> Any:
         )
 
 
-def _run_warnings(spent: dict[str, Any] | None) -> list[tuple[str, str]]:
-    """Say what a finished OpenAI run found out about its own answers.
-
-    Args:
-        spent: The pipeline's summary (``chunks``, ``verified``), if any.
-
-    Returns:
-        Notices: a warning for parts that may have lost speech, and a note or
-        warning on the cross-check against a local pass.
-    """
-    notices: list[tuple[str, str]] = []
-    if not spent:
-        return notices
-    flagged = transcribe.describe_flagged(spent.get("chunks") or [])
-    if flagged:
-        notices.append(("warning", flagged))
-    verified = spent.get("verified")
-    if verified and verified.get("error"):
-        notices.append(
-            (
-                "warning",
-                f"The check with local Whisper ({verified['model']}) failed: "
-                f"{verified['error']} The transcript keeps its estimated times.",
-            )
-        )
-    elif verified:
-        notices.append(("info", _describe_verified(verified)))
-    return notices
-
-
-def _describe_verified(verified: dict[str, Any]) -> str:
-    """Phrase what the cross-check against a local pass did.
-
-    Args:
-        verified: The ``verified`` part of a run's transcription summary.
-
-    Returns:
-        One sentence, e.g. ``Checked against local Whisper (base) in 13:02:
-        118 of 124 paragraphs re-timed; 2 stretches (312 words) the OpenAI
-        answer lacked were added``.
-    """
-    taken = (
-        f" in {_format_length(verified['seconds'])}" if verified.get("seconds") else ""
-    )
-    text = (
-        f"Checked against local Whisper ({verified['model']}){taken}: "
-        f"{verified['anchored']} of {verified['paragraphs']} paragraphs re-timed"
-    )
-    if verified.get("gaps"):
-        text += (
-            f"; {verified['gaps']} stretch(es) ({verified['added_words']} words) the "
-            "OpenAI answer lacked were added, marked 🧩"
-        )
-    else:
-        text += "; nothing the OpenAI answer lacked was found"
-    return text + "."
-
-
-def _with_span(cost: dict[str, Any], span: tuple[int, int] | None) -> dict[str, Any]:
-    """Record on a run's cost which stretch of the recording it transcribed.
-
-    Args:
-        cost: The run's cost from :func:`_run_cost`.
-        span: The stretch, or ``None`` for the whole recording.
-
-    Returns:
-        The cost, with ``span`` added when part of the recording was left out.
-    """
-    return {**cost, "span": list(span)} if span is not None else cost
-
-
-def _run_cost(
-    provider: str,
-    transcription: dict[str, Any] | None,
-    vision_records: list[dict[str, Any]],
-    transcription_ran: bool = True,
-    title_records: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Put a run's transcription, screenshot and title usage together.
-
-    Args:
-        provider: The engine used (local transcription costs nothing).
-        transcription: :func:`usage.summarize` of the transcription requests,
-            or ``None`` when the pipeline did not report it.
-        vision_records: Usage records of the screenshot descriptions.
-        transcription_ran: False when the run stopped before transcribing.
-        title_records: Usage records of the AI title request, if one was made.
-
-    Returns:
-        ``transcription``, ``vision`` and ``title`` summaries (``None`` when
-        unused), the total ``cost_usd`` and whether any part of it is
-        ``estimated``.
-    """
-    vision = usage.summarize(vision_records) if vision_records else None
-    title = usage.summarize(title_records) if title_records else None
-    unknown = (
-        provider == PROVIDER_OPENAI and transcription_ran and transcription is None
-    )
-    parts = [part for part in (transcription, vision, title) if part]
-    return {
-        "provider": provider,
-        "transcription": transcription,
-        "vision": vision,
-        "title": title,
-        "cost_usd": sum(part["cost_usd"] for part in parts),
-        "estimated": unknown or any(part["estimated"] for part in parts),
-    }
-
-
-def _note_spent_before_failure(
-    provider: str,
-    vision_spent: list[dict[str, Any]],
-    notices: list[tuple[str, str]],
-    transcription_spent: dict[str, Any] | None = None,
-) -> None:
-    """Say what a failed run already paid for (nothing is saved).
-
-    Args:
-        provider: The engine of the run.
-        vision_spent: Usage records of the descriptions made before the failure.
-        notices: Messages for the user are appended here.
-        transcription_spent: Usage summary of transcription requests paid before
-            the failure (halves of a split first chunk), if any.
-    """
-    if vision_spent or transcription_spent:
-        cost = _run_cost(
-            provider,
-            transcription_spent,
-            vision_spent,
-            transcription_ran=transcription_spent is not None,
-        )
-        notices.append(("info", _describe_cost({**cost, "partial": True})))
-
-
-def _make_title(
-    transcript_path: Path,
-    progress: ProgressCallback,
-    notices: list[tuple[str, str]],
-) -> list[dict[str, Any]]:
-    """Name a finished transcript when the AI title setting asks for it.
-
-    Runs after either engine: a Local run sends its transcript too. A title
-    that cannot be made costs the run only a warning — the transcript is
-    already paid for and is saved without one.
-
-    Args:
-        transcript_path: The finished transcript.
-        progress: Progress callback of the run.
-        notices: Messages for the user are appended here.
-
-    Returns:
-        The usage records of the title request (empty when none was sent).
-    """
-    mode, model = _title_preferences()
-    if mode == TITLE_MODE_OFF:
-        return []
-    api_key = resolve_openai_key()
-    if not api_key:
-        notices.append(
-            ("info", "No AI title: it needs an OpenAI API key (sidebar or `.env`).")
-        )
-        return []
-    progress({"status": "info", "message": "Writing a title…"})
-    try:
-        title, records = titles.make_title(
-            transcript_path.read_text(encoding="utf-8"), api_key, model
-        )
-    except AppError as exc:
-        notices.append(("warning", f"No AI title: {exc}"))
-        return list(getattr(exc, "usage_records", None) or [])
-    st.session_state.run_title = title
-    return records
-
-
 def run_transcription(
     provider: str,
     model: str,
@@ -1572,8 +1223,11 @@ def run_transcription(
 ) -> None:
     """Run the selected provider's pipeline and store result paths.
 
-    Messages for the user are stored in ``run_notices`` rather than drawn
-    directly, because the page reruns as soon as the job ends.
+    The run itself is :func:`runs.run`, shared with the command line; this
+    gives it the page's file, key and title setting, and a sink that writes
+    its results to the session state. Messages for the user are stored in
+    ``run_notices`` rather than drawn directly, because the page reruns as
+    soon as the job ends.
 
     Args:
         provider: OpenAI API or local provider.
@@ -1588,154 +1242,27 @@ def run_transcription(
         batched: Decode the local pass (the Local engine's run, or the
             cross-check) in batches.
     """
-    settings = get_settings()
+    temp_dir = get_settings().temp_dir
     base_name = _safe_stem(st.session_state.original_filename)
-    transcript_path = settings.temp_dir / f"transcript_{base_name}.txt"
-    srt_path = settings.temp_dir / f"transcript_{base_name}.srt"
-    notices: list[tuple[str, str]] = []
-    # Drop the previous run's result state before starting. Without this, a run
-    # that fails or returns early leaves the old figure on screen, so the result
-    # panel claims "Finished in …" for a run that never finished.
-    st.session_state.elapsed_seconds = None
-    st.session_state.run_cost = None
-    st.session_state.run_title = None
-    st.session_state.run_row_id = None
-    vision_spent: list[dict[str, Any]] = []
-    used_frames: list[str] = []
-    progress = make_progress_callback(st.empty())
-    # Timed from here so the reported figure matches the wait the user actually
-    # sits through, on-screen context included.
-    started = time.monotonic()
-
-    try:
-        # Taken before the run: a recording from a folder that is still being
-        # written would hash differently at the end, and what is discarded then
-        # must be what this run saved.
-        audio_digest = video_digest = None
-        if provider == PROVIDER_OPENAI:
-            audio_digest = _digest_if_any(st.session_state.audio_path)
-        if visual:
-            video_digest = _digest_if_any(st.session_state.video_path)
-        visual_notes = None
-        visual_complete = False
-        if visual:
-            # An account error stops an OpenAI run (its transcription would be
-            # refused the same way) and only warns a Local one.
-            visual_notes, visual_complete = collect_visual_notes(
-                visual,
-                progress,
-                notices,
-                stop_on_account_error=provider == PROVIDER_OPENAI,
-                spent=vision_spent,
-                used=used_frames,
-                span=span,
-            )
-
-        ran, transcription_spent = _run_pipeline(
-            provider,
-            model,
-            with_timestamps,
-            (transcript_path, srt_path if with_timestamps else None),
-            progress,
-            visual_notes,
-            span,
-            verify,
-            batched,
-        )
-        if not ran:
-            notices.append(
-                (
-                    "error",
-                    "Add your OpenAI API key in the sidebar, or set `OPENAI_API_KEY` "
-                    "in a `.env` file. (The Local engine needs no key.)",
-                )
-            )
-        else:
-            st.session_state.transcript_path = transcript_path
-            st.session_state.srt_path = (
-                srt_path if with_timestamps and srt_path.exists() else None
-            )
-            notices += _run_warnings(transcription_spent)
-            title_spent = _make_title(transcript_path, progress, notices)
-            st.session_state.elapsed_seconds = time.monotonic() - started
-            # Cleared only now: a retry that fails before writing anything still
-            # shows the earlier partial transcript, and must still say so.
-            st.session_state.partial = None
-            cache = None
-            if visual and video_digest:
-                cache = vision.cache_dir(
-                    video_digest, visual["model"], visual["detail"]
-                )
-                if visual_complete:
-                    # The cache is discarded below. Descriptions an earlier,
-                    # unsaved attempt paid for outside this selection would then
-                    # count in no row, so this one takes them.
-                    vision_spent += vision.unbilled_usage(
-                        cache, visual["model"], used_frames
-                    )
-            cost = _with_span(
-                _run_cost(
-                    provider,
-                    transcription_spent,
-                    vision_spent,
-                    title_records=title_spent,
-                ),
-                span,
-            )
-            # Recorded with the row, to tell batched runs apart later.
-            st.session_state.run_cost = (
-                {**cost, "local_batched": True} if batched else cost
-            )
-            row_id = save_to_history(source_type, provider, model, with_timestamps)
-            # Only now: a run stopped after its last chunk has already written
-            # the transcript but not saved it, and must be able to resume free.
-            # And straight after the row, with no Streamlit call in between: each
-            # one (session state included) is where a Stop takes effect, and a
-            # Stop between the row and the discard would let Start save the
-            # same transcript as a second row. The parts are first copied
-            # beside the history (keep_run makes no Streamlit call either):
-            # they are the only record of what each chunk's answer held.
-            if audio_digest:
-                parts = transcribe.checkpoint_dir(audio_digest, model, span)
-                if row_id is not None:
-                    checkpoints.keep_run(parts, row_id)
-                checkpoints.discard(parts)
-            if cache is not None:
-                if visual_complete:
-                    checkpoints.discard(cache)
-                else:
-                    # Kept so a rerun pays only for the missing screenshots;
-                    # this row has counted the ones it used.
-                    vision.mark_billed(cache, used_frames)
-            st.session_state.run_row_id = row_id
-    except IncompleteTranscriptionError as exc:
-        st.session_state.transcript_path = transcript_path
-        st.session_state.srt_path = None
-        st.session_state.partial = f"{exc.completed} of {exc.total}"
-        st.session_state.run_cost = {
-            **_with_span(_run_cost(provider, exc.spent, vision_spent), span),
-            "partial": True,
-        }
-        hint = (
-            " The Local engine needs no key or credit."
-            if isinstance(exc.__cause__, OpenAIAccountError) and LOCAL_AVAILABLE
-            else ""
-        )
-        notices.append(
-            (
-                "error",
-                f"Stopped after part {exc.completed} of {exc.total}: {exc}{hint}",
-            )
-        )
-        notices.append(("info", _saved_parts_hint(model, exc.total, span)))
-    except OpenAIAccountError as exc:
-        hint = " The Local engine needs no key or credit." if LOCAL_AVAILABLE else ""
-        notices.append(("error", f"{exc}{hint}"))
-        _note_spent_before_failure(provider, vision_spent, notices, exc.spent)
-    except AppError as exc:
-        notices.append(("error", f"Transcription error: {exc}"))
-        _note_spent_before_failure(provider, vision_spent, notices, exc.spent)
-    st.session_state.run_notices = notices
+    request = runs.RunRequest(
+        filename=st.session_state.original_filename,
+        source_type=source_type,
+        audio_path=st.session_state.audio_path,
+        video_path=st.session_state.video_path,
+        transcript_path=temp_dir / f"transcript_{base_name}.txt",
+        srt_path=temp_dir / f"transcript_{base_name}.srt",
+        provider=provider,
+        model=model,
+        with_timestamps=with_timestamps,
+        visual=visual,
+        span=span,
+        verify=verify,
+        batched=batched,
+        api_key=resolve_openai_key(),
+        local_available=LOCAL_AVAILABLE,
+    )
+    hooks = _run_hooks(make_progress_callback(st.empty()))
+    runs.run(request, _SessionResults(), hooks)
 
 
 def render_run_notices() -> None:
@@ -1776,16 +1303,14 @@ def _saved_parts_hint(
     Returns:
         One sentence for the notice.
     """
-    audio_path: Path | None = st.session_state.audio_path
-    saved = 0
-    if audio_path and audio_path.exists():
-        saved = transcribe.saved_chunk_count(_digest(audio_path), model, span)
-    if not saved:
-        return "No finished parts are saved — Start transcribes it from the beginning."
-    of_total = f" of {total}" if total else ""
-    return (
-        f"{saved}{of_total} part(s) are saved — press Start to transcribe only "
-        "the rest; saved parts are not sent or paid for again."
+    return runs.saved_parts_hint(
+        st.session_state.audio_path,
+        model,
+        total,
+        span,
+        digest=_digest,
+        retry="press Start",
+        retry_verb="Start",
     )
 
 
@@ -1991,71 +1516,6 @@ def _queue_notices() -> list[tuple[str, str]]:
             )
         )
     return notices
-
-
-def _describe_cost(cost: dict[str, Any]) -> str:
-    """Phrase what a run cost and what it used, for a caption.
-
-    Args:
-        cost: The run's cost from :func:`_run_cost`.
-
-    Returns:
-        E.g. ``:material/payments: $0.0071 — transcription 1 request, 0:56 of
-        audio, 1,210 → 240 tokens; screenshots 4 described, 2,580 → 190
-        tokens``.
-    """
-    parts = []
-    transcription = cost.get("transcription")
-    if transcription:
-        tokens = ""
-        if transcription["input_tokens"] or transcription["output_tokens"]:
-            tokens = (
-                f", {transcription['input_tokens']:,} → "
-                f"{transcription['output_tokens']:,} tokens"
-            )
-        audio_seconds = transcription.get("audio_seconds", transcription["seconds"])
-        parts.append(
-            f"transcription {transcription['requests']} request(s), "
-            f"{_format_length(audio_seconds)} of audio{tokens}"
-        )
-    elif cost.get("provider") == PROVIDER_LOCAL:
-        parts.append("transcription free (local)")
-    vision = cost.get("vision")
-    if vision:
-        parts.append(
-            f"screenshots {vision['requests']} described, "
-            f"{vision['input_tokens']:,} → {vision['output_tokens']:,} tokens"
-        )
-    title = cost.get("title")
-    if title:
-        parts.append(
-            f"title {title['input_tokens']:,} → {title['output_tokens']:,} tokens"
-        )
-    verified = (transcription or {}).get("verified")
-    if verified and not verified.get("error"):
-        parts.append(f"checked with local Whisper ({verified['model']}, free)")
-    span = cost.get("span")
-    if span:
-        parts.append(
-            f"{_format_length(span[0])}–{_format_length(span[1])} of the recording "
-            "transcribed, the rest left out"
-        )
-    total = usage.format_usd(cost["cost_usd"], cost.get("estimated", False))
-    icon = ":material/payments:"
-    text = f"{icon} {total} — " + "; ".join(parts) if parts else f"{icon} {total}"
-    if cost.get("partial"):
-        text += " — spent so far, not saved to history."
-        if transcription:
-            text += (
-                " Start again with the same model to transcribe only the rest; "
-                "that run counts this in its total."
-            )
-        if vision:
-            text += (
-                " The screenshot descriptions are kept: the next run with the same "
-                "screenshot model and detail reuses them and counts them in its total."
-            )
-    return text
 
 
 def render_results(disabled: bool = False) -> None:

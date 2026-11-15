@@ -35,7 +35,9 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 ### Modules (thin UI, logic extracted)
 | File | Role |
 |---|---|
-| `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job), several uploads as a queue of such jobs, one after another. No ffmpeg/IO logic inline. |
+| `app.py` | **UI only** — render functions, tabs, sidebar, the two-step run (request → locked page → job), several uploads as a queue of such jobs, one after another. No ffmpeg/IO logic inline; the run itself is `runs.run`. |
+| `runs.py` | **One run, from a prepared recording to a saved history row** — on-screen context, the engine, the AI title, the cost, the row, then the discard of the saved parts — shared by the page and the command line; its results are left in a sink, one at a time (§3 Command line). Also the pre-run cost estimate and where a transcript goes beside its recording. Streamlit-free |
+| `cli.py` | **The command line** (`transcribe`, `estimate`, `latest`, `pending`): arguments in, one JSON object out, progress on stderr; it checks what was asked and calls `runs.run` |
 | `config.py` | **Pydantic Settings + every constant** (single source of truth): formats, models, paths, limits |
 | `audio.py` | ffmpeg helpers: `save_uploaded_file`, `to_wav` (mono 16 kHz), `to_preview` (small MP3 for the player) — UI-agnostic |
 | `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, their lengths (ffprobe, cached per version), stable list labels, a file's identity — UI-agnostic |
@@ -44,14 +46,14 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed, the output-cap and thin-answer guards, one log line and one record per answered chunk, the optional local cross-check) and `transcribe_local` (optionally batched, split back into sentences by word times); transcript rendering |
 | `align.py` | The cross-check: aligns the API text with a local pass word by word (`difflib`), re-times paragraphs, finds the stretches the API answer lacks; pure functions |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
-| `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; the parts of a finished run kept in `data/runs/<row id>/`; also the age-based clean-ups of `temp/` and `uploads/` and the space they take |
+| `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; the parts of a finished run kept in `data/runs/<row id>/`; also the age-based clean-ups of `temp/` and `uploads/` and the space they take; a locked marker file per run, so a run in another process (the command line) counts as one in progress |
 | `serbian.py` | Serbian Cyrillic → Latin transliteration (pure functions; opt-in) |
 | `titles.py` | AI title of a finished transcript: the chat request (with the transcript's script named, and one retry for a title in a foreign script), cleaning the answer into a safe file name, how a title is shown per mode |
 | `usage.py` | Per-request token and cost records (transcription, vision, title), totals, USD formatting; pure functions |
 | `db.py` | SQLite history (`data/transcriptions.db`) and the sidebar preferences stored with it |
 | `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `TitleError`, `OpenAIAccountError`) |
 | `logger.py` | `get_logger()` — stdlib logging (never `print()`); `enable_file_log()` — the rotating `data/logs/app.log`, keys blanked |
-| `scripts/` | Launchers: `run.bat` (Windows), `run.sh` (Linux/macOS), `create-shortcut.ps1`; one-off `serbian_latin_backfill.py` |
+| `scripts/` | Launchers: `run.bat` (Windows), `run.sh` (Linux/macOS), `create-shortcut.ps1`, `v2t.bat` / `v2t.sh` (the command line, from any folder); one-off `serbian_latin_backfill.py` |
 | `tests/` | pytest — pure functions, SQLite, the pipeline with a fake client, headless UI (AppTest); no network, no ffmpeg |
 
 ### Data flow
@@ -83,6 +85,10 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
        → write to SQLite history (a partial run is shown, marked, and not saved); the
           run's chunk files are copied to data/runs/<row id>/ before they are discarded
 ```
+
+From the command line (`cli.py transcribe <recording>`) the flow is the same from the engine on:
+the recording is read where it lies, the run is the same `runs.run`, and the finished
+transcript is copied beside the recording as `transcript_<its name>.txt`.
 
 ### How the two engines differ
 | | OpenAI API | Local (offline) |
@@ -652,7 +658,153 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   cloning the repo must be able to run it immediately, and the offline engine needs no key
   at all.*
 
+### Command line and the shared run *(2026-11-15)*
+- **A command line, not an HTTP API or an MCP server — for now.** The owner wants to tell
+  Claude Code "transcribe the newest recording, put the text beside it and tell me the
+  next steps". Claude Code runs a command, can leave it in the background, is told when
+  it ends and reads JSON. An HTTP API would need a server that is always up, a port and
+  a login, for one user on the same computer. An MCP server needs a start/status pair of
+  tools, because a tool call cannot wait the minutes a transcription takes. Both become
+  worth building only when the caller cannot run a command on this computer (Claude
+  chat, a phone without Remote Control, a hosted copy) — then as a thin wrapper over
+  `runs.run`, which is why the next bullet came first.
+- **The run moved out of the page into `runs.py`, in the same order.**
+  `app.run_transcription` was the only place that knew the order of a run — on-screen
+  context, the engine, the title, the cost, the History row, and only then the discard
+  of the saved parts — and it read and wrote `st.session_state` at every step. A command
+  line would have had to copy 180 lines of rules that each exist because of a real loss
+  (§3 Transcription, UI / flow). Now the page and `cli.py` both call
+  `runs.run(request, results, hooks)`; `app.run_transcription` only builds the request
+  from the session. The 428 tests that existed pass unchanged.
+- **Results go into a sink, one attribute at a time — that is what keeps Stop working.**
+  A Streamlit Stop takes effect at the run's next Streamlit call, session state included
+  (§3 UI / flow, 2026-09-30), and two rules depend on where those calls are: a Stop
+  during the title must leave the saved parts for a free resume, and there must be no
+  call between writing the History row and discarding the parts. Returning one result
+  object at the end would have removed every stop point after the engine: a Stop pressed
+  during the title request would then save the row, discard the parts, and only then
+  stop — with the page saying "stopped before it finished" over a saved transcript.
+  So `runs.run` sets `transcript_path`, `srt_path`, `title`, `elapsed_seconds`,
+  `partial`, `cost` and, after the discard, `row_id` on the object it is given. The
+  page's sink (`app._SessionResults`) writes each to the session state, exactly where
+  the old code did; the command line's is a plain object.
+  `test_nothing_is_set_between_the_history_row_and_the_discard` pins the order in
+  `runs.py` itself, and the two page tests of 2026-09-30 (a Stop right after the row, a
+  Stop during the title) pass unchanged.
+- **Hooks carry what differs between the two callers** (`runs.RunHooks`): progress, the
+  "stage" around a long step (the page's spinner; a line on stderr), loading a local
+  model (cached by Streamlit; plain), the file digest (cached by Streamlit; plain, and
+  remembered for the length of a run so a large video is hashed once, not three times),
+  the wording of the saved-parts hint ("press Start" means nothing in a terminal), and
+  the AI title setting. The title setting is *asked for* only once a transcript is
+  written, not passed in: the page keeps it in the history database, and reading it at
+  the start made a failed run on a fresh database crash instead of reporting its error —
+  a page test caught that in the first version of this change.
+- **The command line is normal use: it writes the real History.** Same `data/`, same
+  row, same `data/runs/<id>/` and log as a run from the page, so cost and history stay
+  in one place. Trying it out is not normal use: tests and trial runs set
+  `DATA_DIR`/`TEMP_DIR`/`UPLOAD_DIR` to a scratch folder (CLAUDE.md invariant).
+- **Nothing paid starts above a ceiling without `--yes`.** On the page nothing is sent
+  before the Start click (§3 UI / flow, "Auto-prepare + ONE click"); a command has no
+  click. `transcribe` estimates the run first — minutes × OpenAI's own per-minute figure
+  ($0.006 for `gpt-4o-transcribe`, on the high side: the owner's recorded runs came out
+  near $0.004), plus one Full HD screenshot per look for `--screens` — and refuses, with
+  `status: needs_confirmation` and exit code 4, a run estimated above
+  `CLI_MAX_COST_USD` ($1, about 2 h 45 min; `--max-cost` changes it for one call) or a
+  recording that does not say its length. An agent can then ask the owner and repeat the
+  command with `--yes`. A local run never asks. The limit is a default chosen here, not
+  measured: change the constant if it gets in the way.
+- **The transcript goes beside the recording as `transcript_<recording name>.txt`, and
+  an existing one is never replaced** without `--overwrite` (`status: exists`, exit 4).
+  That is the owner's naming for meeting folders; a transcript corrected by hand must
+  survive a second call; and it is what makes `pending` a one-line question (a recording
+  without that file). The AI title goes into the History row only, never into the file
+  name — the owner's meeting files keep the recording's name. A partial transcript stays
+  in `temp/` (`partial_transcript`, exit 3): beside the recording it would pass for a
+  finished one.
+- **Each command-line run works in its own `temp/cli-*` folder**, removed when the run
+  ends; a partial run keeps it, without the extracted WAV, and it goes after a day with
+  the other scratch folders (`checkpoints._SCRATCH_PATTERNS`). Not the page's
+  `temp/<name>.wav` and `temp/transcript_<name>.txt`: the page and a command can be on
+  two recordings of the same name at once. Saved parts are keyed by the audio's content,
+  so a resumed command finds them from a freshly extracted WAV, as the page does after
+  its working copy was cleared.
+- **A run in another process is seen through a locked marker file**
+  (`temp/active-runs/<pid>-<id>.run`). `checkpoints.active_run()` counted runs in a
+  module variable, which another process cannot see: "Clean temporary files" on the page
+  would have deleted the saved parts of a command-line run in progress, which would then
+  pay for them again — the two-tabs bug of 2026-09-25, between processes. Each run now
+  also holds an exclusive lock on a marker (`msvcrt.locking` on Windows, `fcntl.flock`
+  elsewhere — not `lockf`, whose lock is dropped when the process closes *any* handle to
+  the file, including the one a check opens), and `any_active_run()` counts a marker it
+  cannot lock. The lock is the signal, not the file or a process id: the operating
+  system drops it when the process ends however it ends, so a killed run leaves a marker
+  that reads as free and is removed by the next check; and on Windows the only stdlib
+  liveness test for a pid, `os.kill(pid, 0)`, terminates that process. Checked between
+  two real processes in `tests/test_checkpoints.py`, including a process that dies
+  without clean-up (`os._exit`; `Popen.kill()` proved nothing there — in a Windows venv
+  it ends only the launcher, and the Python it started kept the lock).
+- **The launchers call the project's own Python** (`scripts/v2t.bat`, `v2t.sh`), not
+  `uv run`: a plain `uv run` syncs first and uninstalls the offline engine (CLAUDE.md,
+  Syncing). They work from any folder: `config.BASE_DIR` and `.env` are found from the
+  module's own path.
+- **One JSON object on stdout, in UTF-8; progress on stderr.** The streams are
+  reconfigured to UTF-8 at the start: a pipe on Windows gets the ANSI code page, which
+  cannot write the "š" of a file name. Whatever goes wrong, the answer is still JSON
+  (`status: failed`, `message`), never a traceback; the traceback goes to the log.
+- *Checked live (2026-11-15, scratch folders, local `base`, synthetic speech, no OpenAI
+  request):* an 8.7 s WAV → `transcript_<name>.txt` beside it in 9.5 s, row 1 in the
+  scratch history; an MKV with `--srt --from 0 --to 0:08` → transcript and `.srt` beside
+  it, row 2; the same command again → `exists`, exit 4; `pending` then lists nothing;
+  `temp/` left with only the empty marker folder.
+- *Checked live against the real OpenAI API (2026-11-15, with the owner's OK; scratch
+  folders, synthetic English speech, $0.023 in all, 7 rows in the scratch history):*
+  - a 9 s call, default model → `done`, $0.0005, the text right; `--max-cost 0.0001` →
+    `needs_confirmation`, exit 4, no request made;
+  - a 2:09 call in three one-minute parts (`SEGMENT_DURATION_MINUTES=1`), **the process
+    killed once part 1 was back** (`taskkill /T`): no answer, nothing beside the
+    recording, the marker left behind; a second process then saw no run and removed the
+    marker; **the same command again** said "1 already done, resuming", sent two
+    requests, not three, and saved one row whose cost counts all three parts;
+  - `--verify`: "about 0:05 left, then the check with local Whisper", then "8 of 8
+    paragraphs re-timed" in the notices and in the transcript's first line;
+  - `--model whisper-1 --srt` → `.txt` and `.srt` beside each other;
+  - a 23 s video of three slides with `--screens --screens-every 5 --title` → three
+    `🖥️` notes placed at 0:00, 0:08 and 0:18, each quoting its slide's text, and a
+    title in the row ("Q3 revenue and new platform roadmap actions"); $0.002 against an
+    estimate of $0.005;
+  - while a command ran, `any_active_run()` in another process said True.
+  A killed command leaves its `temp/cli-*` and `segments-*` folders, as a killed page run
+  does; they go after a day.
+- *The page, seen in a browser after the move (same day, an isolated copy on port 8598
+  with the scratch folders):* the rows the command line saved are in History; a run from
+  the folder source showed "2:08 of audio in 3 part(s)", then "Transcribing part 1 of
+  3… about 0:05 left" for each part, and the result with its cost; a Local `medium` run
+  stopped with the toolbar's Stop came back as "The last run was stopped before it
+  finished. Press Start to run it again." with Start enabled. The page's own Stop button
+  was not pressed (the click landed on the toolbar's, the same mechanism).
+
 ### UI / flow
+- **An OpenAI run says about how much time is left, worked out from its own parts**
+  *(2026-11-15, the owner asked for it)*. "Transcribing part 3 of 11… about 1:30 left":
+  the time the parts of this run took so far (MP3 and any second attempt included)
+  against the audio they covered, times the audio still to be sent; parts saved by an
+  earlier attempt are not counted, as they are not sent. Before the first part is back,
+  the typical speed stands in (`OPENAI_SECONDS_PER_AUDIO_MINUTE`, 2.3). That figure was
+  read from the owner's history, as aggregates: 159 parts of 19 runs took 2.3 s per
+  minute of audio at the median (1.8–3.4 for four in five, 8.5 for the slowest), so a
+  five-minute part answers in about 11 s (7–16 s for four in five, 43 s at most); within
+  one run the parts differ by a factor of 1.3–1.7, in three runs by 2.5–6. So the time
+  is not constant, but steady enough for an estimate — written "about", rounded to 5 s,
+  never under 5 s while a part is out. With the local check ticked the message adds
+  ", then the check with local Whisper": the estimate covers the OpenAI parts only. It
+  is in the message itself, so the page and the command line show it without a change;
+  the payload also carries `remaining_seconds`. **Not built: a bar that fills during one
+  part.** The script is blocked in the request, so the bar would have to be animated in
+  the browser by the expected time and held short of full until the answer came — for
+  a wait of about 11 s. And **Stop stays neutral, not red** (asked the same day): red
+  here means "deletes for good" (Delete, Clean temporary files), and Stop loses
+  nothing — the part in progress is finished and kept.
 - **Auto-prepare + ONE click:** a video's audio is extracted automatically on upload (the
   old "Extract Audio" button is gone), but transcription stays an **explicit click**.
   *Reason: that is where the model and timestamp options are chosen, and it prevents every
@@ -1154,6 +1306,12 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
   after another with the settings chosen once, each saved to History as it finishes;
   the page lists them with where each stands, a failure stops the queue at that file
   and Start goes on from it
+- **About how much time is left** *(2026-11-15)*: each "part N of M" of an OpenAI run adds
+  "about M:SS left", estimated from the parts the run has got back
+- **From the command line** *(2026-11-15)*: `cli.py transcribe` does what Start does and puts
+  `transcript_<recording name>.txt` beside the recording; `estimate`, `latest` and `pending`
+  answer without starting anything. One JSON object per command, for scripts and AI
+  agents; a paid run above $1 needs `--yes`
 - **Faster local Whisper (batched)** *(2026-11-04)*: an opt-in box wherever a local
   pass runs (the Local engine, or the cross-check) — pieces cut at pauses, 8 written
   at once, split back into sentences by their word times; 1.7× on a 14-minute clip with
@@ -1412,6 +1570,22 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       synthetic M4A (extraction, player, a Local run, clean-up leaving the originals).
 
 ### P1 — transcript correctness
+- [ ] **A short last part can lose its closing sentence, and no guard sees it** (found
+      2026-11-15, one observation, synthetic English speech). A 2:09 recording cut into
+      one-minute parts ended with a 13 s part (1:55–2:08). `gpt-4o-transcribe` answered
+      that part with 19 words and left out the last sentence, spoken at 2:02–2:08 ("Point
+      14. That is all for today, thank you, and see you next week." — 14 words); the same
+      recording sent as one part had it, and so did a local `small` pass. The thin-chunk
+      guard stayed silent: 82 words/min against a median of about 123 is above its 50 %,
+      and a 14-word loss is under the cross-check's 25-word minimum too. A 13 s part only
+      happens here because of the one-minute setting, but with the default five minutes a
+      recording still ends in a part of any length from 10 s up (`MIN_TAIL_SECONDS`).
+      Options to weigh, none tried: join a tail shorter than a minute or so to the part
+      before it (a six-minute part of dense Serbian is about 1,750 output tokens, close to
+      the 1,900 cap guard, which would then split it); or always check the last part's
+      end against a local pass of its final seconds. First: see how often it happens on
+      real recordings (the last part's words/min against the run's median, from
+      `usage_json`, read-only).
 - [ ] **Blind test of providers on real audio before 2027-02-26** (M). 10–15 min of real
       Serbian and Macedonian meeting audio plus an AMR call, hand-corrected reference;
       candidates: gpt-transcribe, ElevenLabs Scribe v2 (Data-use opt-out on), Gemini 3.5
@@ -1528,6 +1702,24 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       update (2026-09-29 review).
 
 ### P5 — features and later
+- [ ] **A Claude skill on top of the command line** (S; outside this repo). What `cli.py` cannot
+      know: where recordings come from (the OBS folder, phone calls, Viber voice messages),
+      which `Meeting` folder a recording belongs in, when to ask before a paid run, and what
+      to do with the transcript — read it (in every folder, the owner's call of 2026-11-15),
+      propose a description that is added to the *end* of both file names and rename the
+      pair after the owner's yes, then say the next steps.
+- [x] **A first real OpenAI run through the command line** — done 2026-11-15 on synthetic
+      recordings, `--screens`, `--verify`, `--srt`, the title and a killed-and-resumed run
+      included (§3 Command line, "Checked live against the real OpenAI API"). Still to
+      come: a real meeting through it.
+- [ ] **Nightly local run over `pending`** (optional, last). A scheduled task that transcribes
+      whatever has no transcript with the local engine. Not about money (an hour of
+      meeting is about $0.36 on the API): nothing stays untranscribed, the audio stays on
+      the computer, and the local engine has exact times. The laptop must be on and awake;
+      `large-v3-turbo` is estimated at 20–35 min per 52 min of recording here (journal
+      2026-11-03 part 3).
+- [ ] **An MCP or HTTP wrapper over `runs.run`** — only when a caller cannot run a command on
+      this computer (§3 Command line).
 - [ ] **Show the OpenAI credit left** (asked 2026-11-03). The owner chose a read-only
       Admin key to ask Claude about spend: `C:\Work\tools\openai-potrosnja.py` (outside
       this repo; key in `C:\Work\.secrets`, see `PLAYBOOK-API-PRISTUPI.md`), so
@@ -1551,7 +1743,9 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       hold music — check on real recordings first (aggregates only).
 - [ ] **Meeting summary and action items** (R38, M). An explicit button, gpt-5.4-mini, stored
       in a new nullable `summary` column; hidden for very short transcripts. `titles.py`
-      is the pattern (one chat request, usage record, failure only warns).
+      is the pattern (one chat request, usage record, failure only warns). *2026-11-15:* with
+      the command line, Claude reads the transcript and writes the summary with the
+      project's context — decide whether this is still wanted inside the app.
 - [x] **AI titles for older rows** — done 2026-09-29: "🏷️ Make a title" in a History
       entry, and "🏷️ New title" for a row that has one (to replace a bad title), while
       the mode is on; its cost is added to the row (§3 AI title).
@@ -1563,6 +1757,82 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-15 (part 3) — The command line and the page checked live, with real requests
+
+*Personal laptop.* The owner: "proveri sve ovo slobodno uživo… nema veze što troši".
+Every path left unverified in part 1 was run against the real API on synthetic
+recordings (a 9 s call, a 2:09 planning call, a 23 s video of three slides), with the
+scratch folders and the real key: the default run, the cost limit, a run killed after
+its first part and resumed by the same command, `--verify`, `--srt` with whisper-1,
+`--screens` with a title, and the marker seen from a second process — all as designed,
+$0.023 in total. Then the page itself in a browser, in an isolated copy on port 8598:
+History shows the command line's rows, a run shows the time left, the toolbar's Stop
+ends a local run and unlocks the page. Details in §3 Command line.
+
+**Found on the way** (§5 P1, first item): the 13-second last part of the planning call
+came back without its final sentence, and neither the thin-chunk guard nor the
+cross-check's 25-word minimum would report a loss that small. One observation; to be
+measured on real recordings before anything is changed.
+
+Asked meanwhile, not built: a time left that counts down on the page between parts.
+Nothing changed in the code in this part; nothing committed.
+
+### 2026-11-15 (part 2) — About how much time is left
+
+*Personal laptop.* Looking at a run on the page, the owner asked whether Stop should be
+red like Delete, and whether a part always comes back in the same time, so that a bar
+could show how far a part is. Answered from the history (read-only, aggregates): Stop
+stays neutral, and the answer time is steady enough for an estimate of the whole run,
+not worth a bar inside one 11-second part (§3 UI / flow, first bullet). On "dodaj":
+`transcribe.estimate_remaining` and `format_remaining`, the time left in each "part N of
+M" message, `_is_saved` shared with `_reusable_chunks`, two constants in `config.py`.
+Made in a copy of the working tree and copied over when green, as the owner's app was
+transcribing from this checkout at the time. **Tests: 467** (three new in
+`tests/test_pipeline.py`), ruff clean. Not seen on the live page — the owner's next run
+shows it. Not committed.
+
+### 2026-11-15 — A command line for Claude Code, and the run moved out of the page
+
+*Personal laptop.* The owner asked how to make the app usable from Claude Code ("uzmi
+najnoviji snimak, pošalji na transkripciju, prati, stavi transkript pored snimka,
+pročitaj ga i reci mi šta je sledeće"), whether that takes an API or an MCP server, and
+where it could be hosted. Advice given and accepted: a command line plus a Claude skill;
+no hosting and no Next.js rewrite (a browser tab through Cloudflare Tunnel + Access only
+if the page itself is wanted from a phone; Claude Code's Remote Control already covers
+"transcribe the new recording while I am out"). Then "kreni sa prvim korakom: izdvajanje
+toka iz app.py i komandna linija".
+
+Done, all of it in a separate git worktree first, because the owner's own app was
+running from this checkout (three Streamlit processes) and would have hot-reloaded a
+half-moved `app.py`:
+
+- **`runs.py`** (new): the run that was `app.run_transcription`, Streamlit-free, with a
+  request, a results sink and hooks (§3 Command line and the shared run). `app.py` lost
+  about 540 lines; `_describe_cost`, `_describe_verified`, `_format_length` and
+  `_safe_stem` are now names for the functions in `runs.py`.
+- **`cli.py`** (new): `transcribe`, `estimate`, `latest`, `pending`; launchers
+  `scripts/v2t.bat` and `v2t.sh`; `CommandError` in `exceptions.py`; the command line's
+  constants in `config.py` (`CLI_ENGINES`, `TRANSCRIPT_PREFIX`, `CLI_MAX_COST_USD`,
+  `CLI_LATEST_COUNT`).
+- **`checkpoints.py`**: a locked marker file per run, so "Clean temporary files" and the
+  age-based clean-ups also wait for a run in another process; `cli-*` joins the scratch
+  folders pruned after a day. The page's message now says "possibly in another tab, or
+  started from the command line".
+- **Tests: 464** (was 428): `tests/test_runs.py` (12), `tests/test_cli.py` (21, one
+  parametrised over five refusals), three in `tests/test_checkpoints.py` with a second
+  real process. Ruff clean; the suite also passes with ffmpeg off the PATH, as on CI.
+
+Two things went wrong on the way and are worth knowing: the first version passed the
+title setting in with the request, so it was read before the run — a page test of a
+failed run on an empty database caught it (now a hook, asked after the transcript is
+written); and the first test of a killed run used `Popen.kill()`, which in a Windows
+venv ends only the launcher (the test now has the process end itself with `os._exit`).
+
+Not committed — the owner says when. Left open: the Claude skill that uses the command
+(where recordings come from, the cost threshold, the description added to the end of
+both file names, next steps from the transcript), a first real OpenAI run through the
+command, and the decisions in §5 P5.
 
 ### 2026-11-04 (part 5) — The accent becomes blue
 

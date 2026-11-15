@@ -29,6 +29,14 @@ class FfmpegMissingError(AudioProcessingError):
     """
 
 
+class CommandError(AppError):
+    """Raised when the command line is asked for something it cannot do.
+
+    A missing file, a model the engine does not have, an option that does not
+    fit the recording: the message says which, and nothing has been started.
+    """
+
+
 class TranscriptionError(AppError):
     """Raised when the transcription pipeline or the OpenAI request fails."""
 

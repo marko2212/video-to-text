@@ -403,6 +403,69 @@ def test_progress_counts_finished_chunks(pipeline):
     assert reports[-1]["status"] == "complete"
 
 
+def test_the_time_left_starts_from_the_typical_speed_and_counts_unsent_audio(
+    pipeline,
+):
+    reports = []
+
+    def failing(name, ms):
+        if name == "chunk_001":
+            raise _server_error()
+        return _text(f"Said in {name}.")
+
+    with pytest.raises(IncompleteTranscriptionError):
+        pipeline.run(
+            _tone(12 * MINUTE), FakeClient(failing), progress_callback=reports.append
+        )
+
+    first = next(r for r in reports if r["status"] == "progress")
+    # Twelve minutes at 2.3 s a minute, before any part of this run is back.
+    assert first["remaining_seconds"] == pytest.approx(
+        12 * config.OPENAI_SECONDS_PER_AUDIO_MINUTE
+    )
+    assert first["message"] == "Transcribing part 1 of 3… about 0:30 left"
+
+    reports.clear()
+    pipeline.run(
+        _tone(12 * MINUTE),
+        FakeClient(lambda name, ms: _text(f"Said in {name}.")),
+        progress_callback=reports.append,
+    )
+
+    resumed = next(r for r in reports if r["status"] == "progress")
+    # The saved first part is not sent again, so only seven minutes are left.
+    assert resumed["message"] == "Transcribing part 2 of 3… about 0:15 left"
+
+
+def test_the_time_left_follows_the_parts_this_run_has_got_back():
+    # Two five-minute parts took 20 s and 40 s: a tenth of the audio's length.
+    answered = [(20.0, 300.0), (40.0, 300.0)]
+
+    assert transcribe.estimate_remaining(answered, 420.0) == pytest.approx(42.0)
+    assert transcribe.estimate_remaining([], 600.0) == pytest.approx(23.0)
+    assert transcribe.format_remaining(42.0) == "about 0:40 left"
+    assert transcribe.format_remaining(93.0) == "about 1:35 left"
+    assert transcribe.format_remaining(3725.0) == "about 1:02:05 left"
+    # Never "0:00 left" while a part is still out.
+    assert transcribe.format_remaining(0.4) == "about 0:05 left"
+
+
+def test_the_time_left_says_when_a_local_check_follows(pipeline):
+    reports = []
+
+    pipeline.run(
+        _tone(2 * MINUTE),
+        FakeClient(lambda name, ms: _text("Good morning everyone.", tokens=10)),
+        progress_callback=reports.append,
+        verify=(_whisper(), "base"),
+    )
+
+    first = next(r for r in reports if r["status"] == "progress")
+    assert first["message"] == (
+        "Transcribing part 1 of 1… about 0:05 left, then the check with local Whisper"
+    )
+
+
 def test_a_run_reports_the_tokens_and_cost_it_used(pipeline):
     pipeline.run(
         _tone(12 * MINUTE), FakeClient(lambda n, ms: _text("Said.", tokens=200))

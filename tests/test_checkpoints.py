@@ -1,6 +1,8 @@
 """Tests for the on-disk checkpoints of paid work."""
 
 import os
+import subprocess
+import sys
 import time
 
 import audio
@@ -83,6 +85,88 @@ def test_a_running_transcription_is_visible_to_every_session():
     with checkpoints.active_run():
         assert checkpoints.any_active_run()
     assert not checkpoints.any_active_run()
+
+
+# Holds a run open in a process of its own until its input is closed, or dies
+# without any clean-up when told to. The folders are set after `import config`,
+# which reads the developer's .env.
+_HOLDER = """
+import os
+import sys
+
+import config
+
+os.environ["TEMP_DIR"], os.environ["DATA_DIR"], os.environ["UPLOAD_DIR"] = sys.argv[1:4]
+config.get_settings.cache_clear()
+
+import checkpoints
+
+with checkpoints.active_run():
+    sys.stdout.write("held" + os.linesep)
+    sys.stdout.flush()
+    if sys.stdin.readline().strip() == "die":
+        os._exit(1)
+"""
+
+
+def _markers() -> list:
+    return list((config.get_settings().temp_dir / "active-runs").glob("*.run"))
+
+
+def _hold_a_run_elsewhere() -> subprocess.Popen:
+    settings = config.get_settings()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _HOLDER,
+            str(settings.temp_dir),
+            str(settings.data_dir),
+            str(settings.upload_dir),
+        ],
+        cwd=config.BASE_DIR,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def test_a_run_in_another_process_is_seen_and_released_when_it_ends():
+    # The command line beside the page: "Clean temporary files" there would
+    # delete the saved parts of the command's run, which then pays again.
+    holder = _hold_a_run_elsewhere()
+    try:
+        assert checkpoints.any_active_run()
+        assert checkpoints.prune_scratch(max_age_hours=0) == 0
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+
+    assert not checkpoints.any_active_run()
+    assert _markers() == []
+
+
+def test_a_killed_run_does_not_lock_the_clean_up_for_good():
+    holder = _hold_a_run_elsewhere()
+    assert checkpoints.any_active_run()
+
+    # Not holder.kill(): in a Windows venv that ends only the launcher, and the
+    # Python it started keeps the lock.
+    holder.stdin.write("die" + os.linesep)
+    holder.stdin.close()
+    holder.wait(timeout=30)
+
+    assert len(_markers()) == 1  # nobody was left to remove it
+    assert not checkpoints.any_active_run()
+    assert _markers() == []
+
+
+def test_a_run_leaves_no_marker_behind():
+    with checkpoints.active_run():
+        assert len(_markers()) == 1
+    assert _markers() == []
 
 
 def test_the_run_is_released_even_when_it_is_stopped():

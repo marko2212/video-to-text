@@ -23,6 +23,8 @@ User-facing changes (formats, flags, `.env` keys, commands) must also land in RE
   duplicated in `app.py` / `transcribe.py`.
 - **`app.py` is UI only** — no ffmpeg, IO, or API calls inline; that belongs in
   `audio.py` / `transcribe.py` (which must stay Streamlit-free).
+- **The order of a run lives in `runs.py`** (the page and `cli.py` share it). It sets results
+  one by one: Stop points for the page, none between the History row and the discard (§3).
 - **Never widen `.gitignore` to `*.db`** — only `data/transcriptions.db` (+ `-*`).
 - Local backend stays **`device="cpu"`** by default; CUDA is opt-in via `LOCAL_DEVICE`.
 - **The real `data/`, `uploads/` and `temp/` hold confidential client meetings.** Anything
@@ -42,7 +44,7 @@ User-facing changes (formats, flags, `.env` keys, commands) must also land in RE
 
 ## Dev commands
 
-`make run` · `make lint` / `make format` · `make test` · `make check` (CI gate) · README screenshots + demo GIF: `scripts/dev/readme-screenshots/run.ps1` (demo data, isolated copy).
+`make run` · `make lint` / `make format` · `make test` · `make check` (CI gate) · command line: `scripts/v2t.bat` (README → Command line; in real use it writes the real History) · README screenshots + demo GIF: `scripts/dev/readme-screenshots/run.ps1` (demo data, isolated copy).
 
 **Syncing:** `make sync` / `upgrade` / `reset` keep the offline backend when it is installed
 (`EXTRAS` in the Makefile); `make sync-local` adds it. **Plain `uv sync` uninstalls it**
