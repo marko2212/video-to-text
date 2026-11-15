@@ -1970,6 +1970,32 @@ Not committed — the owner says when. Left open: the Claude skill that uses the
 both file names, next steps from the transcript), a first real OpenAI run through the
 command, and the decisions in §5 P5.
 
+### 2026-11-12 — Work laptop: the repo moved into the workspace folder; OpenAI says "credit exhausted"
+
+*Work laptop.* The owner moved the repo here by hand from `C:\Work\video-to-text` to
+`C:\Work\Video-to-text-doc\video-to-text` (as on the personal laptop on 2026-10-30, part 2)
+and asked to fix the taskbar shortcut and to find "the right OpenAI key". Fixed as then:
+`uv sync --frozen --reinstall --extra local` (the `.venv\Scripts\*.exe` launchers held the
+old python path), the old path replaced in the five `activate*` scripts,
+`create-shortcut.ps1` run again, and the pinned taskbar copy pointed at the new folder and
+icon (both `.lnk` read back). The workspace's own `CLAUDE.md` (`@video-to-text/CLAUDE.md`)
+and `.claude\launch.json` (`uv --directory video-to-text run ...`) are in no repo, so they
+were written again on this machine; Claude's memory was copied to the workspace's key.
+Checked: no old path left in the venv; 428 tests from the moved `.venv`; the app on port
+8599 with scratch folders answered `/_stcore/health`.
+
+The API: `data/logs/app.log` shows that the failing run (18:19) got `429
+insufficient_quota` ("OpenAI credit exhausted"), not a 401. The key in `.env` (a
+`sk-proj-` key, file unchanged since 2026-09-25, the day of the key swap) is valid:
+`GET /v1/models` answers 200, checked by a script that prints only length, prefix and a
+hash. So the organization behind that key has no credit left. A key changed on the
+personal laptop does not travel: `.env` and `C:\Work\.secrets` are in no repo, and
+`.secrets` is empty here. Other projects' `.env` files were not searched (auto mode
+refused it as credential exploration, and those are work keys). The OpenAI dashboard was
+not checked: Chrome on this machine is not logged in to platform.openai.com.
+Open (owner): add credit to that key's organization, or bring the personal laptop's key
+into this `.env`.
+
 ### 2026-11-04 (part 5) — The accent becomes blue
 
 *Personal laptop.* The three commits from the work laptop (907a96f, 688c749, f24c1a8) were
