@@ -187,12 +187,45 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   guard is silent while the median is under 40 words/min
   (`THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE`): a recording that is mostly silence,
   music or a demo has no typical rate to compare with, and re-sending its quiet chunks
-  would only cost money. The first chunk cannot be thin (nothing to compare with). The
+  would only cost money. A chunk with nothing before it to compare with — the first — is
+  judged at the end of the run (next bullet); only a recording of one chunk is never
+  judged. The
   result panel warns with the stretches, History repeats the warning for as long as the
   row lives (the records are in `usage_json`, see below). Cost of a false alarm: one
   chunk sent again (~$0.03 for five minutes) and a marker the reader can check against
   the audio. Rejected: an absolute floor (silence is legitimate), and comparing against
   a local pass by default (minutes of CPU per run; it is the opt-in cross-check below).
+- **The first chunk is judged once the others are back, and sent again only if it holds
+  sound** *(2026-11-15)*. The guard above compares a chunk with the chunks *before* it,
+  so the first one was taken as it came — and that is where the losses were. The first
+  real meeting through the command line (a 15:26 stand-up) came back with 5 words for
+  its first 4:50 and no warning, twice. The owner's history then showed it was no
+  one-off (read-only, numbers only): of 30 OpenAI runs with two or more chunks, the
+  first chunk was under half the median of the rest in 5 — four recordings, 1–50
+  words/min against 88–141 — and in one of them the second chunk too (2 words/min: it
+  had only the thin first chunk to be compared with, whose 23 words/min is under the
+  40 the guard needs). None of those stretches was quiet: 37–67 % of their
+  quarter-second windows were within 20 dB of the loud level of the chunks that answered
+  normally, against 40–80 % in those chunks. So, after the last chunk,
+  `_judge_unjudged` takes every chunk that was answered with no floor in force, holds it
+  against the median of all the *other* chunks, and if it is under half **and holds
+  sound** (`_holds_sound`: at least `THIN_RECHECK_MIN_SOUND_SHARE`, a fifth, of its
+  windows that loud), splits it and sends the halves like any other thin chunk. It
+  writes the same split marker a thin answer leaves when caught at once, so the halves
+  are sent, saved, counted and resumed by `_transcribe_span` as before; the first answer
+  stays paid for and counted. **Why the sound check here and not in the guard above:** a
+  recording left running before the meeting starts with silence (one of the four was
+  trimmed by hand for exactly that — 14.5 minutes of digital silence), and without the
+  check every such start would be paid for twice and marked `⚠️`. **A half that fails**
+  (no connection, no credit) does not fail the run — every other chunk is already paid
+  for: the first answer is kept, marked `⚠️`, and what was paid is counted. Not covered:
+  a recording of one chunk (nothing to compare with; `--verify` is the check there), and
+  the transcripts already in History that lost their start — they stay as they are until
+  the recording is run again. *Checked on the stand-up's first ten minutes (scratch
+  folders, $0.034): chunk 000 answered with 6 words, was found thin against 101
+  words/min, and its halves came back with 238 and 215 words — the local `medium` pass
+  had heard 460 there — with no `⚠️`. So the same audio the model gave up on as one
+  4:50 chunk it transcribed in full as two.*
 - **Every answered chunk leaves a trace: a log file, a record in the row, and its raw
   answer kept beside the history** *(2026-11-03)*. The app's own traces could not find
   the loss above: logging was console-only, the chunk checkpoints were discarded as soon
@@ -782,7 +815,20 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   3… about 0:05 left" for each part, and the result with its cost; a Local `medium` run
   stopped with the toolbar's Stop came back as "The last run was stopped before it
   finished. Press Start to run it again." with Start enabled. The page's own Stop button
-  was not pressed (the click landed on the toolbar's, the same mechanism).
+  was not pressed then (the click landed on the toolbar's, the same mechanism); it was
+  in the countdown check the same day (UI / flow, second bullet).
+- **Claude drives the command through a skill kept outside this repo; nothing runs on
+  its own** *(2026-11-15, the owner)*. The skill is
+  `C:\Work\claude\skills\video-to-text\` (repo `work-workspace`, linked into
+  `~/.claude/skills`): it knows what the app cannot — where recordings appear (OBS in
+  `Videos`, Viber voice messages in `Documents\ViberDownloads\PTT`), which project's
+  `Meeting` folder each belongs in, and that the pair is moved and renamed only after
+  the owner's yes, the description going at the end of both names. It keeps its own
+  tables of folders and adds to them as the owner says more. **No nightly or scheduled
+  run over `pending`** — "noćni prolaz nećemo da radimo to zaboravi": a transcription
+  starts when the owner asks for one. (`Videos` held 46 recordings without a transcript
+  that day, many of them marked unimportant; a scheduled run would have transcribed
+  them all.)
 
 ### UI / flow
 - **An OpenAI run says about how much time is left, worked out from its own parts**
@@ -1336,6 +1382,12 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   `transcript_<recording name>.txt` beside the recording; `estimate`, `latest` and `pending`
   answer without starting anything. One JSON object per command, for scripts and AI
   agents; a paid run above $1 needs `--yes`
+- **A thin first part is caught too** *(2026-11-15)*: the part that had nothing before it
+  to be compared with is judged once the others are back and, if it holds sound, sent
+  again in two halves; a silent start is left alone
+- **A Claude skill drives the command** *(2026-11-15, outside this repo)*: finds the
+  recording (OBS, Viber voice messages, phone calls), transcribes it, says the next
+  steps and moves the pair to its project's `Meeting` folder after the owner's yes
 - **Faster local Whisper (batched)** *(2026-11-04)*: an opt-in box wherever a local
   pass runs (the Local engine, or the cross-check) — pieces cut at pauses, 8 written
   at once, split back into sentences by their word times; 1.7× on a 14-minute clip with
@@ -1395,7 +1447,7 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/align/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 428 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 479 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1504,8 +1556,10 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       **Verify with local Whisper** (`base`, then `small`) ticked should re-time the
       paragraphs and add the 2:16 of chunk 09 as `🧩` paragraphs — compare with the
       hand-merged transcript from the hackathon folder; and watch whether the thin guard
-      fires on a real thin chunk (it never did in the app yet, only in tests) or gives a
-      false alarm on a quiet stretch (the median floor of 40 words/min is a guess).
+      gives a false alarm on a quiet stretch (the median floor of 40 words/min is a
+      guess). It has fired on a real thin chunk since: 2026-11-15, the first chunk of a
+      stand-up, both halves came back in full (§3, "The first chunk is judged once the
+      others are back").
       Checked here only with fakes, and the cross-check with the real `base` model on
       synthetic English speech.
 - [ ] **The trim slider on a real recording** (2026-10-20, §3 UI): a Teams recording
@@ -1594,6 +1648,20 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       synthetic M4A (extraction, player, a Local run, clean-up leaving the originals).
 
 ### P1 — transcript correctness
+- [x] **The first part of a run had no thin-chunk guard, and a real meeting lost its
+      first 4:50 that way** — fixed 2026-11-15 (§3 Transcription, "The first chunk is
+      judged once the others are back"). Found on the first real recording through the
+      command line, a 15:26 stand-up: part 000 (0:00–4:50) came back with 5 words in
+      4.3 s, twice, while a local pass heard about 460–590 words there, and the run
+      ended `done` with no notice. Left open on purpose: a recording of one chunk, and
+      the next item.
+- [ ] **Transcripts already in History that lost their start** (found 2026-11-15, the
+      owner's call). Three earlier runs have a first chunk far under the rest with sound
+      in it: History rows 200 (13 words/min against 141; the run started at 14:34 of the
+      recording), 207 (50 against 122) and 210 (23, then 2, against 88 — ten minutes).
+      Their recordings are still in the project's `Meeting` folder. Running them again
+      now recovers the start (about $0.13 and $0.10 for the two shorter ones, $0.26 for
+      the long one); row 222 is the stand-up's first, incomplete run and 223 its verified one.
 - [ ] **A short last part can lose its closing sentence, and no guard sees it** (found
       2026-11-15, one observation, synthetic English speech). A 2:09 recording cut into
       one-minute parts ended with a 13 s part (1:55–2:08). `gpt-4o-transcribe` answered
@@ -1726,22 +1794,14 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       update (2026-09-29 review).
 
 ### P5 — features and later
-- [ ] **A Claude skill on top of the command line** (S; outside this repo). What `cli.py` cannot
-      know: where recordings come from (the OBS folder, phone calls, Viber voice messages),
-      which `Meeting` folder a recording belongs in, when to ask before a paid run, and what
-      to do with the transcript — read it (in every folder, the owner's call of 2026-11-15),
-      propose a description that is added to the *end* of both file names and rename the
-      pair after the owner's yes, then say the next steps.
+- [x] **A Claude skill on top of the command line** — written 2026-11-15, outside this repo
+      (`C:\Work\claude\skills\video-to-text\`; §3 Command line, last bullet). Its listing
+      and estimate steps were run on the real folders, its pair-moving helper on a made-up
+      pair. Still to come: a real meeting through the whole flow, on the owner's word.
 - [x] **A first real OpenAI run through the command line** — done 2026-11-15 on synthetic
       recordings, `--screens`, `--verify`, `--srt`, the title and a killed-and-resumed run
       included (§3 Command line, "Checked live against the real OpenAI API"). Still to
       come: a real meeting through it.
-- [ ] **Nightly local run over `pending`** (optional, last). A scheduled task that transcribes
-      whatever has no transcript with the local engine. Not about money (an hour of
-      meeting is about $0.36 on the API): nothing stays untranscribed, the audio stays on
-      the computer, and the local engine has exact times. The laptop must be on and awake;
-      `large-v3-turbo` is estimated at 20–35 min per 52 min of recording here (journal
-      2026-11-03 part 3).
 - [ ] **An MCP or HTTP wrapper over `runs.run`** — only when a caller cannot run a command on
       this computer (§3 Command line).
 - [ ] **Show the OpenAI credit left** (asked 2026-11-03). The owner chose a read-only
@@ -1781,6 +1841,43 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-15 (part 6) — The first chunk is judged too
+
+*Personal laptop.* On "Da, popravi", after the stand-up of part 5 lost its first 4:50.
+Asked first what the owner's history says (read-only, numbers only): the first chunk
+was far under the rest in 5 of 30 multi-chunk runs, never in a quiet stretch — so the
+gap was costing real transcripts their opening minutes, not once. The fix
+(`_judge_unjudged`, `_send_again_in_halves`, `_holds_sound` in `transcribe.py`, two
+constants in `config.py`; §3 Transcription) judges such chunks at the end of the run and
+re-sends the ones that hold sound. Written and tested in a copy, copied over when
+green. **Tests: 479** (eight new in `tests/test_pipeline.py`: the first chunk, a
+two-chunk recording, a slow start of several chunks, halves that stay thin, a silent
+start left alone, a half that fails, a resumed re-send, the sound measure), ruff clean,
+also without ffmpeg. Live on the stand-up's first ten minutes: both halves came back in
+full. The owner asked why OpenAI had not returned that stretch: no error and no cap —
+the model ended its answer after the first sentence of the 4:50 chunk, and transcribed
+the same audio in full when it came as two halves. Open: the earlier transcripts that
+lost their start (§5 P1). Not committed.
+
+### 2026-11-15 (part 5) — The Claude skill; no nightly run
+
+*Personal laptop.* The owner named the sources (Viber voice messages in
+`Documents\ViberDownloads\PTT`, OBS recordings in `Videos`) and where recordings go (the
+`Meeting` folder of the project they belong to), told Claude to add to the skill as it
+learns more, and dropped the nightly run. The skill was written outside this repo
+(`C:\Work\claude\skills\video-to-text\`: `SKILL.md` and `par.py`, which moves a recording
+and its transcript together and refuses to overwrite). Here only the docs changed: §3
+Command line (last bullet), §5 P5 (the skill ticked, the nightly item removed). Tried:
+`latest`, `pending` and `estimate` on the real folders (read-only), `par.py` on a made-up
+pair. Then, on the owner's word, two real recordings through the whole flow: a 7 s Viber
+voice message (copied, transcribed, left in the working folder as nobody knows whose it
+is) and a 15:26 stand-up, moved with its transcript to its project's `Meeting` folder.
+**The stand-up exposed a real loss** (§5 P1, first item): its first part came back
+with 5 words and no notice, because the first part has no thin-chunk guard; a second
+run with `--verify medium` filled the 460 missing words. Three rows in the real History
+(221–223; 222 is the incomplete first run of the stand-up). The owner also asked for
+the best model always — the default already is. Not committed.
 
 ### 2026-11-15 (part 4) — The time left counts down on the page
 

@@ -45,6 +45,8 @@ from config import (
     TARGET_SAMPLE_RATE,
     THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE,
     THIN_CHUNK_SHARE,
+    THIN_RECHECK_LOUD_DB,
+    THIN_RECHECK_MIN_SOUND_SHARE,
     TIMESTAMP_MODELS,
     get_settings,
 )
@@ -1372,7 +1374,9 @@ def _transcribe_all(
         fail the same way.
     """
     checkpoint = work[1]
-    pieces: list[dict[str, Any]] = []
+    # The pieces of each chunk, in order: a chunk answered before the run had a
+    # typical rate is judged again at the end, and its pieces replaced.
+    groups: list[list[dict[str, Any]]] = []
     total = len(bounds)
     # The audio of each chunk that still needs a request, and how long the
     # chunks sent so far took: what the time left is worked out from.
@@ -1387,7 +1391,7 @@ def _transcribe_all(
         saved = checkpoints.load(checkpoint, name)
         if saved and saved.get("bounds") == [start_ms, end_ms]:
             logger.info("Part %03d reused from the saved parts of this run", index)
-            pieces += saved["pieces"]
+            groups.append(saved["pieces"])
             continue
         lent = (borrowed or {}).get((start_ms, end_ms))
         if lent is not None:
@@ -1396,7 +1400,7 @@ def _transcribe_all(
             checkpoints.save(
                 checkpoint, name, {"bounds": [start_ms, end_ms], "pieces": lent}
             )
-            pieces += lent
+            groups.append(lent)
             continue
         left = estimate_remaining(
             answered,
@@ -1422,22 +1426,263 @@ def _transcribe_all(
                 want_segments,
                 work,
                 f"{index:03d}",
-                thin_floor=_thin_floor(pieces),
+                thin_floor=_thin_floor(_flat(groups)),
             )
         except AppError as exc:
-            return pieces, (index, exc)
+            return _flat(groups), (index, exc)
         except Exception as exc:
             # Anything else (a failed MP3 export, say) must still leave the
             # partial transcript and the saved chunks behind.
             logger.exception("Chunk %d failed", index + 1)
-            return pieces, (index, TranscriptionError(f"Chunk {index + 1}: {exc}"))
+            failure = TranscriptionError(f"Chunk {index + 1}: {exc}")
+            return _flat(groups), (index, failure)
         # One file per finished chunk, so counting them tells how far a run got.
         checkpoints.save(
             checkpoint, name, {"bounds": [start_ms, end_ms], "pieces": new}
         )
-        pieces += new
+        groups.append(new)
         answered.append((time.monotonic() - began, (end_ms - start_ms) / 1000))
-    return pieces, None
+    _judge_unjudged(
+        audio, bounds, groups, client, model, want_segments, work, progress_callback
+    )
+    return _flat(groups), None
+
+
+def _flat(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Return the pieces of every chunk as one list, in order.
+
+    Args:
+        groups: The pieces of each chunk.
+
+    Returns:
+        All pieces.
+    """
+    return [piece for group in groups for piece in group]
+
+
+def _window_levels(audio: AudioSegment, span: tuple[int, int]) -> list[int]:
+    """Return the loudness of each quarter-second window of a stretch.
+
+    Args:
+        audio: The whole recording.
+        span: ``(start_ms, end_ms)`` of the stretch.
+
+    Returns:
+        The RMS of each window, in order.
+    """
+    start_ms, end_ms = span
+    return [
+        audio[at : at + _CUT_WINDOW_MS].rms
+        for at in range(start_ms, end_ms - _CUT_WINDOW_MS + 1, _CUT_WINDOW_MS)
+    ]
+
+
+def _holds_sound(
+    audio: AudioSegment, span: tuple[int, int], normal: list[tuple[int, int]]
+) -> bool:
+    """Return True when a stretch has sound the way normally answered ones have.
+
+    Tells an answer that lost speech from a stretch with nothing to say: a
+    recording left running before the meeting is silent there, and sending it
+    again would only cost money.
+
+    Args:
+        audio: The whole recording.
+        span: ``(start_ms, end_ms)`` of the stretch in question.
+        normal: Stretches whose answers had a normal number of words.
+
+    Returns:
+        Whether at least ``THIN_RECHECK_MIN_SOUND_SHARE`` of the stretch's
+        windows are within ``THIN_RECHECK_LOUD_DB`` of the loud level (the 90th
+        percentile) of the normal stretches.
+    """
+    reference = sorted(
+        level for bound in normal for level in _window_levels(audio, bound)
+    )
+    levels = _window_levels(audio, span)
+    if not reference or not levels:
+        return False
+    loud = reference[int(len(reference) * 0.9)]
+    threshold = loud / 10 ** (THIN_RECHECK_LOUD_DB / 20)
+    active = sum(level > threshold for level in levels)
+    return active >= THIN_RECHECK_MIN_SOUND_SHARE * len(levels)
+
+
+def _judge_unjudged(
+    audio: AudioSegment,
+    bounds: list[tuple[int, int]],
+    groups: list[list[dict[str, Any]]],
+    client: OpenAI,
+    model: str,
+    want_segments: bool,
+    work: tuple[Path, Path],
+    progress_callback: ProgressCallback | None,
+) -> None:
+    """Judge the chunks that were answered before the run had a typical rate.
+
+    A chunk is compared with the chunks before it, so the first one — and the
+    first few of a recording that starts slowly — was taken as it came. Now
+    that every chunk is back, each of those is held against the others; one
+    with far fewer words that still holds sound is split and sent again like
+    any other thin chunk, and its pieces in ``groups`` are replaced.
+
+    Args:
+        audio: The whole recording.
+        bounds: ``(start_ms, end_ms)`` of each chunk.
+        groups: The pieces of each chunk; changed in place.
+        client: Configured OpenAI client.
+        model: Transcription model name.
+        want_segments: Whether the model returns per-segment timestamps.
+        work: Scratch directory for chunk MP3s, and the checkpoint directory.
+        progress_callback: Optional progress callback.
+    """
+    total = len(bounds)
+    for index, group in enumerate(groups):
+        if len(group) != 1:
+            continue
+        piece = group[0]
+        record = piece.get("record")
+        judged = record is None or "typical_words_per_min" in record
+        if judged or piece.get("thin") or piece.get("capped"):
+            continue
+        others = [
+            (at, other) for at, other in enumerate(groups) if at != index and other
+        ]
+        floor = _thin_floor([p for _, other in others for p in other])
+        rate = words_per_minute(str(piece["text"]), piece["duration"])
+        if floor is None or rate >= floor:
+            continue
+        # The nearest chunks that answered normally say how loud speech is here.
+        normal = sorted(
+            (
+                at
+                for at, other in others
+                if words_per_minute(
+                    " ".join(str(p["text"]) for p in other),
+                    sum(p["duration"] for p in other),
+                )
+                >= floor
+            ),
+            key=lambda at: abs(at - index),
+        )[:2]
+        if not _holds_sound(audio, bounds[index], [bounds[at] for at in normal]):
+            logger.info(
+                "Part %03d has few words (%.0f words/min, floor %.0f) and little "
+                "sound; taken as it is",
+                index,
+                rate,
+                floor,
+            )
+            continue
+        logger.warning(
+            "Part %03d is thin (%.0f words/min, floor %.0f), seen once the other "
+            "parts were back; splitting it",
+            index,
+            rate,
+            floor,
+        )
+        _report(
+            progress_callback,
+            status="progress",
+            message=(
+                f"Part {index + 1} of {total} came back with far fewer words than "
+                "the rest — sending it again in two halves…"
+            ),
+            progress=(total - 1) / total,
+        )
+        groups[index] = _send_again_in_halves(
+            audio,
+            bounds[index],
+            piece,
+            floor,
+            client,
+            model,
+            want_segments,
+            work,
+            index,
+        )
+        start_ms, end_ms = bounds[index]
+        checkpoints.save(
+            work[1],
+            f"chunk_{index:03d}",
+            {"bounds": [start_ms, end_ms], "pieces": groups[index]},
+        )
+
+
+def _send_again_in_halves(
+    audio: AudioSegment,
+    span: tuple[int, int],
+    piece: dict[str, Any],
+    floor: float,
+    client: OpenAI,
+    model: str,
+    want_segments: bool,
+    work: tuple[Path, Path],
+    index: int,
+) -> list[dict[str, Any]]:
+    """Split a chunk found thin after the fact and transcribe its halves.
+
+    The chunk's saved answer is replaced by the same split marker a thin
+    answer leaves when it is caught at once, so the halves are sent, saved,
+    counted and resumed by :func:`_transcribe_span` as any other split.
+
+    Args:
+        audio: The whole recording.
+        span: ``(start_ms, end_ms)`` of the chunk.
+        piece: The chunk's one piece, as first answered.
+        floor: The words-per-minute floor it fell under.
+        client: Configured OpenAI client.
+        model: Transcription model name.
+        want_segments: Whether the model returns per-segment timestamps.
+        work: Scratch directory for chunk MP3s, and the checkpoint directory.
+        index: The chunk's number in the plan.
+
+    Returns:
+        The pieces of the halves. If the chunk is too short to split, or a half
+        fails, the first answer is kept and marked thin — every other chunk is
+        already paid for, and a failure here must not cost the run.
+    """
+    start_ms, end_ms = span
+    span_ms = end_ms - start_ms
+    checkpoint = work[1]
+    name = f"{index:03d}"
+    record = {
+        **piece["record"],
+        "thin": True,
+        "typical_words_per_min": round(floor / THIN_CHUNK_SHARE),
+    }
+    marked = {**piece, "thin": True, "record": record}
+    if span_ms < 2 * MIN_SPLIT_SECONDS * 1000:
+        return [marked]
+    saved = checkpoints.load(checkpoint, f"part_{name}") or {}
+    if "split" not in saved:
+        middle = _quietest_cut(
+            audio,
+            (start_ms + end_ms) // 2,
+            min(span_ms // 4, int(CUT_SEARCH_SECONDS * 1000)),
+        )
+        checkpoints.save(
+            checkpoint,
+            f"part_{name}",
+            {
+                "bounds": [start_ms, end_ms],
+                "split": middle,
+                "usage": _usage_records([piece], model),
+                "reason": "thin",
+                "record": record,
+            },
+        )
+    try:
+        return _transcribe_span(
+            audio, span, client, model, want_segments, work, name, thin_floor=floor
+        )
+    except Exception:
+        logger.exception(
+            "Part %s could not be sent again; its first answer is kept and marked",
+            name,
+        )
+        # The first answer and any half that did come back were paid for.
+        return [{**marked, "usage": _unfinished_chunk_usage(checkpoint, index, model)}]
 
 
 def _usage_records(pieces: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:

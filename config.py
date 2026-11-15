@@ -120,6 +120,17 @@ THIN_CHUNK_SHARE: float = 0.5
 # that is mostly silence, music or a demo has no typical rate to compare with,
 # and re-sending its quiet chunks would only cost money.
 THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE: float = 40.0
+# A part answered before the run had a typical rate — the first one, or the
+# first few of a recording that starts slowly — is judged once the other parts
+# are back, and sent again in halves only if it also holds sound: at least this
+# share of its quarter-second windows within THIN_RECHECK_LOUD_DB of the loud
+# level of the parts that answered normally. A silent start (a recording left
+# running before the meeting) has none, and re-sending it would only cost
+# money. Measured 2026-11-15 on the four real recordings whose first part came
+# back nearly empty (1–50 words/min against 88–141): 37–67 % of their windows
+# were that loud, against 40–80 % in the parts that answered normally.
+THIN_RECHECK_MIN_SOUND_SHARE: float = 0.2
+THIN_RECHECK_LOUD_DB: float = 20.0
 # Chunks are never split below this length, so a runaway split cannot loop.
 MIN_SPLIT_SECONDS: float = 30.0
 # Chunk boundaries move to the quietest moment within this distance of the

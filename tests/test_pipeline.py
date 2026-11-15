@@ -881,8 +881,8 @@ def test_a_half_that_is_still_thin_is_kept_and_marked(pipeline):
     assert warning.endswith("The transcript marks them ⚠️.")
 
 
-def test_the_first_chunk_cannot_be_thin_and_a_quiet_recording_never_is(pipeline):
-    # No earlier chunk to compare with: the first answer is taken as it is.
+def test_an_only_chunk_cannot_be_thin_and_a_quiet_recording_never_is(pipeline):
+    # No other chunk to compare with: the answer is taken as it is.
     first = FakeClient(lambda n, ms: _text("short.", tokens=5))
     pipeline.run(_tone(5 * MINUTE), first)
     assert [name for name, _ in first.calls] == ["chunk_000"]
@@ -914,6 +914,163 @@ def test_a_thin_split_is_resumed_without_paying_for_the_thin_answer_again(pipeli
     assert [name for name, _ in second.calls] == ["chunk_002b"]
     # Two full chunks, the thin answer, and its two halves.
     assert pipeline.spent[-1]["requests"] == 5
+
+
+# --- the first part: nothing before it to compare with ---------------------------
+#
+# A real 15-minute stand-up (2026-11-15) came back with 5 words for its first
+# 4:50 and no warning: a part is compared with the parts before it, and the
+# first one has none. It is judged once the others are back.
+
+
+def _thin_start(thin: set[str]):
+    """Answer the named chunks almost empty, their halves and the rest in full."""
+
+    def answer(name, ms):
+        if name in thin:
+            return _text("can you hear me now?", tokens=5)
+        return _text(_speech(ms // 500), tokens=ms // 400)
+
+    return answer
+
+
+def test_a_thin_first_part_is_sent_again_once_the_others_are_back(pipeline):
+    reports = []
+    client = FakeClient(_thin_start({"chunk_000"}))
+    text = pipeline.run(_tone(15 * MINUTE), client, progress_callback=reports.append)
+
+    assert [name for name, _ in client.calls] == [
+        "chunk_000",
+        "chunk_001",
+        "chunk_002",
+        "chunk_000a",
+        "chunk_000b",
+    ]
+    assert "can you hear me now?" not in text
+    assert "⚠️" not in text
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["part"] for r in records] == ["000a", "000b", "001", "002"]
+    assert [r["index"] for r in records] == [0, 0, 1, 2]
+    assert not any(r["thin"] for r in records)
+    # The first answer was paid for too.
+    assert pipeline.spent[-1]["requests"] == 5
+    again = [
+        r["message"] for r in reports if "sending it again" in r.get("message", "")
+    ]
+    assert again == [
+        "Part 1 of 3 came back with far fewer words than the rest — sending it "
+        "again in two halves…"
+    ]
+
+
+def test_a_recording_of_two_parts_has_its_first_part_judged_by_the_second(pipeline):
+    client = FakeClient(_thin_start({"chunk_000"}))
+    pipeline.run(_tone(8 * MINUTE), client)
+
+    assert [name for name, _ in client.calls] == [
+        "chunk_000",
+        "chunk_001",
+        "chunk_000a",
+        "chunk_000b",
+    ]
+
+
+def test_a_slow_start_of_several_parts_is_judged_too(pipeline):
+    # Two nearly empty parts first (23 and 2 words/min in a real run): the
+    # second had only the first to be compared with, and passed as well.
+    client = FakeClient(_thin_start({"chunk_000", "chunk_001"}))
+    text = pipeline.run(_tone(25 * MINUTE), client)
+
+    assert [name for name, _ in client.calls][5:] == [
+        "chunk_000a",
+        "chunk_000b",
+        "chunk_001a",
+        "chunk_001b",
+    ]
+    assert "can you hear me now?" not in text
+
+
+def test_a_first_part_that_stays_thin_is_kept_and_marked(pipeline):
+    client = FakeClient(_thin_start({"chunk_000", "chunk_000a", "chunk_000b"}))
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert text.count("can you hear me now?") == 2
+    assert text.count("came back with far fewer words than expected") == 2
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["thin"] for r in records] == [True, True, False, False]
+    warning = transcribe.describe_flagged(records)
+    assert warning.startswith("Speech may be missing in 2 part(s) — 0:00–")
+
+
+def test_a_silent_start_is_not_sent_again(pipeline, caplog):
+    # A recording left running before the meeting: no words there, and no
+    # sound either, so there is nothing to ask for twice.
+    audio = AudioSegment.silent(duration=5 * MINUTE, frame_rate=16000) + _tone(
+        10 * MINUTE
+    )
+    client = FakeClient(
+        lambda name, ms: (
+            _text("", tokens=1)
+            if name == "chunk_000"
+            else _text(_speech(600), tokens=800)
+        )
+    )
+    with caplog.at_level("INFO", logger="transcribe"):
+        text = pipeline.run(audio, client)
+
+    assert [name for name, _ in client.calls] == ["chunk_000", "chunk_001", "chunk_002"]
+    assert "⚠️" not in text
+    assert "little sound; taken as it is" in caplog.text
+
+
+def test_a_half_that_fails_keeps_the_first_answer_marked_and_the_run(pipeline):
+    def answer(name, ms):
+        if name == "chunk_000b":
+            raise _server_error()
+        return _thin_start({"chunk_000"})(name, ms)
+
+    client = FakeClient(answer)
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    # Every other part was already paid for: the run is not thrown away.
+    assert text.count("can you hear me now?") == 1
+    assert text.count("came back with far fewer words than expected") == 1
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["thin"] for r in records] == [True, False, False]
+    assert records[0]["typical_words_per_min"] == 120
+    # The first answer, the half that came back, and the two full parts.
+    assert pipeline.spent[-1]["requests"] == 4
+
+
+def test_a_first_part_being_sent_again_is_resumed_from_its_saved_half(pipeline):
+    audio = _tone(15 * MINUTE)
+
+    def stopped(name, ms):
+        if name == "chunk_000b":
+            # Not an error the run survives: the owner pressed Stop.
+            raise KeyboardInterrupt
+        return _thin_start({"chunk_000"})(name, ms)
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.run(audio, FakeClient(stopped))
+
+    second = FakeClient(_thin_start({"chunk_000"}))
+    text = pipeline.run(audio, second)
+
+    assert [name for name, _ in second.calls] == ["chunk_000b"]
+    assert "can you hear me now?" not in text
+    assert pipeline.spent[-1]["requests"] == 5
+
+
+def test_sound_is_told_from_silence_by_the_parts_that_answered_normally():
+    audio = AudioSegment.silent(duration=MINUTE, frame_rate=16000) + _tone(2 * MINUTE)
+    spoken = [(MINUTE, 2 * MINUTE)]
+
+    assert not transcribe._holds_sound(audio, (0, MINUTE), spoken)
+    assert transcribe._holds_sound(audio, (2 * MINUTE, 3 * MINUTE), spoken)
+    # A fifth of the windows is the line: 20 s of sound in 90 s is over it.
+    assert transcribe._holds_sound(audio, (40_000, 130_000), spoken)
+    assert not transcribe._holds_sound(audio, (0, 70_000), spoken)
 
 
 def test_every_answered_part_leaves_one_log_line_and_the_plan_is_logged_once(
