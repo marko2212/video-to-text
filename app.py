@@ -68,6 +68,8 @@ from config import (
     PROVIDER_OPENAI,
     PROVIDERS,
     RECORDING_PROBE_LIMIT,
+    REMAINING_PATTERN,
+    REMAINING_ROUND_SECONDS,
     SCRATCH_MAX_AGE_HOURS,
     SOURCE_FOLDER,
     SOURCE_UPLOAD,
@@ -1638,6 +1640,94 @@ def _tinted_buttons_css() -> None:
     st.markdown(f"<style>{' '.join(rules)}</style>", unsafe_allow_html=True)
 
 
+# Counts the time left in a progress message down, once a second, in the
+# browser: the server only speaks when a part comes back, which can be a minute
+# apart. It reads the figure from the message itself, so a new estimate (up or
+# down) is simply a new start, and a browser without the script still shows
+# the estimate as written. Below ``__FLOOR__`` seconds it waits: the part is
+# still out, and "0:00" would claim otherwise.
+#
+# The text Streamlit drew is never changed. Its markdown splits the message
+# into several text nodes ("…about 0", ":25", " left"), and React leaves a node
+# alone when its own copy says nothing changed, so a figure written into one
+# would survive into the next message. The counted text is shown over the
+# message instead (an attribute and ``::after``), and the message stays what
+# the script reads.
+_COUNTDOWN_SCRIPT = """
+<style>
+[data-time-left] { font-size: 0 !important; }
+[data-time-left]::after {
+  content: attr(data-time-left);
+  font-size: var(--time-left-size);
+}
+</style>
+<script>
+(() => {
+  if (window.v2tCountdown) return;
+  window.v2tCountdown = true;
+  const pattern = /__PATTERN__/;
+  const floor = __FLOOR__;
+  let shown = null, message = "", start = 0, began = 0;
+
+  // The innermost element of an alert whose text holds the figure.
+  const find = () => {
+    for (const alert of document.querySelectorAll('[data-testid="stAlert"]')) {
+      if (!pattern.test(alert.textContent)) continue;
+      let inner = alert;
+      for (;;) {
+        const child = [...inner.children].find((c) => pattern.test(c.textContent));
+        if (!child) return inner;
+        inner = child;
+      }
+    }
+    return null;
+  };
+
+  const tick = () => {
+    const found = find();
+    for (const old of document.querySelectorAll("[data-time-left]")) {
+      if (old !== found) old.removeAttribute("data-time-left");
+    }
+    if (!found) { shown = null; return; }
+    if (found !== shown || found.textContent !== message) {
+      shown = found;
+      message = found.textContent;
+      start = pattern.exec(message)[1].split(":").reduce((sum, n) => sum * 60 + +n, 0);
+      began = performance.now();
+    }
+    if (!found.hasAttribute("data-time-left")) {
+      found.style.setProperty("--time-left-size", getComputedStyle(found).fontSize);
+    }
+    const passed = Math.floor((performance.now() - began) / 1000);
+    const left = Math.max(Math.min(start, floor), start - passed);
+    const two = (n) => String(n).padStart(2, "0");
+    const hours = Math.floor(left / 3600);
+    const minutes = Math.floor(left / 60) % 60;
+    const clock = (hours ? hours + ":" + two(minutes) : minutes) + ":" + two(left % 60);
+    const text = message.replace(pattern, (whole, was) => whole.replace(was, clock));
+    if (found.getAttribute("data-time-left") !== text) {
+      found.setAttribute("data-time-left", text);
+    }
+  };
+
+  setInterval(tick, 250);
+})();
+</script>
+"""
+
+
+def _countdown_script() -> str:
+    """Return the script that counts the time left down between two estimates.
+
+    Returns:
+        The HTML for ``st.html``, with the pattern and the floor from
+        :mod:`config` filled in.
+    """
+    return _COUNTDOWN_SCRIPT.replace("__PATTERN__", REMAINING_PATTERN).replace(
+        "__FLOOR__", str(REMAINING_ROUND_SECONDS)
+    )
+
+
 def _uploader_label_css() -> None:
     """Replace the uploader's long auto-generated format list with a short label."""
     st.markdown(
@@ -2728,6 +2818,7 @@ def main() -> None:
     _claim_job()
     running = st.session_state.job is not None
     _tinted_buttons_css()
+    st.html(_countdown_script(), unsafe_allow_javascript=True)
     render_sidebar(disabled=running)
 
     st.title("Video & Audio Transcription")

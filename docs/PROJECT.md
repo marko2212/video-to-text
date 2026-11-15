@@ -805,6 +805,29 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   a wait of about 11 s. And **Stop stays neutral, not red** (asked the same day): red
   here means "deletes for good" (Delete, Clean temporary files), and Stop loses
   nothing — the part in progress is finished and kept.
+- **On the page the time left counts down in the browser, and the text Streamlit drew
+  is never touched** *(2026-11-15, the owner: "da uživo odbrojava… i da se spusti ili
+  podigne nakon nove procene")*. The server speaks only when a part comes back, so a
+  small script (`_COUNTDOWN_SCRIPT` in `app.py`, put on the page once with
+  `st.html(..., unsafe_allow_javascript=True)`; it runs in the page's own window) looks
+  four times a second for a progress message that matches `REMAINING_PATTERN`, counts
+  the figure down by the clock and starts again from whatever a new message says — up or
+  down. It stops at `REMAINING_ROUND_SECONDS` (0:05) while the part is still out, the
+  same floor the estimate has. The pattern and the floor come from `config.py`, and a
+  test holds the pattern against `format_remaining`, so a reworded message cannot
+  quietly stop the count. **Why an overlay and not a changed text:** Streamlit's
+  markdown splits the message into three text nodes ("…about 0", ":25", " left"), and
+  React rewrites a node only when its own copy of the text changed. A figure written
+  into the middle node would stay there when the next estimate happens to have the same
+  seconds, and the script could not tell the old figure from a new one. So the counted
+  text goes into an attribute (`data-time-left`) shown through `::after`, with the
+  original set to `font-size: 0`; the message stays exactly what the server sent, and
+  that is what the script reads. Without the script the estimate is shown as written.
+  The command line prints one line per part and has nothing to count. *Checked in the
+  browser (isolated copy, a stand-in API on localhost that answers after 20 s —
+  `scripts/dev/fake_openai.py`, no credit spent): 0:05 → 0:25 when the first part's
+  speed is known, then one step a second down to 0:05, the same in the light theme;
+  nothing left over after the run ends or after the page's own Stop.*
 - **Auto-prepare + ONE click:** a video's audio is extracted automatically on upload (the
   old "Extract Audio" button is gone), but transcription stays an **explicit click**.
   *Reason: that is where the model and timestamp options are chosen, and it prevents every
@@ -1307,7 +1330,8 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   the page lists them with where each stands, a failure stops the queue at that file
   and Start goes on from it
 - **About how much time is left** *(2026-11-15)*: each "part N of M" of an OpenAI run adds
-  "about M:SS left", estimated from the parts the run has got back
+  "about M:SS left", estimated from the parts the run has got back; on the page the
+  figure counts down every second until the next estimate replaces it
 - **From the command line** *(2026-11-15)*: `cli.py transcribe` does what Start does and puts
   `transcript_<recording name>.txt` beside the recording; `estimate`, `latest` and `pending`
   answer without starting anything. One JSON object per command, for scripts and AI
@@ -1758,6 +1782,21 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ## 6. Journal
 
+### 2026-11-15 (part 4) — The time left counts down on the page
+
+*Personal laptop.* The owner: "dodaj odbrojavanje uživo na stranici… komituj ovo do
+sada". Parts 1–3 went in as one commit first (`68ee95d`). Then the
+countdown (§3 UI / flow, second bullet): a script on the page, the pattern in
+`config.py`. The first version wrote the counted figure into the message and did
+nothing — Streamlit's markdown had split "about 0:25 left" into three text nodes; the
+second shows the counted text over the message and leaves Streamlit's text alone.
+Written and tested in a copy, as the owner's app was running from this checkout, then
+copied over. Seen in a browser against a stand-in API on localhost
+(`scripts/dev/fake_openai.py`, new: any OpenAI run on the page without the real key or
+credit, with a chosen answer time), dark and light, with the page's own Stop pressed
+mid-count — the button the part 3 check had missed. **Tests: 471** (four new), ruff
+clean, also without ffmpeg. Committed and pushed on "komituj i odbrojavanje pa push".
+
 ### 2026-11-15 (part 3) — The command line and the page checked live, with real requests
 
 *Personal laptop.* The owner: "proveri sve ovo slobodno uživo… nema veze što troši".
@@ -1775,7 +1814,7 @@ came back without its final sentence, and neither the thin-chunk guard nor the
 cross-check's 25-word minimum would report a loss that small. One observation; to be
 measured on real recordings before anything is changed.
 
-Asked meanwhile, not built: a time left that counts down on the page between parts.
+Asked meanwhile: a time left that counts down on the page between parts (built in part 4).
 Nothing changed in the code in this part; nothing committed.
 
 ### 2026-11-15 (part 2) — About how much time is left

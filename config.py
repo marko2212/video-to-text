@@ -146,6 +146,10 @@ OPENAI_CONNECT_TIMEOUT_SECONDS: float = 10.0
 OPENAI_SECONDS_PER_AUDIO_MINUTE: float = 2.3
 # The time left is rounded to this many seconds, and never shown as less.
 REMAINING_ROUND_SECONDS: int = 5
+# How the page finds that figure in a progress message, to count it down in the
+# browser until the next estimate arrives (a regular expression Python and
+# JavaScript both read; it must match ``transcribe.format_remaining``).
+REMAINING_PATTERN: str = r"about ((?:\d+:)?\d+:\d\d) left"
 # Target audio parameters for transcription (mono, 16 kHz is plenty for speech).
 TARGET_CHANNELS: int = 1
 TARGET_SAMPLE_RATE: int = 16000

@@ -5,6 +5,7 @@ writes a small marker file instead of an MP3, and the client is a stand-in that
 answers per chunk.
 """
 
+import re
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -448,6 +449,23 @@ def test_the_time_left_follows_the_parts_this_run_has_got_back():
     assert transcribe.format_remaining(3725.0) == "about 1:02:05 left"
     # Never "0:00 left" while a part is still out.
     assert transcribe.format_remaining(0.4) == "about 0:05 left"
+
+
+@pytest.mark.parametrize(
+    ("seconds", "clock"), [(0.4, "0:05"), (93.0, "1:35"), (3725.0, "1:02:05")]
+)
+def test_the_page_can_find_the_time_left_in_a_message(seconds, clock):
+    # The page counts the figure down in the browser between two estimates; if
+    # the wording changed without the pattern, it would quietly stop counting.
+    message = (
+        f"Transcribing part 2 of 9… {transcribe.format_remaining(seconds)}"
+        ", then the check with local Whisper"
+    )
+
+    found = re.search(config.REMAINING_PATTERN, message)
+
+    assert found is not None
+    assert found.group(1) == clock
 
 
 def test_the_time_left_says_when_a_local_check_follows(pipeline):

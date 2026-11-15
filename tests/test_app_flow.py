@@ -318,6 +318,20 @@ def test_no_credit_for_screenshots_only_warns_a_local_run(tmp_path, monkeypatch)
     assert not test.error
 
 
+def test_the_page_carries_the_script_that_counts_the_time_left_down():
+    # The figure and the floor come from config, so the countdown in the
+    # browser and the estimate from the pipeline cannot drift apart.
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+
+    scripts = [e.proto for e in test.get("html") if "<script>" in e.proto.body]
+
+    assert not test.exception
+    assert len(scripts) == 1
+    assert scripts[0].unsafe_allow_javascript
+    assert f"/{config.REMAINING_PATTERN}/" in scripts[0].body
+    assert f"const floor = {config.REMAINING_ROUND_SECONDS};" in scripts[0].body
+
+
 def test_the_server_listens_on_localhost_only():
     # Transcripts are confidential and the app has no login: it must not be
     # reachable from the network unless someone deliberately says so.
