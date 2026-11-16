@@ -227,6 +227,39 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   words/min, and its halves came back with 238 and 215 words — the local `medium` pass
   had heard 460 there — with no `⚠️`. So the same audio the model gave up on as one
   4:50 chunk it transcribed in full as two.*
+- **Thin is judged over speech, and a split part keeps what OpenAI first returned**
+  *(2026-11-16)*. A 78-minute meeting (row 230) showed two gaps in the guard. Its part
+  0:00–5:01 came back with 166 words and was split; the half 0:00–2:30 returned 8 words
+  and was marked "Speech may be missing", yet ffmpeg found 143 of its 150 s silent
+  (mean −56.8 dB): a false alarm, because words per minute were counted over the whole
+  part. And part 5:01–10:02, normal speech, came back with 11 words while its halves
+  returned 216 and 206 — a real omission the split repaired, but its `part_001.json`
+  marker kept only the numbers (tokens, request id), not the 11 words, so what OpenAI
+  had answered could not be read. Now:
+  - `sound_profile` measures every part before it is sent (pydub on the part's own
+    audio, quarter-second windows, like ffmpeg `silencedetect`, so no ffmpeg in tests):
+    a window is silent below a line 30 dB under the part's loudest window, kept between
+    −60 and −40 dBFS (`SILENCE_*` in `config.py`), and only runs of a second or more
+    count. The record gets `speech_seconds`, `silence_seconds` and `mean_dbfs`, and
+    `words_per_min` is counted **over the speech seconds**; the median that sets the
+    floor is too. A part with under 30 s of speech (`THIN_MIN_SPEECH_SECONDS`) is never
+    thin and does not vote: a rate over a few seconds says nothing. **Why the line moves
+    with the part's loudest window:** a fixed −40 dB would call a quietly recorded call
+    all silence and never judge it; the −60 floor keeps room noise silent.
+  - A split part's first answer is kept as `first_answer` (`reason`, `text`, `record`)
+    in the split marker and on the first half's piece, so it reaches
+    `data/runs/<row>/chunk_NNN.json`; the warning that announces the split quotes its
+    first and last 120 characters. It stays out of the transcript and the row.
+  - Every record carries `request` (model, response_format, language, prompt,
+    chunking_strategy, all listed, `None` when not sent), and the log line prints it with
+    the part's length, so a later change to the request is visible run by run.
+  - `THIN_RETRY_AUTO_CHUNKING` (setting, **off**): before splitting a thin part of a
+    model that takes it, send it once more whole with `chunking_strategy="auto"` (through
+    `extra_body`: SDK 1.75 has no argument for it); kept if no longer thin, otherwise
+    split as before, with both answers in `first_answer`. An experiment for one A/B on
+    the same audio, not a default: one more paid request per thin part.
+  Not done: a `language` hint (one half of row 230 came back in Cyrillic, which a hint
+  might prevent, but it changes every request — §5 P1).
 - **Every answered chunk leaves a trace: a log file, a record in the row, and its raw
   answer kept beside the history** *(2026-11-03)*. The app's own traces could not find
   the loss above: logging was console-only, the chunk checkpoints were discarded as soon
@@ -251,8 +284,10 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
     words/min, seconds).
   - The same figures are the piece's `record` (checkpointed with it) and reach the
     history row as `usage_json["transcription"]["chunks"]` — `{index, part, start, end,
-    mp3_bytes, seconds, output_tokens, chars, words, words_per_min, request_id, thin,
-    capped, typical_words_per_min}` — through the summary `transcribe_openai` returns.
+    mp3_bytes, seconds, output_tokens, chars, words, words_per_min, speech_seconds,
+    silence_seconds, mean_dbfs, request, request_id, thin, capped,
+    typical_words_per_min}` (the sound and request fields since 2026-11-16) — through the
+    summary `transcribe_openai` returns.
     No new column, no migration: the column is JSON already, and rows saved before
     have no records (`chunk_records` synthesises one from a piece's text and usage for
     parts restored from older checkpoints, without a request id).
@@ -1398,6 +1433,11 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 - **A thin first part is caught too** *(2026-11-15)*: the part that had nothing before it
   to be compared with is judged once the others are back and, if it holds sound, sent
   again in two halves; a silent start is left alone
+- **A thin part can be explained afterwards** *(2026-11-16)*: words per minute are
+  counted over the part's speech, so a mostly silent part is no longer marked; a split
+  part keeps OpenAI's first answer in its saved parts; every part logs its speech,
+  silence, mean volume and request parameters; `THIN_RETRY_AUTO_CHUNKING` (off) tries
+  `chunking_strategy="auto"` before a split
 - **The app's part of the Claude skill is in the repo** *(2026-11-16)*:
   `.claude/skills/video-to-text/` — the calls, the statuses, the estimate, the check
   for lost speech, the rules; README, "From Claude Code"
@@ -1463,7 +1503,7 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/align/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 479 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 491 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1694,6 +1734,12 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       end against a local pass of its final seconds. First: see how often it happens on
       real recordings (the last part's words/min against the run's median, from
       `usage_json`, read-only).
+- [ ] **Why does `gpt-4o-transcribe` drop most of a part, and does a request option
+      prevent it?** (2026-11-16, row 230: 11 words for five minutes of normal speech,
+      216 + 206 from its halves.) The next thin part now leaves its first answer, its
+      sound and its request in the log and `data/runs/` (§3, "Thin is judged over
+      speech"). Then, on the owner's word: one run with `THIN_RETRY_AUTO_CHUNKING=true`,
+      and weigh a `language` hint (a half of row 230 came back in Cyrillic).
 - [ ] **Blind test of providers on real audio before 2027-02-26** (M). 10–15 min of real
       Serbian and Macedonian meeting audio plus an AMR call, hand-corrected reference;
       candidates: gpt-transcribe, ElevenLabs Scribe v2 (Data-use opt-out on), Gemini 3.5
@@ -1857,6 +1903,23 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-16 (part 3) — A thin part leaves its first answer and its silence behind
+
+*Personal laptop.* Asked from another session after row 230 (a 78-minute meeting): a half
+of its first part was marked "Speech may be missing" though it was 143 s of silence in
+150, and part 5:01–10:02 came back with 11 words whose text was kept nowhere. Changed
+(§3, "Thin is judged over speech"): `sound_profile` per part, words per minute over
+speech, no judgement under 30 s of speech; `first_answer` in the split marker and the
+chunk's saved parts, with its first and last 120 characters in the log; `request` in
+every record and log line; `THIN_RETRY_AUTO_CHUNKING`, off. The log line per part is
+longer: `… N words/min of speech; sound: S s speech, Q s silence, mean M dBFS; sent
+model=…, response_format=…, language=-, prompt=-, chunking_strategy=-; request <id>`, and
+the `⚠️` marker says "a minute of speech". `scripts/dev/fake_openai.py` can now record the
+form fields of each request, and a test sends through the real SDK to it to see
+`chunking_strategy` on the wire. Tests 479 → 491, all on synthetic audio; ruff clean.
+Docs: README (features, usage, log, configuration, command line), the skill's step 4.
+Not checked against the real API or a real recording. Not committed.
 
 ### 2026-11-16 (part 2) — The app's part of the Claude skill moves into the repo
 

@@ -9,6 +9,7 @@ failed or interrupted run resumes instead of paying again. This module is
 UI-agnostic: progress is reported through an optional callback.
 """
 
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,7 @@ import serbian
 import usage
 from audio import to_wav
 from config import (
+    CHUNKING_STRATEGY_MODELS,
     CUT_SEARCH_SECONDS,
     DEFAULT_MODEL,
     DEFAULT_SEGMENT_MINUTES,
@@ -41,10 +43,15 @@ from config import (
     OUTPUT_TOKEN_CAP_GUARD,
     REMAINING_ROUND_SECONDS,
     SEGMENT_MINUTES_BY_MODEL,
+    SILENCE_BELOW_PEAK_DB,
+    SILENCE_DBFS_CEILING,
+    SILENCE_DBFS_FLOOR,
+    SILENCE_MIN_SECONDS,
     TARGET_CHANNELS,
     TARGET_SAMPLE_RATE,
     THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE,
     THIN_CHUNK_SHARE,
+    THIN_MIN_SPEECH_SECONDS,
     THIN_RECHECK_LOUD_DB,
     THIN_RECHECK_MIN_SOUND_SHARE,
     TIMESTAMP_MODELS,
@@ -88,6 +95,8 @@ _LOCAL_FILL_MARKER = "🧩"
 _VERIFIED_MARKER = "🔍"
 # A stretch shorter than this is nothing to transcribe.
 _MIN_SPAN_MS = 1000
+# How much of the start and of the end of an incomplete answer the log quotes.
+_EXCERPT_CHARS = 120
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -164,7 +173,7 @@ def format_thin_marker(
     Args:
         start: Where the part begins (seconds).
         end: Where it ends (seconds).
-        rate: Words per minute the answer had.
+        rate: Words per minute of speech the answer had.
         typical: Words per minute of the run's other parts, when known.
 
     Returns:
@@ -174,7 +183,7 @@ def format_thin_marker(
     return (
         f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) This "
         f"part came back with far fewer words than expected ({rate:.0f} a "
-        f"minute{against}), so speech here may be missing."
+        f"minute of speech{against}), so speech here may be missing."
     )
 
 
@@ -761,7 +770,40 @@ def _export_chunk(segment: AudioSegment, temp_folder: Path, name: str) -> Path:
     return mp3_path
 
 
-def _request(file_path: Path, client: OpenAI, model: str, want_segments: bool) -> Any:
+def request_parameters(
+    model: str, want_segments: bool, chunking_strategy: str | None = None
+) -> dict[str, Any]:
+    """Return what a transcription request sends besides the audio.
+
+    Every key is listed, sent or not (``None`` means left to OpenAI's default),
+    so the log shows the whole request and a later change to it is visible.
+
+    Args:
+        model: Transcription model name.
+        want_segments: Whether per-segment times (``verbose_json``) are asked for.
+        chunking_strategy: OpenAI's ``chunking_strategy`` (``"auto"``), or
+            ``None`` to leave it out.
+
+    Returns:
+        ``model``, ``response_format``, ``language``, ``prompt`` and
+        ``chunking_strategy``.
+    """
+    return {
+        "model": model,
+        "response_format": "verbose_json" if want_segments else "json",
+        "language": None,
+        "prompt": None,
+        "chunking_strategy": chunking_strategy,
+    }
+
+
+def _request(
+    file_path: Path,
+    client: OpenAI,
+    model: str,
+    want_segments: bool,
+    chunking_strategy: str | None = None,
+) -> Any:
     """Send one chunk to the API (the SDK retries transient failures itself).
 
     Args:
@@ -769,6 +811,8 @@ def _request(file_path: Path, client: OpenAI, model: str, want_segments: bool) -
         client: Client from :func:`openai_api.make_client`.
         model: Transcription model name.
         want_segments: If True, request ``verbose_json`` (per-segment times).
+        chunking_strategy: Sent as OpenAI's ``chunking_strategy`` when given
+            (through ``extra_body``: the SDK in use has no argument for it).
 
     Returns:
         The API response (exposing ``.text``, and ``.segments`` when asked).
@@ -777,15 +821,107 @@ def _request(file_path: Path, client: OpenAI, model: str, want_segments: bool) -
         OpenAIAccountError: If the key or the account is refused.
         TranscriptionError: For any other failure, with a short message.
     """
+    extra: dict[str, Any] = {}
+    if want_segments:
+        extra["response_format"] = "verbose_json"
+    if chunking_strategy is not None:
+        extra["extra_body"] = {"chunking_strategy": chunking_strategy}
     try:
         with file_path.open("rb") as audio_file:
-            if want_segments:
-                return client.audio.transcriptions.create(
-                    model=model, file=audio_file, response_format="verbose_json"
-                )
-            return client.audio.transcriptions.create(model=model, file=audio_file)
+            return client.audio.transcriptions.create(
+                model=model, file=audio_file, **extra
+            )
     except OpenAIError as exc:
         raise openai_api.translate_error(exc, TranscriptionError) from exc
+
+
+def sound_profile(segment: AudioSegment) -> dict[str, Any]:
+    """Measure how much of a part is speech and how much silence.
+
+    Works like ffmpeg's ``silencedetect`` on quarter-second windows, with the
+    line set from the part's own loudest window (see ``SILENCE_*`` in
+    ``config``), so it needs no ffmpeg and judges quiet recordings fairly.
+
+    Args:
+        segment: The part's audio.
+
+    Returns:
+        ``speech_seconds`` and ``silence_seconds`` (rounded to 0.1 s), and
+        ``mean_dbfs``, the part's mean volume (``None`` for digital silence).
+    """
+    levels = [
+        (len(window), window.dBFS)
+        for window in (
+            segment[at : at + _CUT_WINDOW_MS]
+            for at in range(0, len(segment), _CUT_WINDOW_MS)
+        )
+    ]
+    silent_ms = 0
+    if levels:
+        peak = max(level for _, level in levels)
+        line = min(
+            max(peak - SILENCE_BELOW_PEAK_DB, SILENCE_DBFS_FLOOR), SILENCE_DBFS_CEILING
+        )
+        run = 0
+        for length, level in [*levels, (0, math.inf)]:
+            if level < line:
+                run += length
+                continue
+            if run >= SILENCE_MIN_SECONDS * 1000:
+                silent_ms += run
+            run = 0
+    mean = segment.dBFS if len(segment) else -math.inf
+    return {
+        "speech_seconds": round((len(segment) - silent_ms) / 1000, 1),
+        "silence_seconds": round(silent_ms / 1000, 1),
+        "mean_dbfs": round(mean, 1) if math.isfinite(mean) else None,
+    }
+
+
+def _speech_seconds(piece: dict[str, Any]) -> float:
+    """Return a piece's seconds of speech (its whole length if not measured).
+
+    Args:
+        piece: A transcribed piece; parts saved before silence was measured
+            have no ``speech_seconds`` in their record.
+
+    Returns:
+        Seconds of speech.
+    """
+    record = piece.get("record") or {}
+    return float(record.get("speech_seconds", piece["duration"]))
+
+
+def _speech_rate(pieces: list[dict[str, Any]]) -> float:
+    """Return the words per minute of speech of one or more pieces together.
+
+    Args:
+        pieces: Transcribed pieces.
+
+    Returns:
+        Words per minute over their seconds of speech.
+    """
+    return words_per_minute(
+        " ".join(str(piece["text"]) for piece in pieces),
+        sum(_speech_seconds(piece) for piece in pieces),
+    )
+
+
+def _excerpt(text: str, size: int = _EXCERPT_CHARS) -> str:
+    """Quote the start and the end of an answer for a log line.
+
+    Args:
+        text: The answer.
+        size: Characters to keep from each end.
+
+    Returns:
+        The whole text in quotes when it is short, otherwise its first and
+        last ``size`` characters, with line breaks folded into spaces.
+    """
+    flat = " ".join(text.split())
+    if len(flat) <= 2 * size:
+        return f'"{flat}"'
+    return f'"{flat[:size]}" … "{flat[-size:]}"'
 
 
 def _output_tokens(result: Any) -> int | None:
@@ -837,8 +973,10 @@ def _thin_floor(pieces: list[dict[str, Any]]) -> float | None:
     """Return the words-per-minute rate below which the next answer counts as thin.
 
     The floor is a share of the running median of the pieces answered so far
-    (``THIN_CHUNK_SHARE``); pieces already flagged thin do not vote, and a run
-    whose typical rate is too low to judge by (silence, music) gets no floor.
+    (``THIN_CHUNK_SHARE``), each counted over its seconds of speech; pieces
+    already flagged thin, or with too little speech to say anything
+    (``THIN_MIN_SPEECH_SECONDS``), do not vote, and a run whose typical rate is
+    too low to judge by (silence, music) gets no floor.
 
     Args:
         pieces: The pieces transcribed so far in this run.
@@ -847,9 +985,9 @@ def _thin_floor(pieces: list[dict[str, Any]]) -> float | None:
         The floor, or ``None`` while there is nothing to compare with.
     """
     rates = [
-        words_per_minute(str(piece["text"]), piece["duration"])
+        _speech_rate([piece])
         for piece in pieces
-        if not piece.get("thin")
+        if not piece.get("thin") and _speech_seconds(piece) >= THIN_MIN_SPEECH_SECONDS
     ]
     if not rates:
         return None
@@ -867,6 +1005,8 @@ def _chunk_record(
     seconds: float,
     size_bytes: int,
     thin_floor: float | None,
+    sound: dict[str, Any] | None = None,
+    request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe one answered chunk, for the log and the history row.
 
@@ -878,16 +1018,29 @@ def _chunk_record(
         seconds: How long the request took.
         size_bytes: Size of the MP3 that was sent.
         thin_floor: The words-per-minute floor in force (see :func:`_thin_floor`).
+        sound: The part's :func:`sound_profile`; without it the whole part
+            counts as speech.
+        request: The :func:`request_parameters` it was sent with.
 
     Returns:
         A JSON-serialisable record with ``part``, ``start``, ``end``,
         ``mp3_bytes``, ``seconds``, ``output_tokens``, ``chars``, ``words``,
-        ``words_per_min``, ``request_id``, ``thin`` and ``capped``, plus
-        ``typical_words_per_min`` when a floor was in force.
+        ``words_per_min`` (over the seconds of speech), ``speech_seconds``,
+        ``silence_seconds``, ``mean_dbfs``, ``request``, ``request_id``,
+        ``thin`` and ``capped``, plus ``typical_words_per_min`` when a floor
+        was in force. A part with less than ``THIN_MIN_SPEECH_SECONDS`` of
+        speech is never thin.
     """
     start_ms, end_ms = span
     text = str(result.text)
-    rate = words_per_minute(text, (end_ms - start_ms) / 1000)
+    if sound is None:
+        sound = {
+            "speech_seconds": (end_ms - start_ms) / 1000,
+            "silence_seconds": 0.0,
+            "mean_dbfs": None,
+        }
+    speech = sound["speech_seconds"]
+    rate = words_per_minute(text, speech)
     record: dict[str, Any] = {
         "part": name,
         "start": start_ms / 1000,
@@ -898,8 +1051,14 @@ def _chunk_record(
         "chars": len(text),
         "words": len(text.split()),
         "words_per_min": round(rate, 1),
+        **sound,
+        "request": request or {},
         "request_id": _request_id(result),
-        "thin": thin_floor is not None and rate < thin_floor,
+        "thin": (
+            thin_floor is not None
+            and speech >= THIN_MIN_SPEECH_SECONDS
+            and rate < thin_floor
+        ),
         "capped": tokens is not None and tokens >= OUTPUT_TOKEN_CAP_GUARD,
     }
     if thin_floor is not None:
@@ -919,12 +1078,19 @@ def _log_record(record: dict[str, Any]) -> None:
     if record["thin"]:
         flags += f", thin (typical {record['typical_words_per_min']} words/min)"
     tokens = record["output_tokens"]
+    mean = record.get("mean_dbfs")
+    sent = ", ".join(
+        f"{key}={'-' if value is None else value}"
+        for key, value in (record.get("request") or {}).items()
+    )
     logger.info(
-        "Part %s (%s–%s, %.2f MB) answered in %.1f s: %s output tokens, %d chars, "
-        "%d words, %.0f words/min%s, request %s",
+        "Part %s (%s–%s, %.1f s, %.2f MB) answered in %.1f s: %s output tokens, "
+        "%d chars, %d words, %.0f words/min of speech%s; sound: %.1f s speech, "
+        "%.1f s silence, mean %s dBFS; sent %s; request %s",
         record["part"],
         _format_clock(record["start"]),
         _format_clock(record["end"]),
+        record["end"] - record["start"],
         record["mp3_bytes"] / (1024 * 1024),
         record["seconds"],
         f"{tokens:,}" if tokens is not None else "unknown",
@@ -932,6 +1098,10 @@ def _log_record(record: dict[str, Any]) -> None:
         record["words"],
         record["words_per_min"],
         flags,
+        record["speech_seconds"],
+        record["silence_seconds"],
+        "-inf" if mean is None else f"{mean:.1f}",
+        sent or "-",
         record["request_id"] or "id unknown",
     )
 
@@ -1055,37 +1225,32 @@ def _transcribe_span(
         spent = saved.get("usage") or [
             usage.transcription_record(None, model, (end_ms - start_ms) / 1000)
         ]
+        first_answer = saved.get("first_answer")
     else:
-        path = _export_chunk(audio[start_ms:end_ms], temp_folder, f"chunk_{name}")
-        size_bytes = path.stat().st_size
-        started = time.monotonic()
-        try:
-            result = _request(path, client, model, want_segments)
-        finally:
-            path.unlink(missing_ok=True)
-
-        tokens = _output_tokens(result)
-        span_ms = end_ms - start_ms
-        spent = [usage.transcription_record(result, model, span_ms / 1000)]
-        taken = time.monotonic() - started
-        record = _chunk_record(
-            name, span, result, tokens, taken, size_bytes, thin_floor
+        result, record, spent_one = _send(
+            audio, span, client, model, want_segments, temp_folder, name, thin_floor
         )
-        _log_record(record)
+        tokens = record["output_tokens"]
+        span_ms = end_ms - start_ms
+        spent = [spent_one]
         capped, thin = record["capped"], record["thin"]
         splittable = may_split and span_ms >= 2 * MIN_SPLIT_SECONDS * 1000
         if not ((capped or thin) and splittable):
             if capped:
                 logger.warning(
-                    "Part %s still hit the output cap (%d tokens)", name, tokens
+                    "Part %s still hit the output cap (%d tokens); its answer: %s",
+                    name,
+                    tokens,
+                    _excerpt(str(result.text)),
                 )
             if thin:
                 logger.warning(
-                    "Part %s is still thin (%.0f words/min, floor %.0f); kept and "
-                    "marked",
+                    "Part %s is still thin (%.0f words/min of speech, floor %.0f); "
+                    "kept and marked; its answer: %s",
                     name,
                     record["words_per_min"],
                     thin_floor,
+                    _excerpt(str(result.text)),
                 )
             piece = _piece(result, start_ms, end_ms, want_segments, capped, thin)
             piece["usage"] = spent
@@ -1098,24 +1263,60 @@ def _transcribe_span(
         # The answer stopped at the output cap, so the end of this stretch is
         # missing from it — or it has far too few words, so some of the
         # stretch is missing from it. Transcribe the two halves instead.
+        reason = "capped" if capped else "thin"
+        first_answer = _first_answer(reason, str(result.text), record)
         if capped:
             logger.warning(
-                "Part %s hit the output cap (%d tokens); splitting it", name, tokens
+                "Part %s hit the output cap (%d tokens); splitting it; its answer: %s",
+                name,
+                tokens,
+                _excerpt(str(result.text)),
             )
         else:
             logger.warning(
-                "Part %s is thin (%.0f words/min, floor %.0f); splitting it",
+                "Part %s is thin (%.0f words/min of speech, floor %.0f); splitting "
+                "it; its answer: %s",
                 name,
                 record["words_per_min"],
                 thin_floor,
+                _excerpt(str(result.text)),
             )
+            again = _auto_chunking_retry(
+                audio,
+                span,
+                client,
+                model,
+                want_segments,
+                temp_folder,
+                name,
+                record,
+                thin_floor,
+            )
+            if again is not None:
+                result_again, record_again, spent_again = again
+                spent.append(spent_again)
+                if not (record_again["thin"] or record_again["capped"]):
+                    piece = _piece(result_again, start_ms, end_ms, want_segments, False)
+                    piece.update(
+                        usage=spent, record=record_again, first_answer=first_answer
+                    )
+                    checkpoints.save(
+                        checkpoint,
+                        part,
+                        {"bounds": [start_ms, end_ms], "pieces": [piece]},
+                    )
+                    return [piece]
+                first_answer["auto_chunking"] = {
+                    "text": str(result_again.text),
+                    "record": record_again,
+                }
         middle = _quietest_cut(
             audio,
             (start_ms + end_ms) // 2,
             min(span_ms // 4, int(CUT_SEARCH_SECONDS * 1000)),
         )
         # The incomplete answer was paid for too; it is kept with the split
-        # marker so a resumed run still counts it.
+        # marker so a resumed run still counts it, and so does its text.
         checkpoints.save(
             checkpoint,
             part,
@@ -1123,8 +1324,9 @@ def _transcribe_span(
                 "bounds": [start_ms, end_ms],
                 "split": middle,
                 "usage": spent,
-                "reason": "capped" if capped else "thin",
+                "reason": reason,
                 "record": record,
+                "first_answer": first_answer,
             },
         )
 
@@ -1148,7 +1350,151 @@ def _transcribe_span(
         first = pieces[0]
         own = _usage_records([first], model)
         pieces[0] = {**first, "usage": spent + own}
+        if first_answer is not None:
+            # The halves replace the first answer in the transcript; it stays
+            # in the chunk's saved parts, so what OpenAI returned can be seen.
+            pieces[0]["first_answer"] = first_answer
     return pieces
+
+
+def _first_answer(reason: str, text: str, record: dict[str, Any]) -> dict[str, Any]:
+    """Keep an answer that is replaced by its halves, for the saved parts.
+
+    Args:
+        reason: ``"thin"`` or ``"capped"``.
+        text: The answer's text.
+        record: Its record (see :func:`_chunk_record`).
+
+    Returns:
+        ``reason``, ``text`` and ``record``.
+    """
+    return {"reason": reason, "text": text, "record": record}
+
+
+def _send(
+    audio: AudioSegment,
+    span: tuple[int, int],
+    client: OpenAI,
+    model: str,
+    want_segments: bool,
+    temp_folder: Path,
+    name: str,
+    thin_floor: float | None,
+    chunking_strategy: str | None = None,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    """Export one part, measure its sound, send it and log the answer.
+
+    Args:
+        audio: The whole recording.
+        span: ``(start_ms, end_ms)`` of the part.
+        client: Configured OpenAI client.
+        model: Transcription model name.
+        want_segments: Whether the model returns per-segment timestamps.
+        temp_folder: Scratch directory for the part's MP3.
+        name: The part's name (``"003"``, ``"003a"``).
+        thin_floor: Words per minute below which the answer counts as thin.
+        chunking_strategy: OpenAI's ``chunking_strategy``, or ``None``.
+
+    Returns:
+        The answer, its record (see :func:`_chunk_record`) and its usage record.
+    """
+    start_ms, end_ms = span
+    segment = audio[start_ms:end_ms]
+    sound = sound_profile(segment)
+    path = _export_chunk(segment, temp_folder, f"chunk_{name}")
+    size_bytes = path.stat().st_size
+    started = time.monotonic()
+    try:
+        result = _request(path, client, model, want_segments, chunking_strategy)
+    finally:
+        path.unlink(missing_ok=True)
+    tokens = _output_tokens(result)
+    record = _chunk_record(
+        name,
+        span,
+        result,
+        tokens,
+        time.monotonic() - started,
+        size_bytes,
+        thin_floor,
+        sound,
+        request_parameters(model, want_segments, chunking_strategy),
+    )
+    _log_record(record)
+    spent = usage.transcription_record(result, model, (end_ms - start_ms) / 1000)
+    return result, record, spent
+
+
+def _auto_chunking_retry(
+    audio: AudioSegment,
+    span: tuple[int, int],
+    client: OpenAI,
+    model: str,
+    want_segments: bool,
+    temp_folder: Path,
+    name: str,
+    first: dict[str, Any],
+    thin_floor: float | None,
+) -> tuple[Any, dict[str, Any], dict[str, Any]] | None:
+    """Send a thin part once more whole with ``chunking_strategy="auto"``.
+
+    An experiment behind ``THIN_RETRY_AUTO_CHUNKING`` (off by default): the
+    same audio with only the server's voice-activity chunking changed, so the
+    log says whether that alone brings the missing speech back.
+
+    Args:
+        audio: The whole recording.
+        span: ``(start_ms, end_ms)`` of the part.
+        client: Configured OpenAI client.
+        model: Transcription model name.
+        want_segments: Whether the model returns per-segment timestamps.
+        temp_folder: Scratch directory for the part's MP3.
+        name: The part's name.
+        first: The record of the thin answer.
+        thin_floor: Words per minute below which an answer counts as thin.
+
+    Returns:
+        The new answer, its record and its usage record; ``None`` when the
+        setting is off, the model does not take the option, or the request
+        failed (the part is then split as usual).
+    """
+    if not get_settings().thin_retry_auto_chunking:
+        return None
+    if model not in CHUNKING_STRATEGY_MODELS:
+        return None
+    try:
+        result, record, spent = _send(
+            audio,
+            span,
+            client,
+            model,
+            want_segments,
+            temp_folder,
+            name,
+            thin_floor,
+            chunking_strategy="auto",
+        )
+    except AppError as exc:
+        logger.warning(
+            "Part %s could not be sent again with chunking_strategy=auto (%s); "
+            "splitting it",
+            name,
+            exc,
+        )
+        return None
+    better = not (record["thin"] or record["capped"])
+    logger.warning(
+        "Part %s sent again whole with chunking_strategy=auto: %d → %d words "
+        "(%.0f → %.0f words/min of speech); %s; its answer: %s",
+        name,
+        first["words"],
+        record["words"],
+        first["words_per_min"],
+        record["words_per_min"],
+        "no longer thin, kept" if better else "still thin, splitting it",
+        _excerpt(str(result.text)),
+    )
+    return result, record, spent
 
 
 def _piece(
@@ -1549,20 +1895,23 @@ def _judge_unjudged(
             (at, other) for at, other in enumerate(groups) if at != index and other
         ]
         floor = _thin_floor([p for _, other in others for p in other])
-        rate = words_per_minute(str(piece["text"]), piece["duration"])
+        rate = _speech_rate([piece])
         if floor is None or rate >= floor:
+            continue
+        speech = _speech_seconds(piece)
+        if speech < THIN_MIN_SPEECH_SECONDS:
+            logger.info(
+                "Part %03d has few words (%d) but only %.1f s of speech in %.1f s; "
+                "too little to judge, taken as it is",
+                index,
+                len(str(piece["text"]).split()),
+                speech,
+                piece["duration"],
+            )
             continue
         # The nearest chunks that answered normally say how loud speech is here.
         normal = sorted(
-            (
-                at
-                for at, other in others
-                if words_per_minute(
-                    " ".join(str(p["text"]) for p in other),
-                    sum(p["duration"] for p in other),
-                )
-                >= floor
-            ),
+            (at for at, other in others if _speech_rate(other) >= floor),
             key=lambda at: abs(at - index),
         )[:2]
         if not _holds_sound(audio, bounds[index], [bounds[at] for at in normal]):
@@ -1575,11 +1924,12 @@ def _judge_unjudged(
             )
             continue
         logger.warning(
-            "Part %03d is thin (%.0f words/min, floor %.0f), seen once the other "
-            "parts were back; splitting it",
+            "Part %03d is thin (%.0f words/min of speech, floor %.0f), seen once "
+            "the other parts were back; splitting it; its answer: %s",
             index,
             rate,
             floor,
+            _excerpt(str(piece["text"])),
         )
         _report(
             progress_callback,
@@ -1656,6 +2006,35 @@ def _send_again_in_halves(
         return [marked]
     saved = checkpoints.load(checkpoint, f"part_{name}") or {}
     if "split" not in saved:
+        spent = _usage_records([piece], model)
+        first_answer = _first_answer("thin", str(piece["text"]), record)
+        again = _auto_chunking_retry(
+            audio,
+            span,
+            client,
+            model,
+            want_segments,
+            work[0],
+            name,
+            record,
+            floor,
+        )
+        if again is not None:
+            result_again, record_again, spent_again = again
+            spent.append(spent_again)
+            if not (record_again["thin"] or record_again["capped"]):
+                kept = _piece(result_again, start_ms, end_ms, want_segments, False)
+                kept.update(usage=spent, record=record_again, first_answer=first_answer)
+                checkpoints.save(
+                    checkpoint,
+                    f"part_{name}",
+                    {"bounds": [start_ms, end_ms], "pieces": [kept]},
+                )
+                return [kept]
+            first_answer["auto_chunking"] = {
+                "text": str(result_again.text),
+                "record": record_again,
+            }
         middle = _quietest_cut(
             audio,
             (start_ms + end_ms) // 2,
@@ -1667,9 +2046,10 @@ def _send_again_in_halves(
             {
                 "bounds": [start_ms, end_ms],
                 "split": middle,
-                "usage": _usage_records([piece], model),
+                "usage": spent,
                 "reason": "thin",
                 "record": record,
+                "first_answer": first_answer,
             },
         )
     try:

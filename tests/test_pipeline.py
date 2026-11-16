@@ -65,12 +65,15 @@ class FakeClient:
 
     def __init__(self, answer):
         self.calls: list[tuple[str, int]] = []
+        # What each call sent besides the model and the file (``extra_body``).
+        self.extras: list[dict] = []
         self._answer = answer
         self.audio = SimpleNamespace(transcriptions=SimpleNamespace(create=self.create))
 
-    def create(self, model, file, response_format=None):
+    def create(self, model, file, response_format=None, **extra):
         name, length = file.read().decode().split("|")
         self.calls.append((name, int(length)))
+        self.extras.append(extra)
         return self._answer(name, int(length))
 
     def close(self):
@@ -1020,7 +1023,7 @@ def test_a_silent_start_is_not_sent_again(pipeline, caplog):
 
     assert [name for name, _ in client.calls] == ["chunk_000", "chunk_001", "chunk_002"]
     assert "⚠️" not in text
-    assert "little sound; taken as it is" in caplog.text
+    assert "only 0.0 s of speech in 299.9 s; too little to judge" in caplog.text
 
 
 def test_a_half_that_fails_keeps_the_first_answer_marked_and_the_run(pipeline):
@@ -1095,7 +1098,12 @@ def test_every_answered_part_leaves_one_log_line_and_the_plan_is_logged_once(
     assert lines[0].startswith("Part 000 (0:00–")
     assert "answered in" in lines[0]
     assert "800 output tokens" in lines[0]
-    assert "600 words, 120 words/min, request req_chunk_000" in lines[0]
+    assert "600 words, 120 words/min of speech; sound: 299.9 s speech, " in lines[0]
+    assert "0.0 s silence, mean -3.0 dBFS; " in lines[0]
+    assert (
+        "; sent model=gpt-4o-transcribe, response_format=json, language=-, "
+        "prompt=-, chunking_strategy=-; request req_chunk_000"
+    ) in lines[0]
     assert "thin" not in lines[0] and "capped" not in lines[0]
     records = pipeline.spent[-1]["chunks"]
     assert records[0]["request_id"] == "req_chunk_000"
@@ -1116,7 +1124,7 @@ def test_a_capped_answer_is_logged_and_recorded_as_such(pipeline, caplog):
         r.getMessage() for r in caplog.records if r.getMessage().startswith("Part")
     ]
     assert any(
-        line.startswith("Part 000 (") and ", capped, request" in line for line in lines
+        line.startswith("Part 000 (") and ", capped; sound:" in line for line in lines
     )
     records = pipeline.spent[-1]["chunks"]
     assert [r["capped"] for r in records] == [True, True]
@@ -1380,3 +1388,290 @@ def test_a_batched_cross_check_goes_through_the_batched_pipeline(pipeline, monke
     assert len(batched.kwargs) == 1
     assert text.startswith("🔍 Checked against a local Whisper pass (base): ")
     assert "🧩 (1:00) Let us move on to the product roadmap" in text
+
+
+# --- what a thin part leaves behind, and silence that is not missing speech -------
+#
+# A real 78-minute meeting (2026-11-16): the first half of its first part came
+# back with 8 words and was marked, yet 143 of its 150 seconds were silence;
+# and the 11-word answer to a five-minute stretch of normal speech was
+# replaced by its halves without its text being kept anywhere.
+
+
+def _saved(name: str) -> dict:
+    import json
+
+    [path] = config.get_settings().temp_dir.rglob(f"{name}.json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _quiet(ms: int, db: float) -> AudioSegment:
+    return _tone(ms).apply_gain(db + 3.0)  # the tone itself is at -3 dBFS
+
+
+def test_silence_and_speech_are_measured_per_part():
+    silence = AudioSegment.silent(duration=1000, frame_rate=16000)
+    profile = transcribe.sound_profile(silence * 20 + _tone(10_000))
+    assert profile == {
+        "speech_seconds": 10.0,
+        "silence_seconds": 20.0,
+        "mean_dbfs": pytest.approx(-7.8, abs=0.1),
+    }
+    # Gaps shorter than a second are pauses between words, not silence.
+    pauses = (_tone(2000) + silence[:500]) * 10
+    assert transcribe.sound_profile(pauses)["silence_seconds"] == 0.0
+    # A quiet recording's speech is speech, and its room noise is silence.
+    quiet = _quiet(10_000, -45) + _quiet(5000, -75)
+    assert transcribe.sound_profile(quiet)["speech_seconds"] == 10.0
+    assert transcribe.sound_profile(quiet)["silence_seconds"] == 5.0
+    # Digital silence has no mean volume worth a number.
+    assert transcribe.sound_profile(silence * 5) == {
+        "speech_seconds": 0.0,
+        "silence_seconds": 5.0,
+        "mean_dbfs": None,
+    }
+
+
+def test_an_answer_is_quoted_by_its_ends_in_the_log():
+    assert transcribe._excerpt("short\nanswer") == '"short answer"'
+    long = "a" * 120 + "b" * 50 + "c" * 120
+    assert transcribe._excerpt(long) == f'"{"a" * 120}" … "{"c" * 120}"'
+
+
+def test_a_mostly_silent_part_is_judged_by_its_speech_not_flagged(pipeline):
+    # 50 s of speech in a five-minute part: 100 words is 120 a minute of
+    # speech, though only 20 a minute of the part.
+    silence = AudioSegment.silent(duration=250_000, frame_rate=16000)
+    audio = _tone(10 * MINUTE) + _tone(50_000) + silence
+    client = FakeClient(
+        lambda name, ms: _text(_speech(100 if name == "chunk_002" else 600))
+    )
+    text = pipeline.run(audio, client)
+
+    assert [name for name, _ in client.calls] == ["chunk_000", "chunk_001", "chunk_002"]
+    assert "⚠️" not in text
+    record = pipeline.spent[-1]["chunks"][2]
+    assert record["speech_seconds"] == pytest.approx(50, abs=1)
+    assert record["silence_seconds"] == pytest.approx(250, abs=1)
+    assert record["words_per_min"] == pytest.approx(120, abs=3)
+    assert not record["thin"]
+
+
+def test_a_half_that_is_mostly_silence_is_not_marked(pipeline, caplog):
+    # The real case: a thin part is split, and its first half is 143 s of
+    # silence and 7 s of speech that came back as 8 words.
+    silence = AudioSegment.silent(duration=143_000, frame_rate=16000)
+    audio = _tone(10 * MINUTE) + silence + _tone(157_000)
+
+    def answer(name, ms):
+        words = {"chunk_002": 20, "chunk_002a": 8, "chunk_002b": 300}
+        return _text(_speech(words.get(name, 600)))
+
+    client = FakeClient(answer)
+    with caplog.at_level("INFO", logger="transcribe"):
+        text = pipeline.run(audio, client)
+
+    assert [name for name, _ in client.calls][2:] == [
+        "chunk_002",
+        "chunk_002a",
+        "chunk_002b",
+    ]
+    assert "⚠️" not in text
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["part"] for r in records][2:] == ["002a", "002b"]
+    assert records[2]["speech_seconds"] < 30 and not records[2]["thin"]
+    assert transcribe.describe_flagged(records) is None
+    assert "still thin" not in caplog.text
+
+
+def test_a_thin_answer_split_in_halves_keeps_its_text_and_numbers(pipeline, caplog):
+    thin = "the start of a long thin answer " + "x" * 300 + " and its very end"
+
+    def answer(name, ms):
+        if name == "chunk_002":
+            result = _text(thin, tokens=5)
+            result._request_id = "req_thin"
+            return result
+        return _thin_answer(name, ms)
+
+    with caplog.at_level("INFO", logger="transcribe"):
+        pipeline.run(_tone(15 * MINUTE), FakeClient(answer))
+
+    [piece_a, _] = _saved("chunk_002")["pieces"]
+    first = piece_a["first_answer"]
+    assert first["reason"] == "thin" and first["text"] == thin
+    assert first["record"]["request_id"] == "req_thin"
+    assert first["record"]["output_tokens"] == 5
+    assert first["record"]["speech_seconds"] == pytest.approx(300, abs=1)
+    assert first["record"]["request"]["chunking_strategy"] is None
+    # The split marker holds it too, so a resumed run still has it.
+    assert _saved("part_002")["first_answer"] == first
+    # The halves are what the transcript and the history row use.
+    assert "first_answer" not in pipeline.spent[-1]["chunks"][2]
+    [line] = [m for m in caplog.messages if m.startswith("Part 002 is thin")]
+    assert '"the start of a long thin answer xxx' in line
+    assert 'xxx and its very end"' in line and " … " in line
+
+
+def test_a_first_part_judged_afterwards_keeps_its_first_answer(pipeline):
+    pipeline.run(_tone(15 * MINUTE), FakeClient(_thin_start({"chunk_000"})))
+
+    first = _saved("chunk_000")["pieces"][0]["first_answer"]
+    assert first["text"] == "can you hear me now?"
+    assert first["record"]["thin"] and first["record"]["typical_words_per_min"]
+
+
+def test_every_part_records_how_it_was_requested(pipeline):
+    client = FakeClient(_thin_answer)
+    pipeline.run(_tone(15 * MINUTE), client)
+
+    records = pipeline.spent[-1]["chunks"]
+    assert all(
+        r["request"]
+        == {
+            "model": "gpt-4o-transcribe",
+            "response_format": "json",
+            "language": None,
+            "prompt": None,
+            "chunking_strategy": None,
+        }
+        for r in records
+    )
+    # Off by default: nothing beyond the model and the file is sent.
+    assert client.extras == [{}] * 5
+
+
+def _auto_answers(client_ref: list, auto_words: int):
+    """Thin at chunk_002 by default; ``auto_words`` words when sent with auto."""
+
+    def answer(name, ms):
+        if client_ref[0].extras[-1].get("extra_body") == {"chunking_strategy": "auto"}:
+            return _text(_speech(auto_words), tokens=auto_words)
+        return _thin_answer(name, ms)
+
+    return answer
+
+
+@pytest.fixture
+def auto_chunking(monkeypatch):
+    monkeypatch.setenv("THIN_RETRY_AUTO_CHUNKING", "true")
+    config.get_settings.cache_clear()
+
+
+def test_auto_chunking_that_brings_the_speech_back_replaces_the_split(
+    pipeline, auto_chunking, caplog
+):
+    ref: list = []
+    client = FakeClient(_auto_answers(ref, 600))
+    ref.append(client)
+    with caplog.at_level("INFO", logger="transcribe"):
+        text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert [name for name, _ in client.calls] == [
+        "chunk_000",
+        "chunk_001",
+        "chunk_002",
+        "chunk_002",
+    ]
+    assert client.extras[3] == {"extra_body": {"chunking_strategy": "auto"}}
+    assert "almost nothing here" not in text and "⚠️" not in text
+    [piece] = _saved("chunk_002")["pieces"]
+    assert piece["record"]["request"]["chunking_strategy"] == "auto"
+    assert piece["first_answer"]["text"] == "almost nothing here."
+    assert pipeline.spent[-1]["requests"] == 4
+    assert (
+        "Part 002 sent again whole with chunking_strategy=auto: 3 → 600 words"
+        in caplog.text
+    )
+    assert "no longer thin, kept" in caplog.text
+
+
+def test_auto_chunking_that_stays_thin_is_split_as_usual(pipeline, auto_chunking):
+    ref: list = []
+    client = FakeClient(_auto_answers(ref, 3))
+    ref.append(client)
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert [name for name, _ in client.calls][2:] == [
+        "chunk_002",
+        "chunk_002",
+        "chunk_002a",
+        "chunk_002b",
+    ]
+    assert "⚠️" not in text
+    first = _saved("chunk_002")["pieces"][0]["first_answer"]
+    assert first["auto_chunking"]["record"]["request"]["chunking_strategy"] == "auto"
+    assert pipeline.spent[-1]["requests"] == 6
+
+
+def test_a_first_part_judged_afterwards_is_tried_with_auto_chunking_too(
+    pipeline, auto_chunking
+):
+    ref: list = []
+    thin_start = _thin_start({"chunk_000"})
+
+    def answer(name, ms):
+        if ref[0].extras[-1]:
+            return _text(_speech(600), tokens=800)
+        return thin_start(name, ms)
+
+    client = FakeClient(answer)
+    ref.append(client)
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert [name for name, _ in client.calls] == [
+        "chunk_000",
+        "chunk_001",
+        "chunk_002",
+        "chunk_000",
+    ]
+    assert "can you hear me now?" not in text
+    [piece] = _saved("chunk_000")["pieces"]
+    assert piece["first_answer"]["text"] == "can you hear me now?"
+    assert pipeline.spent[-1]["requests"] == 4
+
+
+def test_auto_chunking_is_not_tried_with_a_model_that_lacks_it(pipeline, auto_chunking):
+    client = FakeClient(_thin_answer)
+    pipeline.run(_tone(30 * MINUTE), client, model="whisper-1")
+
+    assert all(extra == {} for extra in client.extras)
+
+
+def test_the_request_options_reach_openai_as_form_fields(tmp_path):
+    # The real SDK against the fake server: what is logged is what is sent.
+    import importlib.util
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    script = Path(__file__).parents[1] / "scripts" / "dev" / "fake_openai.py"
+    spec = importlib.util.spec_from_file_location("fake_openai", script)
+    fake = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fake)
+
+    seen: list[dict[str, str]] = []
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), fake.make_handler(0, seen, text="a b c")
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    client = openai.OpenAI(
+        api_key="test-key",
+        base_url=f"http://127.0.0.1:{server.server_port}/v1",
+        max_retries=0,
+    )
+    part = tmp_path / "chunk_000.mp3"
+    part.write_bytes(b"not really audio")
+    try:
+        plain = transcribe._request(part, client, "gpt-4o-transcribe", False)
+        auto = transcribe._request(
+            part, client, "gpt-4o-transcribe", False, chunking_strategy="auto"
+        )
+    finally:
+        server.shutdown()
+        client.close()
+
+    assert plain.text == auto.text == "a b c"
+    assert seen == [
+        {"model": "gpt-4o-transcribe"},
+        {"model": "gpt-4o-transcribe", "chunking_strategy": "auto"},
+    ]

@@ -131,6 +131,25 @@ THIN_CHUNK_MIN_MEDIAN_WORDS_PER_MINUTE: float = 40.0
 # were that loud, against 40–80 % in the parts that answered normally.
 THIN_RECHECK_MIN_SOUND_SHARE: float = 0.2
 THIN_RECHECK_LOUD_DB: float = 20.0
+# Words per minute are counted over a part's speech, not its whole length, and a
+# part with less speech than this is not judged at all: a rate over a few
+# seconds says nothing. Measured 2026-11-16 on a 78-minute meeting: the first
+# half of its first part (0:00–2:30) came back with 8 words and was marked
+# "Speech may be missing", yet 143 of its 150 seconds were silence.
+THIN_MIN_SPEECH_SECONDS: float = 30.0
+# Silence within a part is measured on quarter-second windows, like ffmpeg's
+# silencedetect: a window is silent when it is SILENCE_BELOW_PEAK_DB quieter
+# than the part's loudest window, with that line kept between
+# SILENCE_DBFS_FLOOR and SILENCE_DBFS_CEILING (so a quiet recording's speech is
+# not silence, and room noise under -60 dBFS always is), and only runs of
+# SILENCE_MIN_SECONDS or more count — shorter gaps are pauses between words.
+SILENCE_BELOW_PEAK_DB: float = 30.0
+SILENCE_DBFS_FLOOR: float = -60.0
+SILENCE_DBFS_CEILING: float = -40.0
+SILENCE_MIN_SECONDS: float = 1.0
+# Models that take OpenAI's ``chunking_strategy`` (server-side voice activity
+# detection); THIN_RETRY_AUTO_CHUNKING uses it only with these.
+CHUNKING_STRATEGY_MODELS: set[str] = {"gpt-4o-transcribe", "gpt-4o-mini-transcribe"}
 # Chunks are never split below this length, so a runaway split cannot loop.
 MIN_SPLIT_SECONDS: float = 30.0
 # Chunk boundaries move to the quietest moment within this distance of the
@@ -426,6 +445,8 @@ class Settings(BaseSettings):
         frame_max_count: Hard cap on screenshots described per video.
         serbian_latin: Rewrite Serbian Cyrillic in transcripts as Latin (off).
         allow_local_files: Offer recordings from a folder on this computer.
+        thin_retry_auto_chunking: Before splitting a thin part, send it once
+            more whole with ``chunking_strategy="auto"`` and log what changed.
     """
 
     openai_api_key: str | None = Field(
@@ -456,6 +477,11 @@ class Settings(BaseSettings):
     # computer it runs on. Turn it off (ALLOW_LOCAL_FILES=false) wherever other
     # people can open the page — a hosted copy would show them its server's disk.
     allow_local_files: bool = Field(default=True)
+    # Off by default: an experiment, one more paid request per thin part. On
+    # (THIN_RETRY_AUTO_CHUNKING=true), a thin part of a model that takes it is
+    # sent once more whole with the server's voice-activity chunking before it
+    # is split; the log says whether that alone brought the speech back.
+    thin_retry_auto_chunking: bool = Field(default=False)
 
     model_config = SettingsConfigDict(
         env_file=".env",

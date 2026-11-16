@@ -16,12 +16,18 @@ Usage (the page must be an isolated copy: scratch ``DATA_DIR`` / ``TEMP_DIR`` /
 
 Run it from a folder without the project's ``.env``, or the real key is sent
 to this server (it reads no headers, but there is no reason to send it).
+
+The tests start it in a thread through :func:`make_handler`, with a list that
+collects the form fields of every request (all but the audio file), to see
+what the app really sends on the wire.
 """
 
 import json
 import sys
 import threading
 import time
+from email.parser import BytesParser
+from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _LIFETIME_SECONDS = 1200
@@ -31,11 +37,35 @@ _SPEECH = " ".join(
 )
 
 
-def make_handler(delay: float) -> type[BaseHTTPRequestHandler]:
+def form_fields(content_type: str, body: bytes) -> dict[str, str]:
+    """Return the plain fields of a multipart form (the file is left out).
+
+    Args:
+        content_type: The request's ``Content-Type`` header, with its boundary.
+        body: The request body.
+
+    Returns:
+        Field name to value, for every part that is not a file.
+    """
+    message = BytesParser(policy=HTTP).parsebytes(
+        f"Content-Type: {content_type}\r\n\r\n".encode() + body
+    )
+    return {
+        part.get_param("name", header="content-disposition"): part.get_content()
+        for part in message.iter_parts()
+        if part.get_filename() is None
+    }
+
+
+def make_handler(
+    delay: float, seen: list[dict[str, str]] | None = None, text: str = _SPEECH
+) -> type[BaseHTTPRequestHandler]:
     """Return a request handler that answers transcriptions after ``delay``.
 
     Args:
         delay: Seconds to wait before each transcription answer.
+        seen: When given, the form fields of each request are appended to it.
+        text: What every transcription answer says.
 
     Returns:
         The handler class for the server.
@@ -43,13 +73,15 @@ def make_handler(delay: float) -> type[BaseHTTPRequestHandler]:
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             if not self.path.endswith("/audio/transcriptions"):
                 self.send_response(404)
                 self.end_headers()
                 return
+            if seen is not None:
+                seen.append(form_fields(self.headers.get("Content-Type", ""), body))
             time.sleep(delay)
-            body = json.dumps({"text": _SPEECH}).encode()
+            body = json.dumps({"text": text}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
