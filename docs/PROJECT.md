@@ -259,7 +259,13 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
     split as before, with both answers in `first_answer`. An experiment for one A/B on
     the same audio, not a default: one more paid request per thin part.
   Not done: a `language` hint (one half of row 230 came back in Cyrillic, which a hint
-  might prevent, but it changes every request — §5 P1).
+  might prevent, but it changes every request — §5 P1). *Checked live (2026-11-16, real
+  API, scratch folders, a synthetic 3:00 TTS recording in one-minute parts, ~$0.03): a
+  minute with 3.1 s of speech and 57 s of silence came back with 3 words and was not
+  flagged (the old count would have split it); with the first answer of part 000 cut to
+  6 words in the test script, `chunking_strategy="auto"` was accepted and its answer had
+  134 words, kept; with the option off, the real halves had 69 + 66 words and
+  `first_answer` held the cut text and its request id.*
 - **Every answered chunk leaves a trace: a log file, a record in the row, and its raw
   answer kept beside the history** *(2026-11-03)*. The app's own traces could not find
   the loss above: logging was console-only, the chunk checkpoints were discarded as soon
@@ -1739,7 +1745,9 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       216 + 206 from its halves.) The next thin part now leaves its first answer, its
       sound and its request in the log and `data/runs/` (§3, "Thin is judged over
       speech"). Then, on the owner's word: one run with `THIN_RETRY_AUTO_CHUNKING=true`,
-      and weigh a `language` hint (a half of row 230 came back in Cyrillic).
+      and weigh a `language` hint (a half of row 230 came back in Cyrillic; in the live
+      check of 2026-11-16 the `chunking_strategy="auto"` answer wrote "last短 break" for
+      "Short break" in English speech — 短 is Chinese for "short").
 - [ ] **Blind test of providers on real audio before 2027-02-26** (M). 10–15 min of real
       Serbian and Macedonian meeting audio plus an AMR call, hand-corrected reference;
       candidates: gpt-transcribe, ElevenLabs Scribe v2 (Data-use opt-out on), Gemini 3.5
@@ -1919,7 +1927,28 @@ the `⚠️` marker says "a minute of speech". `scripts/dev/fake_openai.py` can 
 form fields of each request, and a test sends through the real SDK to it to see
 `chunking_strategy` on the wire. Tests 479 → 491, all on synthetic audio; ruff clean.
 Docs: README (features, usage, log, configuration, command line), the skill's step 4.
-Not checked against the real API or a real recording. Not committed.
+Committed as `79b4bee` and pushed (only this work's hunks of this file; another
+session's edits to it were left in the working tree).
+
+*Checked live the same day against the real OpenAI API* (scratch `DATA_DIR`, `TEMP_DIR`,
+`UPLOAD_DIR`; a 3:00 recording made from Windows TTS: a minute of speech, a minute with
+"Short break" and silence, a minute of speech; `SEGMENT_DURATION_MINUTES=1`; about $0.03
+for three runs):
+- the command line, as is: three parts, 129, 3 and 123 words; part 001 had 3.1 s of
+  speech and 57.0 s of silence (mean −34.0 dBFS against −20.9 for speech), so it was
+  not judged — the old count (3 words a minute against a floor of about 63) would have
+  split it. Every log line carried the request id, the sound figures and
+  `model=gpt-4o-transcribe, response_format=json, language=-, prompt=-,
+  chunking_strategy=-`. No notices.
+- a script that cut only the first answer of part 000 to 6 words (all other requests
+  real), with `THIN_RETRY_AUTO_CHUNKING=true`: the part was found thin once the others
+  were back (7 against a floor of 71), sent whole with `chunking_strategy="auto"`, which
+  the API accepted, 134 words came back and were kept; 4 requests. Its answer had one
+  glitch: "failed twice last短 break" where the recording says "Short break" (§5 P1).
+- the same with the setting off: the part was split, the real halves had 69 and 66
+  words, no `⚠️`, and `chunk_000.json` held `first_answer` with the 6 words and the
+  request id; 5 requests.
+Not seen live: a real thin answer from OpenAI (it cannot be provoked on purpose).
 
 ### 2026-11-16 (part 2) — The app's part of the Claude skill moves into the repo
 
