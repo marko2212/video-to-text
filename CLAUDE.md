@@ -12,6 +12,8 @@ questions are already answered there (and several choices are workarounds for re
 After any significant work, update **docs/PROJECT.md** in the same pass
 (Done / Next / Decisions / Journal — entry `### YYYY-MM-DD — title`, newest on top).
 User-facing changes (formats, flags, `.env` keys, commands) must also land in README.
+A change to the command line (commands, options, statuses, notices) also lands in
+`.claude/skills/video-to-text/SKILL.md`, in the same commit: it is what Claude reads to drive it.
 
 ## Invariants
 

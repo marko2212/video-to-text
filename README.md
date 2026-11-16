@@ -317,6 +317,10 @@ Options of `transcribe` (the first five also apply to `estimate`):
 
 A command writes to the same History, log and saved parts as the page, so the page shows its runs, and while a command is transcribing, the page's **Clean temporary files** waits. The OpenAI key comes from `.env` (a key typed into the sidebar lives only in that browser session).
 
+### From Claude Code 🤖
+
+The repository carries a Claude Code skill, `.claude/skills/video-to-text/SKILL.md`: how to find a recording, say what it will cost, run the command, check that no speech was lost and report what was said. Open Claude Code in the clone and ask it to transcribe a recording. To have the skill in every folder, copy that folder to `~/.claude/skills/` and put the clone's path into the two calls at its top. It knows the app only; where your recordings appear and where they go belongs in a personal skill of your own, which can send Claude to this one for the commands.
+
 ## Configuration 🔑
 
 * **OpenAI API Key (for the OpenAI engine, on-screen context and the AI title):** set it in the `.env` file as `OPENAI_API_KEY`, **or** type it into the sidebar at runtime (kept only for the session, never written to disk). The local offline engine needs no key.

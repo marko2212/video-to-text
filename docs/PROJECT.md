@@ -54,6 +54,7 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `exceptions.py` | Domain exceptions (`AppError` → `AudioProcessingError`, `TranscriptionError` → `IncompleteTranscriptionError`, `VisualContextError`, `TitleError`, `OpenAIAccountError`) |
 | `logger.py` | `get_logger()` — stdlib logging (never `print()`); `enable_file_log()` — the rotating `data/logs/app.log`, keys blanked |
 | `scripts/` | Launchers: `run.bat` (Windows), `run.sh` (Linux/macOS), `create-shortcut.ps1`, `v2t.bat` / `v2t.sh` (the command line, from any folder); one-off `serbian_latin_backfill.py` |
+| `.claude/skills/video-to-text/` | The Claude Code skill for the command line: the flow and the rules an agent follows, the app's part only (§3 Command line, last bullet) |
 | `tests/` | pytest — pure functions, SQLite, the pipeline with a fake client, headless UI (AppTest); no network, no ffmpeg |
 
 ### Data flow
@@ -817,8 +818,20 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   finished. Press Start to run it again." with Start enabled. The page's own Stop button
   was not pressed then (the click landed on the toolbar's, the same mechanism); it was
   in the countdown check the same day (UI / flow, second bullet).
-- **Claude drives the command through a skill kept outside this repo; nothing runs on
-  its own** *(2026-11-15, the owner)*. The skill is
+- **The skill is in two parts: what is about the app is in this repo, the owner's folders
+  stay outside it** *(2026-11-16, the owner asked whether a public skill would be of use)*.
+  `.claude/skills/video-to-text/SKILL.md` holds the calls, what to do for each `status`,
+  the estimate before a run, the check for lost speech and the rules (nothing starts
+  unasked, recordings are confidential, trials use scratch folders). Reasons: the
+  instructions sit beside the command they describe and change in the same commit
+  (on 2026-11-15 the thin-first-part fix here needed three more commits in the other
+  repo), and whoever clones the app has them. The owner's skill keeps only what this
+  repo cannot know and sends Claude here for the commands; a personal skill of the same
+  name takes the place of the project one in the owner's own sessions. No plugin or
+  marketplace file: a project skill needs none, and nobody has asked to install it
+  from elsewhere.
+- **Claude drives the command through a skill; nothing runs on its own**
+  *(2026-11-15, the owner; the skill was then wholly outside this repo)*. The owner's skill is
   `C:\Work\claude\skills\video-to-text\` (repo `work-workspace`, linked into
   `~/.claude/skills`): it knows what the app cannot — where recordings appear (OBS in
   `Videos`, Viber voice messages in `Documents\ViberDownloads\PTT`), which project's
@@ -1385,6 +1398,9 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 - **A thin first part is caught too** *(2026-11-15)*: the part that had nothing before it
   to be compared with is judged once the others are back and, if it holds sound, sent
   again in two halves; a silent start is left alone
+- **The app's part of the Claude skill is in the repo** *(2026-11-16)*:
+  `.claude/skills/video-to-text/` — the calls, the statuses, the estimate, the check
+  for lost speech, the rules; README, "From Claude Code"
 - **A Claude skill drives the command** *(2026-11-15, outside this repo)*: finds the
   recording (OBS, Viber voice messages, phone calls), transcribes it, says the next
   steps and moves the pair to its project's `Meeting` folder after the owner's yes
@@ -1841,6 +1857,21 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-16 (part 2) — The app's part of the Claude skill moves into the repo
+
+*Work laptop.* The owner asked whether a public skill, kept in the repo for others, would
+be of use. Answer given and accepted: yes, as a split and not a copy. New:
+`.claude/skills/video-to-text/SKILL.md` (the calls through `${CLAUDE_SKILL_DIR}`, the
+statuses, the flow from finding a recording to the report, the check for lost speech, the
+rules), written from README "Command line" and from the general half of the owner's
+skill, with nothing of the owner's folders, projects or names in it. The owner's skill
+(outside this repo) was cut down to those and now names this file for the commands.
+Docs: README "From Claude Code", CLAUDE.md (a change to the command line lands in the
+skill in the same commit), §2 (the folder), §3 Command line (the decision), §4. Checked:
+the skill was linked into `~/.claude/skills` under another name for a moment and an open
+session listed it with its description; the link was removed. Not checked: a session
+opened in the clone by someone who has no personal skill of the same name.
 
 ### 2026-11-16 — Work laptop: the command line pulled; a new OpenAI key, checked live
 
