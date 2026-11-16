@@ -1842,6 +1842,21 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 
 ## 6. Journal
 
+### 2026-11-16 — Work laptop: the command line pulled; a new OpenAI key, checked live
+
+*Work laptop.* The 2026-11-12 entry, left uncommitted here, was committed on the owner's
+word and put on top of the three command-line commits (`pull --rebase`; the journal was
+the only conflict). 479 tests pass on the pulled code, `scripts\v2t.bat --help` answers,
+and the Claude skill is linked on this machine too.
+
+The owner then put a new OpenAI key into this machine's `.env`, which closes the open
+item of 2026-11-12 (`429 insufficient_quota`). *Checked live (scratch `DATA_DIR`,
+`TEMP_DIR` and `UPLOAD_DIR`; the real History and log untouched, same size and time):* a
+9 s synthetic English clip (a Windows SAPI voice) through `cli.py transcribe` with
+`gpt-4o-transcribe` came back `done` in 3.4 s, one part answered in 2.6 s (`200 OK`,
+179 words/min), no notices, $0.0006. The text was what was said; only a name came back
+spelled the English way and "nine thirty" as `9:30`.
+
 ### 2026-11-15 (part 6) — The first chunk is judged too
 
 *Personal laptop.* On "Da, popravi", after the stand-up of part 5 lost its first 4:50.
