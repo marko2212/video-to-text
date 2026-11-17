@@ -314,3 +314,152 @@ def test_times_are_read_as_seconds_or_clock():
     assert cli._seconds("1:02:03") == 3723
     with pytest.raises(argparse.ArgumentTypeError):
         cli._seconds("half past")
+
+
+def _row(row_id: int):
+    return db.get_transcription(row_id)
+
+
+def test_rename_gives_a_moved_recording_its_new_name_in_history(
+    capsys, recording, engine, tmp_path
+):
+    bare = recording.with_name("2026-11-16 13-54-36.wav")
+    recording.rename(bare)
+    code, answer = _call(capsys, "transcribe", str(bare))
+    row_id = answer["row_id"]
+    before = _row(row_id)
+    project = tmp_path / "Project" / "Meeting"
+    project.mkdir(parents=True)
+    moved = project / "2026-11-16 13-54-36 - daily - schema.wav"
+    bare.rename(moved)
+
+    code, answer = _call(capsys, "rename", str(bare), str(moved))
+
+    assert code == cli.EXIT_DONE
+    assert answer["status"] == "renamed"
+    assert (answer["from"], answer["to"]) == (bare.name, moved.name)
+    assert [entry["row_id"] for entry in answer["entries"]] == [row_id]
+    after = _row(row_id)
+    assert after["filename"] == moved.name
+    # An audio file is transcribed where it lies: its stored path follows it.
+    assert before["audio_path"] == str(bare)
+    assert after["audio_path"] == str(moved)
+    for column in ("transcript", "title", "cost_usd", "created_at", "usage_json"):
+        assert after[column] == before[column]
+
+
+def test_rename_by_name_keeps_a_video_rows_extracted_audio_path(capsys):
+    db.init_db()
+    row_id = db.add_transcription(
+        filename="2026-11-16 11-01-49.mkv",
+        source_type="video",
+        model="gpt-4o-transcribe",
+        with_timestamps=False,
+        transcript="Text.",
+        audio_path="C:/temp/cli-x/2026-11-16 11-01-49.wav",
+    )
+
+    code, answer = _call(
+        capsys,
+        "rename",
+        "2026-11-16 11-01-49.mkv",
+        "2026-11-16 11-01-49 - architecture - MPN.mkv",
+    )
+
+    assert (code, answer["status"]) == (cli.EXIT_DONE, "renamed")
+    row = _row(row_id)
+    assert row["filename"] == "2026-11-16 11-01-49 - architecture - MPN.mkv"
+    assert row["audio_path"] == "C:/temp/cli-x/2026-11-16 11-01-49.wav"
+
+
+def _add(name: str) -> int:
+    db.init_db()
+    return db.add_transcription(
+        filename=name,
+        source_type="video",
+        model="gpt-4o-transcribe",
+        with_timestamps=False,
+        transcript=f"Text of {name}.",
+    )
+
+
+def test_every_run_of_the_recording_is_renamed_unless_one_row_is_named(capsys):
+    first, second = _add("a.mkv"), _add("a.mkv")
+    other = _add("b.mkv")
+
+    code, answer = _call(capsys, "rename", "a.mkv", "a - one.mkv", "--id", str(first))
+
+    assert code == cli.EXIT_DONE
+    assert [entry["row_id"] for entry in answer["entries"]] == [first]
+    assert [_row(i)["filename"] for i in (first, second, other)] == [
+        "a - one.mkv",
+        "a.mkv",
+        "b.mkv",
+    ]
+
+    code, answer = _call(capsys, "rename", "a.mkv", "a - two.mkv")
+
+    assert [entry["row_id"] for entry in answer["entries"]] == [second]
+    assert _row(second)["filename"] == "a - two.mkv"
+
+    code, answer = _call(capsys, "rename", "b.mkv", "b - x.mkv", "--id", str(first))
+
+    assert (code, answer["status"]) == (cli.EXIT_FAILED, "failed")
+    assert f"no entry {first} named b.mkv" in answer["message"]
+    assert _row(other)["filename"] == "b.mkv"
+
+
+def test_a_dry_run_and_an_unknown_name_change_nothing(capsys):
+    row_id = _add("a.mkv")
+
+    code, answer = _call(capsys, "rename", "a.mkv", "a - one.mkv", "--dry-run")
+
+    assert (code, answer["status"]) == (cli.EXIT_DONE, "dry_run")
+    assert [entry["row_id"] for entry in answer["entries"]] == [row_id]
+    assert _row(row_id)["filename"] == "a.mkv"
+
+    code, answer = _call(capsys, "rename", "c.mkv", "c - one.mkv")
+
+    assert (code, answer["status"]) == (cli.EXIT_NOT_STARTED, "not_found")
+    assert answer["entries"] == []
+
+
+@pytest.mark.parametrize(
+    ("new", "reason"),
+    [
+        ("transcript_a - one.txt", "not a video or audio file name"),
+        ("a.mkv", "are the same"),
+        ("{missing}", "There is no file"),
+    ],
+)
+def test_a_rename_that_looks_like_a_mistake_is_refused(capsys, tmp_path, new, reason):
+    row_id = _add("a.mkv")
+    new = new.replace("{missing}", str(tmp_path / "Meeting" / "a - one.mkv"))
+
+    code, answer = _call(capsys, "rename", "a.mkv", new)
+
+    assert (code, answer["status"]) == (cli.EXIT_FAILED, "failed")
+    assert reason in answer["message"]
+    assert _row(row_id)["filename"] == "a.mkv"
+
+
+def test_history_lists_entries_newest_first_and_filters_by_name(capsys):
+    old = _add("2026-11-13 14-12-54.mkv")
+    new = _add("2026-11-16 13-01-12.mkv")
+    db.set_title(new, "API engine", None, None)
+
+    code, answer = _call(capsys, "history")
+
+    assert (code, answer["status"]) == (cli.EXIT_DONE, "listed")
+    assert [entry["row_id"] for entry in answer["entries"]] == [new, old]
+    assert answer["entries"][0]["recording"] == "2026-11-16 13-01-12.mkv"
+    assert answer["entries"][0]["title"] == "API engine"
+    assert "transcript" not in answer["entries"][0]
+
+    code, answer = _call(capsys, "history", "--name", "2026-11-13")
+
+    assert [entry["row_id"] for entry in answer["entries"]] == [old]
+
+    code, answer = _call(capsys, "history", "--count", "1")
+
+    assert [entry["row_id"] for entry in answer["entries"]] == [new]

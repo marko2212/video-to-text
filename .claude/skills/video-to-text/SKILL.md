@@ -29,6 +29,8 @@ The answer is one JSON object on standard output; progress goes to standard erro
 | `pending <folder>` | The recordings with no `transcript_….txt` beside them. |
 | `estimate <recording>` | Length and cost of the run asked for. Starts nothing, needs no key. |
 | `transcribe <recording>` | What Start does on the page; leaves `transcript_<recording name>.txt` beside the recording. |
+| `history [--name TEXT]` | The app's History entries, newest first (`row_id`, `recording`, `title`), without their text. |
+| `rename <old> <new>` | After you renamed or moved a recording, gives its History entries the new name (`--dry-run` first if unsure). |
 
 | `status` | Exit code | What to do |
 |---|---|---|
@@ -87,7 +89,12 @@ The answer is one JSON object on standard output; progress goes to standard erro
 - Recordings are usually confidential conversations. Their content goes nowhere except
   what the app itself sends to OpenAI. Do not paste a transcript into another repository,
   a ticket or a message unless the user asks for exactly that.
-- Recordings and transcripts are not deleted, renamed or moved unless the user asks.
+- Recordings and transcripts are not deleted, renamed or moved unless the user asks. When
+  you do rename or move a recording on the user's word, rename its transcript with it
+  (`transcript_<new recording name>.txt`) and then run `rename "<old path>" "<new path>"`,
+  so the app's History shows the new name too; `not_found` only means the recording was
+  never transcribed by this app. History entries named before this step existed can be
+  renamed the same way, one name at a time (`history` lists them).
 - In real use the command writes to the app's real History, log and saved parts, and that
   is intended. A trial is not real use: synthetic sound, and `DATA_DIR`, `TEMP_DIR` and
   `UPLOAD_DIR` set to a scratch folder (the repository's `CLAUDE.md`).

@@ -7,14 +7,21 @@ JSON object on standard output, progress on standard error.
     python cli.py estimate   "C:/Meetings/2026-11-05 14-03-25.mkv"
     python cli.py latest     "C:/Meetings"
     python cli.py pending    "C:/Meetings"
+    python cli.py history    --name "2026-11-05"
+    python cli.py rename     "14-03-25.mkv" "C:/Meetings/14-03-25 - daily.mkv"
 
 ``transcribe`` does what Start does on the page (:func:`runs.run`): the same
 engines, saved parts, guards, cost record and History row. The transcript is
 then put beside the recording as ``transcript_<its name>.txt``. Exit codes: 0
 done, 1 failed, 3 stopped part-way (run the same command again — saved parts
-are not paid for twice), 4 not started (the transcript exists, or the estimate
-is over the limit and ``--yes`` was not given); 2 is argparse's for a bad
-command line.
+are not paid for twice), 4 not started (the transcript exists, the estimate
+is over the limit and ``--yes`` was not given, or ``rename`` found no History
+entry of that name); 2 is argparse's for a bad command line.
+
+``history`` and ``rename`` look after History, not recordings: when a
+recording is renamed or moved after its run (a description added to its name),
+``rename`` gives its History entries the new name, so the list shows what the
+folder shows.
 """
 
 import argparse
@@ -207,6 +214,41 @@ def _parser() -> argparse.ArgumentParser:
         "pending", help="list a folder's recordings that have no transcript yet"
     )
     pending.add_argument("folder", type=Path)
+
+    history = commands.add_parser(
+        "history", help="list History entries, newest first (reads, changes nothing)"
+    )
+    history.add_argument(
+        "--count",
+        type=int,
+        default=CLI_LATEST_COUNT,
+        help="how many at most, 0 for all (default: %(default)s)",
+    )
+    history.add_argument(
+        "--name", metavar="TEXT", help="only recordings whose name contains this"
+    )
+
+    rename = commands.add_parser(
+        "rename",
+        help="after a recording was renamed or moved, give its History entries "
+        "the new name",
+    )
+    rename.add_argument(
+        "old", help="the recording's old name or path (as History knows it)"
+    )
+    rename.add_argument("new", help="its new name, or its new path (which must exist)")
+    rename.add_argument(
+        "--id",
+        dest="ids",
+        type=int,
+        action="append",
+        metavar="ROW",
+        help="only this History entry (repeat for several); default: every "
+        "entry with the old name",
+    )
+    rename.add_argument(
+        "--dry-run", action="store_true", help="say what would change, change nothing"
+    )
     return parser
 
 
@@ -608,6 +650,110 @@ def _estimate(args: argparse.Namespace) -> int:
     return EXIT_DONE
 
 
+def _history(args: argparse.Namespace) -> int:
+    """List History entries, newest first, without their text."""
+    rows = db.list_transcriptions()
+    if args.name:
+        needle = args.name.casefold()
+        rows = [row for row in rows if needle in row["filename"].casefold()]
+    if args.count > 0:
+        rows = rows[: args.count]
+    _emit(
+        {
+            "status": "listed",
+            "entries": [
+                {
+                    "row_id": row["id"],
+                    "recording": row["filename"],
+                    "created_at": row["created_at"],
+                    "model": row["model"],
+                    "title": row["title"],
+                }
+                for row in rows
+            ],
+        }
+    )
+    return EXIT_DONE
+
+
+def _is_path(text: str) -> bool:
+    """Return True when a command-line argument names a folder, not just a file."""
+    return Path(text).parent != Path()
+
+
+def _rename(args: argparse.Namespace) -> int:
+    """Give the History entries of a renamed or moved recording its new name.
+
+    Only the name History shows changes (and the stored audio path, where it
+    pointed at the recording itself). The transcript text, title, cost and the
+    run's saved parts stay as they are; nothing on disk is touched.
+    """
+    old_name, new_name = Path(args.old).name, Path(args.new).name
+    if old_name == new_name:
+        raise CommandError(f"The old and the new name are the same: {new_name}.")
+    if runs.source_type(Path(new_name)) is None:
+        raise CommandError(
+            f"{new_name} is not a video or audio file name; give the recording, "
+            "not its transcript."
+        )
+    new_path: Path | None = None
+    if _is_path(args.new):
+        new_path = Path(args.new).expanduser().resolve()
+        if not new_path.is_file():
+            raise CommandError(f"There is no file {new_path}.")
+    rows = db.transcriptions_named(old_name)
+    if args.ids:
+        missing = sorted(set(args.ids) - {row["id"] for row in rows})
+        if missing:
+            raise CommandError(
+                f"History has no entry {', '.join(map(str, missing))} named {old_name}."
+            )
+        rows = [row for row in rows if row["id"] in set(args.ids)]
+    if not rows:
+        _emit(
+            {
+                "status": "not_found",
+                "from": old_name,
+                "to": new_name,
+                "entries": [],
+                "message": f"History has no entry named {old_name}.",
+            }
+        )
+        return EXIT_NOT_STARTED
+    changes = []
+    for row in rows:
+        audio_path = row["audio_path"]
+        if audio_path and Path(audio_path).name == old_name:
+            # An audio file is transcribed where it lies, so the row keeps its
+            # path; a video's row points at extracted audio and keeps that.
+            audio_path = str(new_path or Path(audio_path).with_name(new_name))
+        changes.append((row["id"], new_name, audio_path))
+    if not args.dry_run:
+        db.rename_transcriptions(changes)
+        logger.info(
+            "Renamed History entries %s: %s -> %s",
+            ", ".join(str(row["id"]) for row in rows),
+            old_name,
+            new_name,
+        )
+    _emit(
+        {
+            "status": "dry_run" if args.dry_run else "renamed",
+            "from": old_name,
+            "to": new_name,
+            "entries": [
+                {
+                    "row_id": row["id"],
+                    "created_at": row["created_at"],
+                    "title": row["title"],
+                }
+                for row in rows
+            ],
+        }
+    )
+    return EXIT_DONE
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one command.
 
@@ -633,6 +779,10 @@ def main(argv: list[str] | None = None) -> int:
             return _estimate(args)
         enable_file_log()
         db.init_db()
+        if args.command == "history":
+            return _history(args)
+        if args.command == "rename":
+            return _rename(args)
         return _transcribe(args)
     except AppError as exc:
         _emit({"status": "failed", "message": str(exc)})

@@ -883,6 +883,21 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   starts when the owner asks for one. (`Videos` held 46 recordings without a transcript
   that day, many of them marked unimportant; a scheduled run would have transcribed
   them all.)
+- **History follows a recording's new name, through a command, not the page**
+  *(2026-11-17, the owner: "ostane ovako go zapamćen i onda nemam dobru sliku kada gledam
+  istoriju")*. A recording is transcribed under the name its program gave it
+  (`2026-11-16 13-54-36.mkv`); only afterwards, once the content is known, does the
+  owner's skill add a description to the recording's and the transcript's names. History
+  kept the bare name. `rename <old> <new>` changes `filename` (and `audio_path`, which
+  for an audio file is the recording itself) on every row of that name, nothing else:
+  the transcript, title, cost and `data/runs/<row>/` are keyed by row id or content, so
+  they need no change. It matches by name because that is all a row stores of a video
+  (its `audio_path` is the extracted WAV); a name made by OBS, Viber or a phone is
+  unique enough, and `--id` narrows it when it is not. It refuses a new name that is not
+  a recording (the transcript passed by mistake) and a new path that does not exist.
+  `history` lists rows, so a caller can find the bare ones without opening the database.
+  No rename box on the page: nobody asked, and the name on the page is already the AI
+  title when the owner wants one.
 
 ### UI / flow
 - **An OpenAI run says about how much time is left, worked out from its own parts**
@@ -1499,7 +1514,9 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   names each transcript from its content (nano or mini) and uses the title instead of,
   or after, the file name in History and in downloaded file names; the title keeps to
   the transcript's script (one retry), and saved rows can be (re)titled from History
-- **Persistent history** (SQLite): browse, re-download TXT/SRT, delete
+- **Persistent history** (SQLite): browse, re-download TXT/SRT, delete; from the command
+  line `history` lists it and `rename` gives a renamed or moved recording's rows its new
+  name *(2026-11-17)*
 - **Working copies clear themselves** — uploads and extracted audio over a day old are
   deleted when the page is opened *(2026-09-30)*; the sidebar shows the space working
   files take, with the button to delete them now *(2026-10-03)*
@@ -1509,7 +1526,7 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/align/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 491 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 499 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1911,6 +1928,25 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-17 — History follows a recording's new name
+
+*Personal laptop.* The owner: after a run his skill renames the recording and its
+transcript (`… - <description>`), but History kept the bare name, so the list said
+little. New commands `history` and `rename <old> <new>` (§3, "History follows a
+recording's new name"); `db.transcriptions_named` and `db.rename_transcriptions`. Tests
+491 → 499 (a moved audio file keeps its path in the row, a video row keeps its WAV path,
+several runs of one name, `--id`, `--dry-run`, `not_found`, the refusals, `history`'s
+filter), all on a scratch History; ruff clean. Docs: README (command line), the skill's
+command table and its rule on renaming. The owner's own skill moves the pair with
+`par.py`, which now calls `rename` itself and has a step `istorija` for the old bare
+rows; tried on a scratch History, then as a dry run on the real one: 5 names (7 rows)
+would get their description from a Meeting folder, 96 names have no described file there,
+none had two candidates. Applied on the owner's yes, after a copy of the database
+(`data/transcriptions.db-backup-2026-11-17-025012-before-rename`, 228 rows, integrity ok):
+rows 211, 212, 226 and 228–231 now carry the described names; a second dry run finds
+nothing left. Committed and pushed on the owner's word, together with `par.py` in his
+skill repo.
 
 ### 2026-11-16 (part 3) — A thin part leaves its first answer and its silence behind
 

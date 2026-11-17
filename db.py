@@ -188,6 +188,46 @@ def get_transcription(record_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def transcriptions_named(filename: str) -> list[sqlite3.Row]:
+    """Return the rows of one recording name, newest first.
+
+    Args:
+        filename: The recording's name exactly as History stores it.
+
+    Returns:
+        Rows with ``id``, ``filename``, ``audio_path``, ``title`` and
+        ``created_at`` (several when the recording was transcribed again).
+    """
+    with closing(_connect()) as conn:
+        return conn.execute(
+            """
+            SELECT id, filename, audio_path, title, created_at
+            FROM transcriptions
+            WHERE filename = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (filename,),
+        ).fetchall()
+
+
+def rename_transcriptions(changes: list[tuple[int, str, str | None]]) -> None:
+    """Give rows a recording's new name, all of them or none.
+
+    Args:
+        changes: ``(id, filename, audio_path)`` per row; ``audio_path`` is the
+            row's value after the change (the same as before when it did not
+            point at the renamed file).
+    """
+    with closing(_connect()) as conn, conn:
+        conn.executemany(
+            "UPDATE transcriptions SET filename = ?, audio_path = ? WHERE id = ?",
+            [
+                (filename, audio_path, record_id)
+                for record_id, filename, audio_path in changes
+            ],
+        )
+
+
 def get_preferences() -> dict[str, str]:
     """Return every stored preference.
 

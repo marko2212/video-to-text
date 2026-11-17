@@ -297,6 +297,8 @@ On Linux and macOS it is `scripts/v2t.sh`; both work from any folder and use the
 | `estimate <recording>` | The recording's length and what the run asked for would cost. Starts nothing, needs no key. |
 | `latest <folder>` | The folder's newest recordings (`--count`, 10 by default), each with its length and its transcript, if it has one. |
 | `pending <folder>` | The recordings that have no `transcript_….txt` beside them yet. |
+| `history` | History entries, newest first: `row_id`, `recording` (the name History shows), `created_at`, `model`, `title`; no text. `--count` (0 for all), `--name TEXT` for names that contain it. Changes nothing. |
+| `rename <old> <new>` | After a recording was renamed or moved (a description added to its name, say), gives its History entries the new name, so History shows what the folder shows. Each argument is a name or a path; a new path must exist. Every entry with the old name changes (a recording transcribed twice has two), unless `--id ROW` names some; `--dry-run` only says which. The transcript, title, cost and saved parts stay as they are, and no file is touched. |
 
 Options of `transcribe` (the first five also apply to `estimate`):
 
@@ -314,6 +316,8 @@ Options of `transcribe` (the first five also apply to `estimate`):
 | `failed` | 1 | Nothing was saved; `message` says why. |
 | `partial` | 3 | An OpenAI run stopped part-way (no credit, no connection). Run the same command again: only the rest is sent. The partial text is at `partial_transcript`, not beside the recording. |
 | `exists`, `needs_confirmation` | 4 | Not started: the recording already has a transcript, or the estimate is over the limit. |
+| `listed`, `renamed`, `dry_run` | 0 | `latest`, `pending` and `history` answer `listed`; `rename` answers `renamed` (or `dry_run`) with `from`, `to` and the `entries` it changed. |
+| `not_found` | 4 | `rename` found no History entry with the old name; nothing changed. |
 
 A command writes to the same History, log and saved parts as the page, so the page shows its runs, and while a command is transcribing, the page's **Clean temporary files** waits. Standard error carries the log's line per part (`Part 003 (10:02–15:04, 302.0 s, …) answered in …: … words, … words/min of speech; sound: … s speech, … s silence, mean … dBFS; sent model=…, response_format=…, language=-, prompt=-, chunking_strategy=-; request req_…`) and, for a part sent again, a warning that quotes the start and end of its first answer. The OpenAI key comes from `.env` (a key typed into the sidebar lives only in that browser session).
 
