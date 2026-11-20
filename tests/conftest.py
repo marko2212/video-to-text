@@ -25,6 +25,8 @@ def isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAME_MAX_COUNT", str(config.DEFAULT_FRAME_MAX_COUNT))
     monkeypatch.delenv("SEGMENT_DURATION_MINUTES", raising=False)
     monkeypatch.setenv("SERBIAN_LATIN", "true")
+    monkeypatch.delenv("LOCAL_FILL", raising=False)
+    monkeypatch.delenv("LOCAL_FILL_MODEL", raising=False)
 
     config.get_settings.cache_clear()
     yield

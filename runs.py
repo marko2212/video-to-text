@@ -86,7 +86,8 @@ class RunRequest:
         batched: Decode the local pass (the run's, or the check's) in batches.
         api_key: The OpenAI key, if there is one.
         local_available: Whether the offline engine is installed, so that a
-            refused account can be pointed to it.
+            refused account can be pointed to it, and the parts an OpenAI run
+            still marks incomplete can be filled by it (:func:`fill_model`).
     """
 
     filename: str
@@ -425,22 +426,73 @@ def describe_verified(verified: dict[str, Any]) -> str:
     return text + "."
 
 
+def describe_filled(filled: dict[str, Any], chunks: list[dict[str, Any]]) -> str | None:
+    """Phrase what local Whisper did with the parts a run left incomplete.
+
+    Args:
+        filled: The ``filled`` part of a run's transcription summary.
+        chunks: The run's chunk records, each checked one with its
+            ``local_check``.
+
+    Returns:
+        One sentence, e.g. ``Local Whisper (medium) filled 2 of 2 part(s) that
+        came back incomplete from OpenAI, in 3:12: 20:00–22:29 (312 words),
+        25:05–27:34 (149 words), marked 🧩.``; ``None`` when no part could be
+        checked (the warning on the failure says so).
+    """
+    checked = filled["parts"] - filled.get("failed", 0)
+    if not checked:
+        return None
+    taken = f", in {format_length(filled['seconds'])}" if filled.get("seconds") else ""
+    who = f"Local Whisper ({filled['model']})"
+    of = f"part(s) that came back incomplete from OpenAI{taken}"
+    if not filled["filled"]:
+        return f"{who} checked the {checked} {of}, and found nothing more in them."
+    where = [
+        f"{format_length(record['start'])}–{format_length(record['end'])} "
+        f"({record['local_check']['added_words']} words)"
+        for record in chunks
+        if (record.get("local_check") or {}).get("added_words")
+    ]
+    return (
+        f"{who} filled {filled['filled']} of {filled['parts']} {of}: "
+        f"{', '.join(where)}, marked 🧩."
+    )
+
+
 def run_warnings(spent: dict[str, Any] | None) -> list[Notice]:
     """Say what a finished OpenAI run found out about its own answers.
 
     Args:
-        spent: The pipeline's summary (``chunks``, ``verified``), if any.
+        spent: The pipeline's summary (``chunks``, ``verified``, ``filled``),
+            if any.
 
     Returns:
-        Notices: a warning for parts that may have lost speech, and a note or
-        warning on the cross-check against a local pass.
+        Notices: a warning for parts that may have lost speech, a note on what
+        local Whisper filled in, and a note or warning on the cross-check
+        against a local pass.
     """
     notices: list[Notice] = []
     if not spent:
         return notices
-    flagged = transcribe.describe_flagged(spent.get("chunks") or [])
+    chunks = spent.get("chunks") or []
+    flagged = transcribe.describe_flagged(chunks)
     if flagged:
         notices.append(("warning", flagged))
+    filled = spent.get("filled")
+    if filled:
+        note = describe_filled(filled, chunks)
+        if note:
+            notices.append(("info", note))
+        if filled.get("failed"):
+            notices.append(
+                (
+                    "warning",
+                    f"Local Whisper ({filled['model']}) could not check "
+                    f"{filled['failed']} of the {filled['parts']} part(s) that came "
+                    f"back incomplete: {filled.get('error')} They stay marked ⚠️.",
+                )
+            )
     verified = spent.get("verified")
     if verified and verified.get("error"):
         notices.append(
@@ -547,6 +599,12 @@ def describe_cost(cost: dict[str, Any]) -> str:
     verified = (transcription or {}).get("verified")
     if verified and not verified.get("error"):
         parts.append(f"checked with local Whisper ({verified['model']}, free)")
+    filled = (transcription or {}).get("filled")
+    if filled and filled["parts"] > filled.get("failed", 0):
+        parts.append(
+            f"{filled['parts']} incomplete part(s) checked with local Whisper "
+            f"({filled['model']}, free)"
+        )
     span = cost.get("span")
     if span:
         parts.append(
@@ -621,6 +679,27 @@ def _remembering(digest: Callable[[Path], str]) -> Callable[[Path], str]:
     return remembered
 
 
+def fill_model(local_available: bool, verify: str | None = None) -> str | None:
+    """Return the local model that fills what an OpenAI run left incomplete.
+
+    Decided here, for the page and the command line alike: on unless
+    ``LOCAL_FILL`` is off, and only with the offline engine installed. A run
+    that verifies the whole recording against local Whisper needs no second
+    check of some of its parts.
+
+    Args:
+        local_available: Whether the offline engine is installed.
+        verify: The local model of the run's whole-recording check, if any.
+
+    Returns:
+        ``LOCAL_FILL_MODEL``, or ``None`` when the parts stay marked ``⚠️``.
+    """
+    settings = get_settings()
+    if not settings.local_fill or not local_available or verify:
+        return None
+    return settings.local_fill_model
+
+
 def _run_engine(
     request: RunRequest,
     hooks: RunHooks,
@@ -661,6 +740,10 @@ def _run_engine(
         if request.verify
         else None
     )
+    # Loaded only if a part is still incomplete after the run: most runs
+    # need no local pass, and a first use downloads the model.
+    filler = fill_model(request.local_available, request.verify)
+    fill = (lambda: hooks.load_local_model(filler), filler) if filler else None
     with hooks.stage("Transcribing with the OpenAI API…"):
         return transcribe.transcribe_openai(
             request.audio_path,
@@ -674,6 +757,7 @@ def _run_engine(
             span=request.span,
             verify=local,
             verify_batched=request.batched,
+            fill=fill,
         )
 
 

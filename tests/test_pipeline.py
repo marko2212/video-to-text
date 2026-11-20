@@ -1485,6 +1485,315 @@ def test_a_batched_cross_check_goes_through_the_batched_pipeline(pipeline, monke
     assert "🧩 (1:00) Let us move on to the product roadmap" in text
 
 
+# --- the parts still incomplete, filled from local Whisper over those parts only ----
+#
+# A 48-minute meeting (2026-11-20) came back with two halves still thin; the
+# check with local `medium` that filled them was run by hand over all 48
+# minutes. Now the run checks those halves alone, by itself.
+
+# What OpenAI lost: 32 words, more than the 25 a stretch needs to be added.
+_LOST = (
+    "The board approved the budget for next year after a long discussion about "
+    "hiring two engineers and moving the data centre to the new region before "
+    "the end of the first quarter."
+)
+
+
+class StretchWhisper:
+    """Stands in for a local model run over the stretches cut out of a recording.
+
+    Every stretch gets the same segments, timed from the stretch's own start;
+    the length of each stretch it was given is recorded.
+    """
+
+    def __init__(self, said):
+        self.said = said
+        self.lengths: list[float] = []
+
+    def transcribe(self, path, vad_filter):
+        length = len(AudioSegment.from_wav(path)) / 1000
+        self.lengths.append(length)
+        segments = [SimpleNamespace(start=s, end=e, text=t) for s, e, t in self.said]
+        return iter(segments), SimpleNamespace(duration=length)
+
+
+_HEARS_THE_LOSS = [(1.0, 3.0, " almost nothing here."), (20.0, 35.0, f" {_LOST}")]
+_HEARS_NOTHING_MORE = [(1.0, 3.0, " almost nothing here.")]
+
+
+def _still_thin(name, ms):
+    # Two full parts at 120 words/min; the third and both its halves come back
+    # with three words.
+    if name.startswith("chunk_002"):
+        return _text("almost nothing here.", tokens=5)
+    return _text(_speech(600, start=1_000 * int(name[6:9])), tokens=800)
+
+
+def _loader(model, loads: list[str]):
+    def load():
+        loads.append("medium")
+        return model
+
+    return (load, "medium")
+
+
+def _clock(seconds: float) -> str:
+    return transcribe._format_clock(seconds)
+
+
+def test_parts_still_thin_are_filled_from_a_local_pass_over_them_alone(pipeline):
+    whisper, loads = StretchWhisper(_HEARS_THE_LOSS), []
+
+    text = pipeline.run(
+        _tone(15 * MINUTE), FakeClient(_still_thin), fill=_loader(whisper, loads)
+    )
+
+    records = pipeline.spent[-1]["chunks"]
+    halves = records[2:]
+    assert [r["thin"] for r in records] == [False, False, True, True]
+    # The model is loaded once, and given the two halves — 5 of the 15 minutes.
+    assert loads == ["medium"]
+    assert whisper.lengths == [pytest.approx(r["end"] - r["start"]) for r in halves]
+    lines = text.strip().split("\n\n")
+    assert lines[0] == (
+        "🔍 Local Whisper (medium) checked the 2 part(s) that came back "
+        "incomplete from OpenAI: 2 filled with 64 words, marked 🧩."
+    )
+    for half in halves:
+        # The local text where it was spoken, after OpenAI's own few words.
+        assert f"🧩 ({_clock(half['start'] + 20)}) The board approved" in text
+        assert (
+            f"🔍 ({_clock(half['start'])}–{_clock(half['end'])}) This part came "
+            "back with far fewer words than expected (1 a minute of speech "
+            "against about 120 in the rest). Local Whisper (medium) heard 35 "
+            "words here and added the 32 that the OpenAI answer lacked, marked 🧩."
+        ) in lines
+        assert half["local_check"] == {
+            "model": "medium",
+            "local_words": 35,
+            "added_words": 32,
+        }
+    assert "⚠️" not in text
+    assert text.count("almost nothing here.") == 2  # OpenAI's text is kept
+    assert "(~0:00) w0 w1" in text  # the parts that came back whole are not touched
+    assert transcribe.describe_flagged(records) is None
+    filled = pipeline.spent[-1]["filled"]
+    assert filled == {
+        "model": "medium",
+        "seconds": filled["seconds"],
+        "parts": 2,
+        "filled": 2,
+        "added_words": 64,
+        "failed": 0,
+    }
+
+
+def test_a_part_where_local_whisper_hears_nothing_more_keeps_its_mark(pipeline):
+    whisper, loads = StretchWhisper(_HEARS_NOTHING_MORE), []
+
+    text = pipeline.run(
+        _tone(15 * MINUTE), FakeClient(_still_thin), fill=_loader(whisper, loads)
+    )
+
+    assert text.split("\n\n")[0] == (
+        "🔍 Local Whisper (medium) checked the 2 part(s) that came back "
+        "incomplete from OpenAI: 2 still marked ⚠️."
+    )
+    assert "🧩 (" not in text
+    kept = "so speech here may be missing. Local Whisper (medium) heard 3 words here"
+    assert text.count(kept) == 2
+    records = pipeline.spent[-1]["chunks"]
+    warning = transcribe.describe_flagged(records)
+    assert warning.startswith("Speech may be missing in 2 part(s) — ")
+    heard = "local Whisper (medium) heard 3 words there, nothing more"
+    assert warning.count(heard) == 2
+    assert pipeline.spent[-1]["filled"]["filled"] == 0
+
+
+def _still_looping(name, ms):
+    if name.startswith("chunk_001"):
+        return _text(_looped(), tokens=600)
+    return _text(_speech(600, start=1_000 * int(name[6:9])), tokens=800)
+
+
+@pytest.mark.parametrize("answer", [_still_thin, _still_looping])
+def test_only_the_parts_still_flagged_go_to_local_whisper(pipeline, answer):
+    whisper = StretchWhisper(_HEARS_NOTHING_MORE)
+
+    pipeline.run(_tone(15 * MINUTE), FakeClient(answer), fill=_loader(whisper, []))
+
+    records = pipeline.spent[-1]["chunks"]
+    flagged = [r for r in records if r["thin"] or r["looped"]]
+    assert len(flagged) == 2
+    assert whisper.lengths == [pytest.approx(r["end"] - r["start"]) for r in flagged]
+    assert all("local_check" in r for r in flagged)
+    assert not any("local_check" in r for r in records if r not in flagged)
+
+
+def test_a_looped_part_is_filled_with_what_its_repeats_stand_in_for(pipeline):
+    # The shape of the 2026-11-19 call: the part's speech, then one sentence over
+    # and over where the rest should have been. Aligned with the repeats, the
+    # lost speech would pass for another wording of them (found live with
+    # `medium`, 2026-11-20: 195 words heard, none added).
+    lost = f"{_LOST} {_speech(40, start=5_000)}"  # 72 words
+    whisper = StretchWhisper([(0.0, 60.0, _speech(250)), (70.0, 90.0, lost)])
+
+    text = pipeline.run(
+        _tone(15 * MINUTE), FakeClient(_still_looping), fill=_loader(whisper, [])
+    )
+
+    looped = [r for r in pipeline.spent[-1]["chunks"] if r["looped"]]
+    assert [r["local_check"]["added_words"] for r in looped] == [72, 72]
+    for half in looped:
+        assert f"🧩 ({_clock(half['start'] + 70)}) The board approved" in text
+        assert f"🔍 ({_clock(half['start'])}–{_clock(half['end'])}) The model " in text
+    assert "⚠️" not in text
+    # OpenAI's answer is still written as it came, repeats and all.
+    assert text.count("So whenever you change any data") == 20
+
+
+def test_repeats_are_left_out_for_the_alignment_only_once_seen():
+    assert transcribe.without_repeats(_looped(20, repeats=3)) == (
+        " ".join(f"w{i}" for i in range(20))
+        + " so whenever you change any data please tell me in the chat correct yes"
+    )
+    assert transcribe.without_repeats(_speech(30)) == " ".join(
+        f"w{i}" for i in range(30)
+    )
+
+
+def test_a_run_with_nothing_left_incomplete_loads_no_local_model(pipeline):
+    loads: list[str] = []
+
+    text = pipeline.run(
+        _tone(15 * MINUTE),
+        FakeClient(_thin_answer),  # thin once, whole in halves
+        fill=_loader(StretchWhisper(_HEARS_THE_LOSS), loads),
+    )
+
+    assert loads == []
+    assert "filled" not in pipeline.spent[-1]
+    assert "🔍" not in text
+
+
+def test_a_local_model_that_cannot_load_leaves_the_marks_and_the_run(pipeline):
+    def broken():
+        raise RuntimeError("no space left for the model")
+
+    text = pipeline.run(
+        _tone(15 * MINUTE), FakeClient(_still_thin), fill=(broken, "medium")
+    )
+
+    assert text.count("so speech here may be missing.") == 2
+    assert "🔍" not in text
+    filled = pipeline.spent[-1]["filled"]
+    assert filled["failed"] == 2 and filled["filled"] == 0
+    assert filled["error"] == "no space left for the model"
+    records = pipeline.spent[-1]["chunks"]
+    assert records[2]["local_check"] == {
+        "model": "medium",
+        "error": "no space left for the model",
+    }
+    assert transcribe.describe_flagged(records).startswith("Speech may be missing in 2")
+
+
+def test_the_whole_recording_check_marks_a_flagged_part_it_filled_as_filled(pipeline):
+    # 20 words every 10 s for the two whole parts, then the halves of part 002:
+    # the first is where the loss is, the second has only OpenAI's three words.
+    said = [
+        (10.0 * i, 10.0 * i + 10, " ".join(f"w{j}" for j in range(w, w + 20)))
+        for i, w in enumerate([*range(0, 600, 20), *range(1_000, 1_600, 20)])
+    ]
+    said += [
+        (601.0, 603.0, "almost nothing here."),
+        (620.0, 635.0, _LOST),
+        (880.0, 882.0, "almost nothing here."),
+    ]
+    whisper = FakeWhisper(
+        [SimpleNamespace(start=s, end=e, text=t) for s, e, t in said], duration=900.0
+    )
+
+    text = pipeline.run(
+        _tone(15 * MINUTE), FakeClient(_still_thin), verify=(whisper, "base")
+    )
+
+    first, second = pipeline.spent[-1]["chunks"][2:]
+    assert first["local_check"] == {
+        "model": "base",
+        "local_words": 35,
+        "added_words": 32,
+    }
+    assert second["local_check"] == {
+        "model": "base",
+        "local_words": 3,
+        "added_words": 0,
+    }
+    # The filled half loses its "may be missing"; the other keeps it.
+    assert f"🔍 ({_clock(first['start'])}–{_clock(first['end'])}) This part" in text
+    assert f"⚠️ ({_clock(first['start'])}" not in text
+    assert (
+        f"⚠️ ({_clock(second['start'])}–{_clock(second['end'])}) This part came back "
+        "with far fewer words than expected"
+    ) in text
+    assert "Local Whisper (base) heard 3 words here and found nothing more." in text
+    warning = transcribe.describe_flagged(pipeline.spent[-1]["chunks"])
+    assert warning.startswith("Speech may be missing in 1 part(s) — ")
+    assert "parts" not in pipeline.spent[-1]["verified"]
+
+
+def test_a_run_keeps_what_the_local_check_did_with_its_history_entry(
+    pipeline, monkeypatch, tmp_path
+):
+    import json
+
+    import db
+    import runs
+
+    audio = _tone(15 * MINUTE)
+    monkeypatch.setattr(transcribe, "_load_audio", lambda path, folder: audio)
+    monkeypatch.setattr(openai_api, "make_client", lambda key: FakeClient(_still_thin))
+    db.init_db()
+    request = runs.RunRequest(
+        filename="meeting.wav",
+        source_type="audio",
+        audio_path=pipeline.source,
+        transcript_path=tmp_path / "transcript_meeting.txt",
+        srt_path=tmp_path / "transcript_meeting.srt",
+        provider=config.PROVIDER_OPENAI,
+        model=config.DEFAULT_MODEL,
+        api_key="test-key",
+        local_available=True,
+    )
+    results = SimpleNamespace()
+    loaded = []
+
+    def load(name):
+        loaded.append(name)
+        return StretchWhisper(_HEARS_THE_LOSS)
+
+    runs.run(request, results, runs.RunHooks(load_local_model=load))
+
+    assert loaded == [config.DEFAULT_LOCAL_FILL_MODEL]
+    [row] = db.list_transcriptions()
+    entry = db.get_transcription(row["id"])
+    assert entry["transcript"].startswith("🔍 Local Whisper (medium) checked the 2")
+    saved = json.loads(entry["usage_json"])["transcription"]
+    assert saved["filled"]["added_words"] == 64
+    assert [c.get("local_check", {}).get("added_words") for c in saved["chunks"]] == [
+        None,
+        None,
+        32,
+        32,
+    ]
+    [(level, note)] = results.notices
+    assert level == "info"
+    assert note.startswith(
+        "Local Whisper (medium) filled 2 of 2 part(s) that came back incomplete "
+        "from OpenAI, in "
+    )
+    assert note.endswith("(32 words), marked 🧩.")
+
+
 # --- what a thin part leaves behind, and silence that is not missing speech -------
 #
 # A real 78-minute meeting (2026-11-16): the first half of its first part came

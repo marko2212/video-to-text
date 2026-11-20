@@ -43,7 +43,7 @@ pydub + **ffmpeg** · Pydantic Settings · SQLite · **uv** (dependencies) · **
 | `recordings.py` | Recordings picked from a folder on this computer instead of uploaded: reading a pasted folder or file path, listing media newest first, their lengths (ffprobe, cached per version), stable list labels, a file's identity — UI-agnostic |
 | `frames.py` | One-pass video scan (scene changes + 5 s grid, dHash), selection from the scan, single-frame extraction |
 | `vision.py` | Describes those frames with a vision model (cached per frame); cost estimates for the UI |
-| `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed, the output-cap and thin-answer guards, one log line and one record per answered chunk, the optional local cross-check) and `transcribe_local` (optionally batched, split back into sentences by word times); transcript rendering |
+| `transcribe.py` | Pipeline: `transcribe_openai` (chunked, checkpointed, the output-cap and thin-answer guards, one log line and one record per answered chunk, the local fill of the parts still incomplete, the optional local cross-check) and `transcribe_local` (optionally batched, split back into sentences by word times); transcript rendering |
 | `align.py` | The cross-check: aligns the API text with a local pass word by word (`difflib`), re-times paragraphs, finds the stretches the API answer lacks; pure functions |
 | `openai_api.py` | The OpenAI client (retry/timeout policy) and SDK errors → short app errors |
 | `checkpoints.py` | On-disk results of paid requests, keyed by content hash, so failed runs resume; the parts of a finished run kept in `data/runs/<row id>/`; also the age-based clean-ups of `temp/` and `uploads/` and the space they take; a locked marker file per run, so a run in another process (the command line) counts as one in progress |
@@ -75,7 +75,11 @@ upload (identified by file_id, saved to uploads/) — several at once form a que
           per minute than the run's median, is split and redone once; one line per
           answered chunk in data/logs/app.log and one record in the history row)
           OR  local (whole file at once)
-       → (Verify with local Whisper, if ticked: the same audio through the local
+       → (parts still thin, looped or capped after that, with the offline backend and
+          LOCAL_FILL on: those parts alone through local Whisper (medium), each
+          aligned with its own answer → what it lacked added as 🧩 paragraphs, its
+          ⚠️ line turned into a 🔍 line)
+       → (Verify with local Whisper, if ticked, instead: the same audio through the local
           engine, the two texts aligned word by word → paragraphs re-timed, missing
           stretches added as 🧩 paragraphs)
        → rendering: (M:SS) or (~M:SS) + paragraphs, on-screen notes placed by time,
@@ -228,6 +232,9 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   chunk sent again (~$0.03 for five minutes) and a marker the reader can check against
   the audio. Rejected: an absolute floor (silence is legitimate), and comparing against
   a local pass by default (minutes of CPU per run; it is the opt-in cross-check below).
+  A local pass over the parts still flagged after the split *is* the default since
+  2026-11-20 ("Parts still incomplete are filled…", below): it costs the time of those
+  parts, not of the recording.
 - **The first chunk is judged once the others are back, and sent again only if it holds
   sound** *(2026-11-15)*. The guard above compares a chunk with the chunks *before* it,
   so the first one was taken as it came — and that is where the losses were. The first
@@ -393,6 +400,74 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
     paragraphs re-timed to the line starts (0:13, 0:37, 1:18, 1:29 where the estimates
     said 0:18, 0:44, 1:15, 1:28), the missing line added at 0:49 (spoken at 0:49.8),
     99 % of API words matched, 13 s for the pass. Not yet on a real meeting (§5).
+- **Parts still incomplete are filled from local Whisper, those parts only, by
+  default** *(2026-11-20; the owner asked why a local check has to be started by hand
+  when the app already knows which parts are missing, and agreed to this)*. A
+  48-minute meeting that day (History row 240) came back with two halves still thin
+  after the split — 20:00–22:29 at 10 words/min and 25:05–27:34 at 4, against about
+  155 — and the owner's skill reran the whole recording with `--verify medium` (row
+  241), 35:39 of CPU for 48:25 of audio. Now, when an OpenAI run of a model without
+  times ends with parts still thin, looped or capped, `transcribe_openai` runs
+  `_fill_flagged` (given `fill` by `runs.fill_model`: `LOCAL_FILL` on, the offline
+  backend installed, no `--verify`):
+  - The local model is loaded only then, through `hooks.load_local_model` (the page's
+    cached loader and its download spinner); most runs need no local pass, and a first
+    use of `medium` downloads 1.5 GB. Each flagged part is cut from the audio the run
+    has already loaded (pydub, no ffmpeg, no second decode of a video) and passed to
+    `_local_entries`, which places it on the recording's timeline (`start_at`).
+  - **Each part is aligned with its own answer alone** (`align.cross_check` over that
+    part's paragraphs): an alignment of the whole transcript against a few local
+    stretches would shift every other paragraph by its nearest anchored neighbour's
+    drift. The part is rendered from it — its paragraphs with the recording's own times,
+    what it lacked as `🧩` paragraphs — and the rest of the transcript stays as it came,
+    `(~M:SS)`. The OpenAI text itself is never changed.
+  - **`medium` by default** (`DEFAULT_LOCAL_FILL_MODEL`): what the owner runs by hand
+    for exactly this, and better at Serbian than `base` or `small`; 0.74× the length
+    on the owner's CPU (row 241), so a 2:30 half in under two minutes. `LOCAL_FILL_MODEL`
+    changes it (a validator refuses a name that is not a local model), `LOCAL_FILL=false`
+    turns it off. **A `.env` setting, not a box on the page or a command option**, so the
+    page and the command line cannot behave differently; the page says it in a caption
+    under the verify box.
+  - **A filled part loses its `⚠️`** — the question the owner's session raised. The line
+    says "speech here may be missing", which stops being true once the words are there;
+    but the reader must still learn that the `🧩` text is the local model's wording and
+    why it is there. So a part where local Whisper added words gets one line instead:
+    `🔍 (25:05–27:34) This part came back with far fewer words than expected (4 a minute
+    of speech against about 160 in the rest). Local Whisper (medium) heard N words here
+    and added the M that the OpenAI answer lacked, marked 🧩.` A part where it added
+    nothing keeps its `⚠️`, with "Local Whisper (medium) heard N words here and found
+    nothing more." — a stretch with little speech can then be told from a loss. The same
+    now holds for `--verify`: a flagged part that one of its added stretches starts in is
+    marked filled. That is what left row 241's `⚠️` for 25:05–27:34 under the `🧩`
+    paragraphs that filled it. Its `⚠️` for 20:00–22:29 had not disappeared: in that
+    second run OpenAI answered the part whole, so it was never flagged (rows 240 and 241,
+    read-only, flags and counts only).
+  - *Record:* each checked part's record gets `local_check` (`model`, `local_words`,
+    `added_words`, or `error`), so `describe_flagged` leaves filled parts out of "Speech
+    may be missing…" and says "local Whisper (medium) heard N words there, nothing more"
+    for the others, in the notice and in History alike; the summary gets `filled`
+    (`model`, `seconds`, `parts`, `filled`, `added_words`, `failed`, `error`) for the note
+    under the result, History's entry and the cost caption; the transcript's first line
+    says it too (`🔍 Local Whisper (medium) checked the 2 part(s) that came back
+    incomplete from OpenAI: 1 filled with 264 words, marked 🧩; 1 still marked ⚠️.`).
+  - *Failure:* a model that cannot load, or a part it cannot transcribe, leaves that part
+    with its `⚠️` and adds a warning; the run is saved as usual. A Stop during the pass
+    (Streamlit's `StopException` is a `BaseException`, which the step does not catch)
+    leaves the parts saved, so Start resumes free and fills again.
+  - **Not covered: a loss the guard does not flag.** In row 241 the whole-recording check
+    added 461 words: 264 in 25:05–27:34, and 197 at 40:50–42:30, inside the part
+    40:03–45:05, which had come back with 108 words/min against about 155 — under two
+    thirds of the others, above the half that flags a part. A check of the flagged parts
+    alone would have added the 264 only (§5 P1).
+  - **A looped part is searched without its repeats.** The alignment adds local text
+    only where the answer has at most a third as many words, so a loop that stands
+    where the speech was passes for another wording of it. Seen in the day's live check
+    with real `medium` (journal 2026-11-20): a looped half, 195 words heard, none added. So for a
+    looped part, what is missing is looked for in its answer with every word of a
+    repeated eight-word window left out (`without_repeats`, the windows `repeat_share`
+    counts: a sentence written ten times is kept once); the answer is still written as
+    it came, re-timed by the full alignment. `--verify` still aligns a loop as it came
+    (it did fill the loop of 2026-11-19, where the speech before the loop matched).
 - **Chunks are cut in pauses, and tiny tails are merged** — each boundary moves to the
   quietest 250 ms window within ±10 s of the nominal cut, so shorter chunks do not
   mean more words cut in half; a final chunk under 10 s joins the previous one. The
@@ -1536,6 +1611,11 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
   run re-times every paragraph of a gpt-4o-transcribe transcript to the recording's own
   time and adds the stretches the API answer lacked, marked `🧩`, with the figures in the
   transcript's first line, under the result and in History
+- **Parts still incomplete are filled by themselves** *(2026-11-20)*: after an OpenAI
+  run, a part still thin, looped or capped is transcribed by local Whisper (`medium`),
+  that part only, and what its answer lacked is added, marked `🧩`; its `⚠️` becomes a
+  `🔍` line, and the notice, History and the transcript's first line say what was
+  filled (`LOCAL_FILL`, `LOCAL_FILL_MODEL`; needs the offline backend)
 - **Original script kept by default**; Serbian → Latin is opt-in (`SERBIAN_LATIN=true`)
   *(2026-09-25)*; one-off backfill script for saved records
 - **Playable previews** for AMR/WMA/AIFF, video and large files; fast History at 100+
@@ -1558,7 +1638,7 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 **Quality / infrastructure**
 - Modular refactor (config/audio/transcribe/align/db/exceptions/logger), type hints + docstrings
 - **ruff: 0 errors** (down from 74), `ruff format` clean; modern ruff config (`[tool.ruff.lint]`, `target-version=py312`, plus D/RUF/PTH/T20/S)
-- **pytest: 499 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
+- **pytest: 522 tests** (DB CRUD + PRAGMAs + schema migration + preferences, AI titles and their script check, recordings from a folder, the picture of the sound and the slider that leaves part of a recording out, SRT/formatting helpers, frame selection and dedup, count/cost estimates, `.env` overrides, the OpenAI pipeline and vision step against fake clients and a fake network, the thin-chunk guard, the per-chunk log lines and records, the kept parts, the log file, the cross-check on synthetic transcripts, checkpoints, transliteration, the backfill, the upload queue and its count, batched local decoding, the questions before a delete, headless UI flows with AppTest) — no network, no ffmpeg; the regression tests were each checked to fail with their bug put back
 - **CI** (GitHub Actions): ruff + format check + pytest on Python 3.12 and 3.13 (`uv sync --locked`), plus a job with the offline engine installed
 - **Makefile**: `run` / `sync` (keeps the offline engine) / `sync-local` / `lint` / `format` / `test` / `check` / `clean` / `reset`
 - **Localhost-only by default** (`.streamlit/config.toml`, compose `127.0.0.1`), usage statistics off *(2026-09-25)*
@@ -1773,6 +1853,15 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       Their recordings are still in the project's `Meeting` folder. Running them again
       now recovers the start (about $0.13 and $0.10 for the two shorter ones, $0.26 for
       the long one); row 222 is the stand-up's first, incomplete run and 223 its verified one.
+- [ ] **A part that loses a stretch without falling to half the others' rate is not
+      flagged, so nothing fills it** (found 2026-11-20, rows 240–241). Part 40:03–45:05
+      of a 48-minute meeting came back with 108 words/min against about 155 and had lost
+      197 words at 40:50–42:30, which only the whole-recording `--verify` found; the
+      automatic local fill (§3, "Parts still incomplete…") takes flagged parts only.
+      Option, free since no request is sent again: let the local fill (not the paid
+      resend) also take parts under about two thirds of the median. First, read-only:
+      how many saved parts fall between a half and two thirds, and in the rows with
+      `verified`, how often a stretch was added inside such a part. The owner decides.
 - [ ] **A short last part can lose its closing sentence, and no guard sees it** (found
       2026-11-15, one observation, synthetic English speech). A 2:09 recording cut into
       one-minute parts ended with a 13 s part (1:55–2:08). `gpt-4o-transcribe` answered
@@ -1964,6 +2053,47 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-20 — Parts still incomplete are filled from local Whisper by themselves
+
+*Personal laptop, in a session of its own (worktree `verify-thin-parts-c5a798`).* The
+owner asked why a local check has to be started by hand when the app already knows which
+parts are missing, and agreed to the change. That morning a 48-minute meeting had come back
+with two halves still thin (row 240), and the personal skill reran the whole recording with
+`--verify medium` (row 241, 35:39 of CPU).
+
+Built (§3 Transcription, "Parts still incomplete are filled…"): `_fill_flagged` in
+`transcribe.py` runs local Whisper over the parts still thin, looped or capped, each
+aligned with its own answer; `runs.fill_model` decides for the page and the command line
+alike (`LOCAL_FILL`, `LOCAL_FILL_MODEL`, the backend, not with `--verify`); `local_check` on
+each checked part's record and `filled` in the summary feed the notice, History, the cost
+caption and the transcript's first line; a filled part's `⚠️` becomes a `🔍` line, in
+`--verify` runs too; a caption on the page says the check exists. README, `.env.example`
+and the repo's skill (step 4) describe it.
+
+Looked at read-only in History (flags, times and word counts only): row 241's `⚠️` for
+20:00–22:29 had not disappeared — OpenAI answered that part whole the second time — and of
+the 461 words its check added, 197 were in a part the guard never flagged (108 words/min
+against about 155; §5 P1, the owner decides).
+
+A trap for live checks from a worktree: `config`'s `load_dotenv(override=True)` looks for
+`.env` from `config.py`'s folder upwards, and a worktree under `.claude/worktrees/` finds the
+main clone's — its key, and any `DATA_DIR` in it would override a scratch one. So the code
+was copied to a scratch folder with no `.env` above it and run from there (the tests are
+safe: `conftest.py` sets the environment after that load and turns `env_file` off).
+
+Checked live with the real `medium` model, scratch folders, no request to OpenAI: a 9:06
+recording of synthetic speech (Windows TTS, 60 numbered sentences), 3-minute parts, a fake
+OpenAI on localhost that answered part 2 and its halves with three words and part 3 and its
+halves with one sentence twenty times. A first run, before the loop fix, showed the looped
+halves heard (195 words) and nothing added; with `without_repeats` all four halves were
+filled: 195 + 194 + 194 + 206 words, each at its sentence's own time, 5:02 for 6:05 of
+audio (with the test suite running beside it), one info notice, no warning. Seen there and
+left as it is: the 🧩 text of a looped part sits among the loop's repeats, which keep their
+estimated times. Gate: 522 tests pass (also without ffmpeg), ruff clean; three mutations
+(a filled part keeping its `⚠️`, the warning naming a filled part, the loop branch removed)
+each failed the new tests. Not committed (the owner says when). Open: the owner's personal
+skill, in another repo, still says to rerun with `--verify medium` when speech is missing.
 
 ### 2026-11-19 — Looped answers are sent again; two more OpenAI models
 

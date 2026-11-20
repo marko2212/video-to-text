@@ -82,6 +82,27 @@ def test_progress_goes_to_standard_error_and_the_answer_is_one_object(
     assert json.loads(captured.out)["status"] == "done"
 
 
+@pytest.mark.parametrize(
+    ("installed", "argv", "fill"),
+    [
+        (True, [], config.DEFAULT_LOCAL_FILL_MODEL),
+        (False, [], None),
+        (True, ["--verify"], None),
+    ],
+)
+def test_incomplete_parts_are_filled_locally_as_on_the_page(
+    capsys, recording, engine, monkeypatch, installed, argv, fill
+):
+    monkeypatch.setattr(cli, "_local_installed", lambda: installed)
+    monkeypatch.setattr(runs, "load_local_model", lambda name: f"model:{name}")
+
+    code, _ = _call(capsys, "transcribe", str(recording), *argv)
+
+    assert code == cli.EXIT_DONE
+    offered = engine[-1]["fill"]
+    assert (offered and offered[1]) == fill
+
+
 def test_a_recording_with_a_transcript_is_left_alone(capsys, recording, engine):
     target = runs.sibling_transcript(recording)
     target.write_text("Corrected by hand.", encoding="utf-8")

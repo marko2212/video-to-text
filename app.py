@@ -1890,6 +1890,13 @@ def _render_verify_option(disabled: bool) -> str | None:
         ),
     )
     if not wanted:
+        filler = runs.fill_model(LOCAL_AVAILABLE)
+        if filler:
+            st.caption(
+                ":material/healing: A part that still comes back incomplete after "
+                f"being sent again is filled by local Whisper ({filler}) — that "
+                "part only, free, marked 🧩."
+            )
         return None
     return st.selectbox(
         "Local Whisper model for the check",
@@ -2509,18 +2516,23 @@ def _history_checks(record: Any) -> tuple[str | None, str | None]:
     Returns:
         A warning naming the parts that may have lost speech (``None`` when
         none was flagged, or the row predates the records), and a note on the
-        cross-check against a local pass (``None`` when there was none).
+        cross-check against a local pass, or on what local Whisper filled in
+        (``None`` when there was neither).
     """
     try:
         details = json.loads(record["usage_json"] or "{}")
     except ValueError:
         return None, None
     transcription = details.get("transcription") or {}
-    flagged = transcribe.describe_flagged(transcription.get("chunks") or [])
+    chunks = transcription.get("chunks") or []
+    flagged = transcribe.describe_flagged(chunks)
     verified = transcription.get("verified")
+    filled = transcription.get("filled")
     checked = None
     if verified and not verified.get("error"):
         checked = _describe_verified(verified)
+    elif filled:
+        checked = runs.describe_filled(filled, chunks)
     return flagged, checked
 
 

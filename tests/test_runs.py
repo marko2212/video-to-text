@@ -320,3 +320,136 @@ def test_the_saved_parts_are_counted_not_promised(tmp_path, engine):
         request.audio_path, request.model, 3, retry="press Start", retry_verb="Start"
     )
     assert some.startswith("1 of 3 part(s) are saved — press Start to transcribe")
+
+
+# --- the parts an OpenAI run leaves incomplete, filled by local Whisper ------------
+
+
+def test_the_local_fill_is_on_with_the_backend_and_off_with_a_whole_check(
+    monkeypatch,
+):
+    from pydantic import ValidationError
+
+    assert runs.fill_model(local_available=True) == "medium"
+    assert runs.fill_model(local_available=False) is None
+    # A check of the whole recording fills those parts already.
+    assert runs.fill_model(local_available=True, verify="base") is None
+
+    monkeypatch.setenv("LOCAL_FILL_MODEL", "small")
+    config.get_settings.cache_clear()
+    assert runs.fill_model(local_available=True) == "small"
+
+    monkeypatch.setenv("LOCAL_FILL", "false")
+    config.get_settings.cache_clear()
+    assert runs.fill_model(local_available=True) is None
+
+    monkeypatch.setenv("LOCAL_FILL_MODEL", "huge")
+    config.get_settings.cache_clear()
+    with pytest.raises(ValidationError, match="LOCAL_FILL_MODEL must be one of"):
+        config.get_settings()
+
+
+def test_the_pipeline_gets_the_local_model_to_load_only_when_needed(
+    tmp_path, monkeypatch
+):
+    offered = []
+
+    def fake(input_file, output_file, api_key, **kwargs):
+        offered.append(kwargs["fill"])
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+        return dict(_SPENT)
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", fake)
+    db.init_db()
+    loaded = []
+    hooks = runs.RunHooks(
+        load_local_model=lambda name: loaded.append(name) or f"model:{name}"
+    )
+
+    runs.run(_request(tmp_path, local_available=True), _sink(), hooks)
+
+    load, name = offered[-1]
+    assert name == config.DEFAULT_LOCAL_FILL_MODEL
+    assert loaded == []  # not before the pipeline asks for it
+    assert load() == "model:medium"
+
+    runs.run(_request(tmp_path, local_available=False), _sink(), hooks)
+    runs.run(_request(tmp_path, local_available=True, verify="base"), _sink(), hooks)
+    assert offered[1:] == [None, None]
+
+
+def _checked(part, start, end, rate, **check):
+    return {
+        "index": int(part[:3]),
+        "part": part,
+        "start": start,
+        "end": end,
+        "words_per_min": rate,
+        "typical_words_per_min": 160,
+        "thin": True,
+        "capped": False,
+        "local_check": {"model": "medium", **check},
+    }
+
+
+def test_the_notices_say_what_local_whisper_filled_and_what_still_lacks_speech():
+    chunks = [
+        _checked("004a", 1200.5, 1349.1, 9.5, local_words=330, added_words=312),
+        _checked("005a", 1505.4, 1654.6, 3.6, local_words=12, added_words=0),
+    ]
+    filled = {
+        "model": "medium",
+        "seconds": 192.0,
+        "parts": 2,
+        "filled": 1,
+        "added_words": 312,
+        "failed": 0,
+    }
+
+    notices = runs.run_warnings({"chunks": chunks, "filled": filled})
+
+    assert notices == [
+        (
+            "warning",
+            "Speech may be missing in 1 part(s) — 25:05–27:34 (4 words/min against "
+            "about 160, local Whisper (medium) heard 12 words there, nothing more). "
+            "The transcript marks them ⚠️.",
+        ),
+        (
+            "info",
+            "Local Whisper (medium) filled 1 of 2 part(s) that came back incomplete "
+            "from OpenAI, in 3:12: 20:00–22:29 (312 words), marked 🧩.",
+        ),
+    ]
+    cost = runs.run_cost(config.PROVIDER_OPENAI, {**_SPENT, "filled": filled}, [])
+    assert "2 incomplete part(s) checked with local Whisper (medium, free)" in (
+        runs.describe_cost(cost)
+    )
+
+
+def test_a_local_check_that_could_not_run_is_a_warning_and_the_marks_stay():
+    error = {"error": "no space left for the model"}
+    chunks = [
+        _checked("004a", 1200.5, 1349.1, 9.5, **error),
+        _checked("005a", 1505.4, 1654.6, 3.6, **error),
+    ]
+    filled = {
+        "model": "medium",
+        "seconds": 0.4,
+        "parts": 2,
+        "filled": 0,
+        "added_words": 0,
+        "failed": 2,
+        "error": "no space left for the model",
+    }
+
+    notices = runs.run_warnings({"chunks": chunks, "filled": filled})
+
+    assert [level for level, _ in notices] == ["warning", "warning"]
+    assert notices[0][1].startswith("Speech may be missing in 2 part(s) — ")
+    assert notices[1][1] == (
+        "Local Whisper (medium) could not check 2 of the 2 part(s) that came back "
+        "incomplete: no space left for the model They stay marked ⚠️."
+    )
+    cost = runs.run_cost(config.PROVIDER_OPENAI, {**_SPENT, "filled": filled}, [])
+    assert "local Whisper" not in runs.describe_cost(cost)

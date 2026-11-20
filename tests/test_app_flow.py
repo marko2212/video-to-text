@@ -1190,6 +1190,54 @@ def test_a_checked_run_says_what_the_local_pass_did(monkeypatch):
     )
 
 
+def test_parts_local_whisper_filled_are_not_warned_about_and_history_says_so(
+    monkeypatch,
+):
+    def filled(input_file, output_file, api_key, **kwargs):
+        Path(output_file).write_text("Transcript.", encoding="utf-8")
+        summary = _flagged_summary()
+        summary["chunks"][0]["local_check"] = {
+            "model": "medium",
+            "local_words": 330,
+            "added_words": 312,
+        }
+        summary["filled"] = {
+            "model": "medium",
+            "seconds": 192.0,
+            "parts": 1,
+            "filled": 1,
+            "added_words": 312,
+            "failed": 0,
+        }
+        return summary
+
+    monkeypatch.setattr(transcribe, "transcribe_openai", filled)
+    test = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    _upload(test, "talk.wav", b"talk audio")
+    _start(test)
+
+    note = (
+        "Local Whisper (medium) filled 1 of 1 part(s) that came back incomplete "
+        "from OpenAI, in 3:12: 0:00–5:00 (312 words), marked 🧩."
+    )
+    assert not test.warning
+    assert [i.value for i in test.info] == [note]
+    assert any(
+        "1 incomplete part(s) checked with local Whisper (medium, free)" in c.value
+        for c in test.caption
+    )
+
+    from streamlit.proto.WidgetStates_pb2 import WidgetState
+
+    fresh = AppTest.from_string(_APP, default_timeout=_TIMEOUT).run()
+    [entry] = fresh.expander
+    states = fresh._tree.get_widget_states()
+    states.widgets.append(WidgetState(id=entry.proto.id, bool_value=True))
+    fresh._run(states)
+    assert not fresh.warning
+    assert any(c.value == f":material/fact_check: {note}" for c in fresh.caption)
+
+
 def test_a_failed_check_is_a_warning_not_a_failed_run(monkeypatch):
     def unchecked(input_file, output_file, api_key, **kwargs):
         Path(output_file).write_text("Transcript.", encoding="utf-8")
@@ -1264,6 +1312,25 @@ def test_the_check_is_offered_for_untimed_openai_runs_when_the_backend_is_there(
     [chooser] = [s for s in test.selectbox if s.key == "verify_model"]
     assert chooser.value == config.DEFAULT_VERIFY_MODEL
     assert test.session_state.result[3] == config.DEFAULT_VERIFY_MODEL
+
+
+def _fill_caption(test: AppTest) -> list[str]:
+    return [c.value for c in test.caption if "filled by local Whisper" in c.value]
+
+
+def test_the_page_says_that_incomplete_parts_are_filled_locally(monkeypatch):
+    monkeypatch.setattr(app, "LOCAL_AVAILABLE", True)
+    test = AppTest.from_string(_ENGINE_SCRIPT).run()
+    [caption] = _fill_caption(test)
+    assert "filled by local Whisper (medium) — that part only" in caption
+
+    # Not with the whole recording checked, nor with the setting off.
+    verify = next(b for b in test.checkbox if b.label == "Verify with local Whisper")
+    verify.set_value(True).run()
+    assert not _fill_caption(test)
+    monkeypatch.setenv("LOCAL_FILL", "false")
+    config.get_settings.cache_clear()
+    assert not _fill_caption(AppTest.from_string(_ENGINE_SCRIPT).run())
 
 
 def test_the_check_is_not_offered_without_the_backend_or_for_timed_models(

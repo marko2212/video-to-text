@@ -96,6 +96,8 @@ _SPAN_MARKER = "⏭️"
 # lacked speech, and of the header line that says the transcript was checked.
 _LOCAL_FILL_MARKER = "🧩"
 _VERIFIED_MARKER = "🔍"
+# Why a part whose answer ended at the output cap is marked.
+_CAPPED_REASON = "The model stopped writing at its length limit here"
 # A stretch shorter than this is nothing to transcribe.
 _MIN_SPAN_MS = 1000
 # How much of the start and of the end of an incomplete answer the log quotes.
@@ -182,11 +184,18 @@ def format_thin_marker(
     Returns:
         A line that cannot be mistaken for speech.
     """
+    return (
+        f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) "
+        f"{_thin_reason(rate, typical)}, so speech here may be missing."
+    )
+
+
+def _thin_reason(rate: float, typical: float | None) -> str:
+    """Say why a part was judged thin (the start of its marker line)."""
     against = f" against about {typical:.0f} in the rest" if typical else ""
     return (
-        f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) This "
-        f"part came back with far fewer words than expected ({rate:.0f} a "
-        f"minute of speech{against}), so speech here may be missing."
+        "This part came back with far fewer words than expected "
+        f"({rate:.0f} a minute of speech{against})"
     )
 
 
@@ -202,9 +211,16 @@ def format_looped_marker(start: float, end: float, share: float) -> str:
         A line that cannot be mistaken for speech.
     """
     return (
-        f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) The "
-        f"model repeated itself here ({share:.0%} of this part repeats earlier "
-        "text), so speech here may be missing."
+        f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) "
+        f"{_looped_reason(share)}, so speech here may be missing."
+    )
+
+
+def _looped_reason(share: float) -> str:
+    """Say why a part was judged looped (the start of its marker line)."""
+    return (
+        f"The model repeated itself here ({share:.0%} of this part repeats "
+        "earlier text)"
     )
 
 
@@ -218,42 +234,145 @@ def format_capped_marker(end: float) -> str:
         A line that cannot be mistaken for speech.
     """
     return (
-        f"{_MISSING_MARKER} (~{_format_clock(end)}) The model stopped writing "
-        "at its length limit here, so the end of this part may be missing."
+        f"{_MISSING_MARKER} (~{_format_clock(end)}) {_CAPPED_REASON}, so the "
+        "end of this part may be missing."
     )
 
 
-def _flag_lines(piece: dict[str, Any]) -> list[str]:
-    """Return the marker lines a piece carries (output cap, thin answer).
+def format_filled_marker(
+    start: float, end: float, reasons: list[str], check: dict[str, Any]
+) -> str:
+    """Render the line that marks a flagged part local Whisper filled in.
+
+    It takes the place of the part's ``⚠️`` lines: the speech is no longer
+    missing, but the reader should know that the ``🧩`` paragraphs are the
+    local model's wording, and why they are there.
+
+    Args:
+        start: Where the part begins (seconds).
+        end: Where it ends (seconds).
+        reasons: Why the part was flagged, one sentence per flag.
+        check: The part's ``local_check`` (``model``, ``local_words``,
+            ``added_words``).
+
+    Returns:
+        A line that cannot be mistaken for speech.
+    """
+    return (
+        f"{_VERIFIED_MARKER} ({_format_clock(start)}–{_format_clock(end)}) "
+        f"{'. '.join(reasons)}. Local Whisper ({check['model']}) heard "
+        f"{check['local_words']} words here and added the {check['added_words']} "
+        f"that the OpenAI answer lacked, marked {_LOCAL_FILL_MARKER}."
+    )
+
+
+def _flags(piece: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return each flag of a piece as its ``⚠️`` line and its reason.
 
     Args:
         piece: A transcribed piece with ``start`` and ``duration``.
 
     Returns:
-        Zero, one or two lines, to go right after the piece's text.
+        ``(marker line, reason)`` for the output cap, a thin and a looped
+        answer, in that order — none for a piece that came back whole.
     """
     end = piece["start"] + piece["duration"]
-    lines = []
+    record = piece.get("record") or {}
+    flags = []
     if piece.get("capped"):
-        lines.append(format_capped_marker(end))
+        flags.append((format_capped_marker(end), _CAPPED_REASON))
     if piece.get("thin"):
-        record = piece.get("record") or {}
-        lines.append(
-            format_thin_marker(
-                piece["start"],
-                end,
-                record.get("words_per_min", 0.0),
-                record.get("typical_words_per_min"),
+        rate = record.get("words_per_min", 0.0)
+        typical = record.get("typical_words_per_min")
+        flags.append(
+            (
+                format_thin_marker(piece["start"], end, rate, typical),
+                _thin_reason(rate, typical),
             )
         )
     if piece.get("looped"):
-        record = piece.get("record") or {}
-        lines.append(
-            format_looped_marker(
-                piece["start"], end, record.get("repeat_share", LOOP_REPEAT_SHARE)
-            )
+        share = record.get("repeat_share", LOOP_REPEAT_SHARE)
+        flags.append(
+            (format_looped_marker(piece["start"], end, share), _looped_reason(share))
         )
-    return lines
+    return flags
+
+
+def _flag_lines(piece: dict[str, Any]) -> list[str]:
+    """Return the marker lines a piece carries (output cap, thin, looped).
+
+    A flagged part that local Whisper filled in (its ``local_check`` added
+    words) gets one ``🔍`` line instead of its ``⚠️`` ones; one where it heard
+    nothing more keeps them, with what it heard.
+
+    Args:
+        piece: A transcribed piece with ``start`` and ``duration``.
+
+    Returns:
+        Zero or more lines, to go right after the piece's text.
+    """
+    flags = _flags(piece)
+    check = piece.get("local_check") or {}
+    if not flags or "added_words" not in check:
+        return [line for line, _ in flags]
+    if check["added_words"]:
+        end = piece["start"] + piece["duration"]
+        reasons = [reason for _, reason in flags]
+        return [format_filled_marker(piece["start"], end, reasons, check)]
+    heard = (
+        f" Local Whisper ({check['model']}) heard {check['local_words']} words "
+        "here and found nothing more."
+    )
+    return [line + heard for line, _ in flags]
+
+
+def format_fill_note(checks: list[dict[str, Any]]) -> str | None:
+    """Render the header line of a transcript whose flagged parts were checked.
+
+    Args:
+        checks: The ``local_check`` of every part local Whisper was run over.
+
+    Returns:
+        One line for the top of the transcript, or ``None`` when no part
+        could be checked (the notices say why).
+    """
+    done = [check for check in checks if "added_words" in check]
+    if not done:
+        return None
+    filled = [check for check in done if check["added_words"]]
+    left = len(checks) - len(filled)
+    found = []
+    if filled:
+        words = sum(check["added_words"] for check in filled)
+        found.append(
+            f"{len(filled)} filled with {words} words, marked {_LOCAL_FILL_MARKER}"
+        )
+    if left:
+        found.append(f"{left} still marked {_MISSING_MARKER}")
+    return (
+        f"{_VERIFIED_MARKER} Local Whisper ({done[0]['model']}) checked the "
+        f"{len(checks)} part(s) that came back incomplete from OpenAI: "
+        f"{'; '.join(found)}."
+    )
+
+
+def _item_line(item: dict[str, Any]) -> str:
+    """Render one item of :func:`align.merge` as a transcript line.
+
+    Args:
+        item: A re-timed API paragraph (``exact`` or not) or a ``gap``
+            paragraph of local text.
+
+    Returns:
+        ``(M:SS)`` for a paragraph with the recording's own time, ``(~M:SS)``
+        for one that keeps an estimate, ``🧩 (M:SS)`` for local text.
+    """
+    stamp = _format_clock(item["start"])
+    if item["kind"] == "gap":
+        return f"{_LOCAL_FILL_MARKER} ({stamp}) {item['text']}"
+    if item["exact"]:
+        return f"({stamp}) {item['text']}"
+    return f"(~{stamp}) {item['text']}"
 
 
 def format_verify_note(stats: dict[str, Any]) -> str:
@@ -423,8 +542,14 @@ def build_untimed_transcript(
     assumes an even speaking rate — which is enough to place on-screen notes
     next to the speech they accompany instead of in a block at the end.
 
+    A part that local Whisper was run over (:func:`_fill_flagged`) is written
+    as that check aligned it: its paragraphs with the recording's own times,
+    and what the answer lacked added as ``🧩`` paragraphs; the first line then
+    says what the check did (:func:`format_fill_note`).
+
     Args:
-        pieces: Chunks with ``start`` and ``duration`` (seconds) and ``text``.
+        pieces: Chunks with ``start`` and ``duration`` (seconds) and ``text``,
+            and ``local_check`` on a part local Whisper was run over.
         visual_notes: Optional on-screen notes with ``time`` and ``description``.
         missing: ``(start, end, reason)`` of an untranscribed tail, if any.
 
@@ -433,15 +558,28 @@ def build_untimed_transcript(
     """
     notes = sorted(visual_notes or [], key=lambda note: note["time"])
     lines: list[str] = []
+    header = format_fill_note(
+        [piece["local_check"] for piece in pieces if "local_check" in piece]
+    )
+    if header:
+        lines.append(header)
 
     def notes_until(limit: float) -> None:
         while notes and notes[0]["time"] <= limit:
             lines.append(format_visual_note(notes.pop(0)))
 
     for index, piece in enumerate(pieces):
-        for paragraph in _untimed_paragraphs([piece], index):
-            notes_until(paragraph["start"])
-            lines.append(f"(~{_format_clock(paragraph['start'])}) {paragraph['text']}")
+        check = piece.get("local_check") or {}
+        if "added" in check:
+            for item in align.merge(check["paragraphs"], check["added"]):
+                notes_until(item["start"])
+                lines.append(_item_line(item))
+        else:
+            for paragraph in _untimed_paragraphs([piece], index):
+                notes_until(paragraph["start"])
+                lines.append(
+                    f"(~{_format_clock(paragraph['start'])}) {paragraph['text']}"
+                )
         lines += _flag_lines(piece)
 
     if missing:
@@ -497,7 +635,8 @@ def build_verified_transcript(
     neighbour and still marked ``(~M:SS)``; and a stretch the local pass has
     but the API answer lacks is added where it belongs, marked as the local
     pass's text. The chunk markers (output cap, thin answer) and the on-screen
-    notes are placed by time among them.
+    notes are placed by time among them; a flagged part that the added text
+    falls in is marked as filled rather than as missing speech.
 
     Args:
         pieces: Chunks with ``start`` and ``duration`` (seconds) and ``text``.
@@ -508,14 +647,24 @@ def build_verified_transcript(
 
     Returns:
         The transcript as blank-line separated paragraphs, and the
-        cross-check's figures (``model`` added).
+        cross-check's figures (``model`` added), with ``parts``: the
+        ``local_check`` of each flagged part, by its index in ``pieces``.
     """
     paragraphs = _untimed_paragraphs(pieces)
     checked = align.cross_check(paragraphs, entries)
-    stats = {"model": model, **checked["stats"]}
+    stats: dict[str, Any] = {"model": model, **checked["stats"], "parts": {}}
     notes = [dict(note) for note in visual_notes or []]
-    for piece in pieces:
-        end = piece["start"] + piece["duration"]
+    for index, piece in enumerate(pieces):
+        start, end = piece["start"], piece["start"] + piece["duration"]
+        if _incomplete(piece):
+            within = [g for g in checked["gaps"] if start <= g["start"] < end]
+            heard = [e for e in entries if start <= e["start"] < end]
+            stats["parts"][index] = {
+                "model": model,
+                "local_words": sum(len(align.normalise(e["text"])) for e in heard),
+                "added_words": sum(gap["words"] for gap in within),
+            }
+            piece = {**piece, "local_check": stats["parts"][index]}
         notes += [{"time": end, "line": line} for line in _flag_lines(piece)]
     notes.sort(key=lambda note: note["time"])
 
@@ -527,13 +676,7 @@ def build_verified_transcript(
 
     for item in align.merge(checked["paragraphs"], checked["gaps"]):
         notes_until(item["start"])
-        stamp = _format_clock(item["start"])
-        if item["kind"] == "gap":
-            lines.append(f"{_LOCAL_FILL_MARKER} ({stamp}) {item['text']}")
-        elif item["exact"]:
-            lines.append(f"({stamp}) {item['text']}")
-        else:
-            lines.append(f"(~{stamp}) {item['text']}")
+        lines.append(_item_line(item))
     lines += [format_visual_note(note) for note in notes]
     return "\n\n".join(lines), stats
 
@@ -1040,6 +1183,35 @@ def is_looped(text: str) -> bool:
     return repeat_share(text) >= LOOP_REPEAT_SHARE
 
 
+def without_repeats(text: str, size: int = LOOP_NGRAM_WORDS) -> str:
+    """Return a text's words with every stretch that repeats an earlier one left out.
+
+    A word is left out when it lies in a ``size``-word window that already
+    appeared in the text — the windows :func:`repeat_share` counts — so a
+    sentence written ten times is kept once.
+
+    Args:
+        text: The transcribed text.
+        size: Words per window.
+
+    Returns:
+        The words kept, lower-cased, without punctuation (for an alignment,
+        not for reading).
+    """
+    words = [word.lower() for word in _LOOP_WORD.findall(text)]
+    repeated = [False] * len(words)
+    seen: set[tuple[str, ...]] = set()
+    for at in range(len(words) - size + 1):
+        window = tuple(words[at : at + size])
+        if window in seen:
+            repeated[at : at + size] = [True] * size
+        else:
+            seen.add(window)
+    return " ".join(
+        word for word, again in zip(words, repeated, strict=True) if not again
+    )
+
+
 def _incomplete(record: dict[str, Any]) -> bool:
     """Tell whether an answer's record says speech may be missing from it.
 
@@ -1202,11 +1374,17 @@ def chunk_records(pieces: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Returns:
         One record per piece, in order, each with an ``index`` (the chunk's
-        number in the plan). A piece saved before records existed gets one
-        made from its text and usage, without a request id.
+        number in the plan), and for a part local Whisper checked, its
+        ``local_check`` (``model``, ``local_words``, ``added_words``, or
+        ``error``). A piece saved before records existed gets one made from its
+        text and usage, without a request id.
     """
     records = []
     for position, piece in enumerate(pieces):
+        check = piece.get("local_check")
+        if check is not None:
+            figures = ("model", "local_words", "added_words", "error")
+            check = {key: check[key] for key in figures if key in check}
         record = piece.get("record")
         if record is None:
             text = str(piece["text"])
@@ -1228,21 +1406,31 @@ def chunk_records(pieces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         part = record.get("part") or ""
         digits = part[:3] if part[:3].isdigit() else ""
         records.append({"index": int(digits) if digits else position, **record})
+        if check is not None:
+            records[-1]["local_check"] = check
     return records
+
+
+def _filled(record: dict[str, Any]) -> bool:
+    """Tell whether local Whisper added what a flagged part's answer lacked."""
+    return bool((record.get("local_check") or {}).get("added_words"))
 
 
 def describe_flagged(chunks: list[dict[str, Any]]) -> str | None:
     """Phrase which parts of a run may have lost speech, for a warning.
 
+    A flagged part that local Whisper filled in is not named; one it checked
+    and found nothing more in says so.
+
     Args:
         chunks: Records from :func:`chunk_records` (as saved with the row).
 
     Returns:
-        One sentence naming each flagged part, or ``None`` when none is.
+        One sentence naming each part still flagged, or ``None`` when none is.
     """
     phrases = []
     for record in chunks:
-        if not _incomplete(record):
+        if not _incomplete(record) or _filled(record):
             continue
         where = f"{_format_clock(record['start'])}–{_format_clock(record['end'])}"
         why = []
@@ -1254,6 +1442,12 @@ def describe_flagged(chunks: list[dict[str, Any]]) -> str | None:
             why.append("stopped at the output cap")
         if record.get("looped"):
             why.append(f"{record.get('repeat_share', 0):.0%} repeated text")
+        check = record.get("local_check") or {}
+        if "added_words" in check:
+            why.append(
+                f"local Whisper ({check['model']}) heard {check['local_words']} "
+                "words there, nothing more"
+            )
         phrases.append(f"{where} ({', '.join(why)})")
     if not phrases:
         return None
@@ -2245,6 +2439,143 @@ def _reusable_chunks(
     )
 
 
+def _fill_flagged(
+    audio: AudioSegment,
+    pieces: list[dict[str, Any]],
+    fill: tuple[Callable[[], Any], str],
+    temp_folder: Path,
+    progress_callback: ProgressCallback | None,
+    batched: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Run local Whisper over the parts still marked incomplete, and only those.
+
+    Each flagged part — thin, looped or at the output cap after being sent
+    again in halves — is cut out of the recording and transcribed locally, and
+    its answer is aligned with that pass (:func:`align.cross_check`): its
+    paragraphs take the recording's own times, and a stretch the answer lacked
+    comes back as ``🧩`` paragraphs. For a looped part, what is missing is
+    looked for in its answer without the repeats (:func:`without_repeats`):
+    with them, the local text would pass for another wording of the loop. The
+    rest of the recording is not touched, so it costs the time of those parts
+    instead of the whole recording's.
+
+    Args:
+        audio: The decoded recording (mono 16 kHz).
+        pieces: The run's pieces.
+        fill: Returns the loaded local model (called only if a part is
+            flagged), and the model's name.
+        temp_folder: The run's scratch folder, for the parts cut out.
+        progress_callback: Optional callback receiving status payloads.
+        batched: Decode the local pass in batches (:func:`_local_entries`).
+
+    Returns:
+        The pieces, each flagged one with ``local_check``: ``model``, the
+        words local Whisper heard there (``local_words``) and the words added
+        (``added_words``), with the aligned ``paragraphs`` and ``added``
+        paragraphs to render — or ``model`` and ``error``. And the check's
+        figures for the run's summary (``model``, ``seconds``, ``parts``,
+        ``filled``, ``added_words``, ``failed`` and the first ``error``), or
+        ``None`` when no part was flagged.
+    """
+    flagged = [index for index, piece in enumerate(pieces) if _incomplete(piece)]
+    if not flagged:
+        return pieces, None
+    load, name = fill
+    started = time.monotonic()
+    _report(
+        progress_callback,
+        status="info",
+        message=(
+            f"{len(flagged)} part(s) may still lack speech — checking just "
+            f"those with local Whisper ({name})…"
+        ),
+    )
+    checked = list(pieces)
+    model: Any = None
+    failure: str | None = None
+    try:
+        model = load()
+    except Exception as exc:
+        # The paid transcript is written as it is: the check is a bonus.
+        logger.exception("Local %s for the incomplete parts could not be loaded", name)
+        failure = str(exc) or type(exc).__name__
+    for number, index in enumerate(flagged, start=1):
+        piece = pieces[index]
+        start, end = piece["start"], piece["start"] + piece["duration"]
+        where = f"{_format_clock(start)}–{_format_clock(end)}"
+        if failure is not None:
+            checked[index] = {**piece, "local_check": {"model": name, "error": failure}}
+            continue
+        wav = temp_folder / f"local_{index:03d}.wav"
+        try:
+            audio[round(start * 1000) : round(end * 1000)].export(wav, format="wav")
+            entries, _ = _local_entries(
+                wav,
+                model,
+                None,
+                progress_callback,
+                f"Checking {where} ({number} of {len(flagged)}) with local "
+                f"Whisper ({name})",
+                model_name=name,
+                batched=batched,
+                start_at=start,
+            )
+            result = align.cross_check(_untimed_paragraphs([piece], index), entries)
+            found = result
+            if piece.get("looped"):
+                # A loop's repeats stand where the lost speech was: aligned with
+                # them, the local text reads as another wording of them and is
+                # not added. What is missing is found without them; the answer
+                # is still written as it came, re-timed by the full alignment.
+                plain = {**piece, "text": without_repeats(str(piece["text"]))}
+                found = align.cross_check(_untimed_paragraphs([plain], index), entries)
+            check = {
+                "model": name,
+                "local_words": found["stats"]["local_words"],
+                "added_words": found["stats"]["added_words"],
+                "paragraphs": result["paragraphs"],
+                "added": found["gaps"],
+            }
+            logger.info(
+                "Local check of %s with %s: %d words heard, %d added",
+                where,
+                name,
+                check["local_words"],
+                check["added_words"],
+            )
+        except Exception as exc:
+            logger.exception("Local check of %s with %s failed", where, name)
+            check = {"model": name, "error": str(exc)}
+        finally:
+            wav.unlink(missing_ok=True)
+        checked[index] = {**piece, "local_check": check}
+
+    checks = [checked[index]["local_check"] for index in flagged]
+    done = [check for check in checks if "error" not in check]
+    summary: dict[str, Any] = {
+        "model": name,
+        "seconds": round(time.monotonic() - started, 1),
+        "parts": len(flagged),
+        "filled": sum(1 for check in done if check["added_words"]),
+        "added_words": sum(check["added_words"] for check in done),
+        "failed": len(checks) - len(done),
+    }
+    errors = [check["error"] for check in checks if "error" in check]
+    if errors:
+        summary["error"] = errors[0]
+    logger.info(
+        "Local check of %d incomplete part(s) with %s in %.0f s: %d filled, "
+        "%d words added, %d failed",
+        summary["parts"],
+        name,
+        summary["seconds"],
+        summary["filled"],
+        summary["added_words"],
+        summary["failed"],
+    )
+    return checked, summary
+
+
 def transcribe_openai(
     input_file: str | Path,
     output_file: str | Path,
@@ -2257,6 +2588,7 @@ def transcribe_openai(
     span: tuple[float, float] | None = None,
     verify: tuple[Any, str] | None = None,
     verify_batched: bool = False,
+    fill: tuple[Callable[[], Any], str] | None = None,
 ) -> dict[str, Any]:
     """Transcribe an audio/video file with the OpenAI API, chunk by chunk.
 
@@ -2276,14 +2608,22 @@ def transcribe_openai(
             transcript is re-timed by, and filled in from, that pass
             (:func:`build_verified_transcript`). Only for models without
             timestamps; ignored when the run stops part-way.
-        verify_batched: Run that local pass in batches (:func:`_local_entries`).
+        verify_batched: Run that local pass, or the one of ``fill``, in
+            batches (:func:`_local_entries`).
+        fill: A function returning a loaded ``faster_whisper.WhisperModel``,
+            and its name: when parts are still marked incomplete after the
+            run, local Whisper transcribes those parts only and fills in what
+            the answer lacked (:func:`_fill_flagged`); the model is loaded
+            only then. Only for models without timestamps, and not with
+            ``verify``, which checks the whole recording.
 
     Returns:
         What the requests used and cost (:func:`usage.summarize`), counting
         chunks paid for by an earlier, unfinished attempt too, with
         ``audio_seconds`` (the length transcribed), ``chunks`` (one record per
-        answered part, :func:`chunk_records`) and, after a cross-check,
-        ``verified`` (its figures and how long the local pass took).
+        answered part, :func:`chunk_records`), after a cross-check
+        ``verified`` (its figures and how long the local pass took), and
+        after a local check of the incomplete parts ``filled`` (its figures).
 
     Raises:
         OpenAIAccountError: If the key or account is refused before any chunk
@@ -2402,6 +2742,7 @@ def transcribe_openai(
 
         local_pass = None
         checked: dict[str, Any] | None = None
+        filled: dict[str, Any] | None = None
         local_seconds = 0.0
         if verify is not None and not timed_entries:
             local_model, local_name = verify
@@ -2423,6 +2764,10 @@ def transcribe_openai(
                 logger.exception("Cross-check with local %s failed", local_name)
                 checked = {"model": local_name, "error": str(exc)}
             local_seconds = time.monotonic() - local_started
+        elif fill is not None and not timed_entries:
+            pieces, filled = _fill_flagged(
+                audio, pieces, fill, temp_folder, progress_callback, verify_batched
+            )
         stats = _write_outputs(
             output_file,
             pieces,
@@ -2433,6 +2778,10 @@ def transcribe_openai(
             verified=local_pass,
         )
         if stats is not None:
+            # What the whole-recording check found in each flagged part goes
+            # with that part's record, as a check of those parts alone does.
+            for index, check in stats.pop("parts", {}).items():
+                pieces[index] = {**pieces[index], "local_check": check}
             checked = {**stats, "seconds": round(local_seconds, 1)}
             logger.info(
                 "Cross-check with local %s in %.0f s: %d of %d paragraphs re-timed, "
@@ -2469,6 +2818,8 @@ def transcribe_openai(
         }
         if checked is not None:
             summary["verified"] = checked
+        if filled is not None:
+            summary["filled"] = filled
         return summary
 
     except AppError as exc:
@@ -2563,6 +2914,7 @@ def _local_entries(
     label: str = "Transcribing",
     model_name: str | None = None,
     batched: bool = False,
+    start_at: float | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """Run a local faster-whisper model over the recording, or a stretch of it.
 
@@ -2578,6 +2930,8 @@ def _local_entries(
             write ``LOCAL_BATCH_SIZE`` of them at once — faster, but each
             piece without the text before it and without a second try. The
             pieces come back split into sentences (:func:`_split_by_words`).
+        start_at: Where ``input_file`` starts on the recording's timeline,
+            when it is a stretch cut out already (without ``span``).
 
     Returns:
         Timed segments with ``start``, ``end`` and ``text`` on the
@@ -2587,7 +2941,7 @@ def _local_entries(
         TranscriptionError: If the stretch is too short to transcribe.
     """
     source = input_file
-    offset = 0.0
+    offset = start_at or 0.0
     cut: Path | None = None
     started = time.monotonic()
     try:
@@ -2657,12 +3011,17 @@ def _local_entries(
                     progress=min(1.0, segment.end / duration),
                 )
         text = " ".join(entry["text"] for entry in timed_entries)
+        placed = span
+        if placed is None and start_at is not None:
+            placed = (start_at, start_at + float(duration))
         logger.info(
             "Local pass over %s (%s, %s%s) in %.0f s: %d segment(s), %d words, "
             "%.0f words/min",
             input_file.name,
             model_name or "local model",
-            f"{_format_clock(span[0])}–{_format_clock(span[1])}" if span else "whole",
+            f"{_format_clock(placed[0])}–{_format_clock(placed[1])}"
+            if placed
+            else "whole",
             ", batched" if batched else "",
             time.monotonic() - started,
             len(timed_entries),

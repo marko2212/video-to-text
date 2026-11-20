@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv(override=True)
@@ -429,6 +429,14 @@ VERIFY_GAP_PARAGRAPH_SECONDS: float = 40.0
 # The local model offered first for the cross-check: the smallest that reads
 # well enough to align on; `tiny` misses too many words.
 DEFAULT_VERIFY_MODEL: str = DEFAULT_LOCAL_MODEL
+# After an OpenAI run, the parts still marked incomplete (thin, looped or at the
+# output cap once sent again in halves) are transcribed by local Whisper — those
+# parts only — and what the answer lacked is added from it (`LOCAL_FILL`, on).
+# `medium`: what the owner ran by hand for exactly this on real meetings (it
+# filled 25:05–27:34 of a 48-minute meeting, 2026-11-20); smaller models read
+# Serbian worse. It runs at about 0.7× the length on the owner's CPU, so a
+# 2:30 half takes under two minutes. A first use downloads it (~1.5 GB).
+DEFAULT_LOCAL_FILL_MODEL: str = "medium"
 
 # The application log: every run leaves one line per chunk sent (bounds, size,
 # request time and id, tokens, words per minute, guard flags), so an answer
@@ -478,6 +486,10 @@ class Settings(BaseSettings):
         allow_local_files: Offer recordings from a folder on this computer.
         thin_retry_auto_chunking: Before splitting a thin part, send it once
             more whole with ``chunking_strategy="auto"`` and log what changed.
+        local_fill: After an OpenAI run, transcribe the parts still marked
+            incomplete with local Whisper and add what the answer lacked
+            (needs the offline backend; on).
+        local_fill_model: The local model for that (``medium``).
     """
 
     openai_api_key: str | None = Field(
@@ -513,6 +525,12 @@ class Settings(BaseSettings):
     # sent once more whole with the server's voice-activity chunking before it
     # is split; the log says whether that alone brought the speech back.
     thin_retry_auto_chunking: bool = Field(default=False)
+    # On by default (the owner's choice, 2026-11-20): a part that still came
+    # back incomplete is filled from local Whisper, that part only, instead of
+    # a second pass over the whole recording started by hand. Free; it costs
+    # the time of those parts. LOCAL_FILL=false leaves them marked ⚠️.
+    local_fill: bool = Field(default=True)
+    local_fill_model: str = Field(default=DEFAULT_LOCAL_FILL_MODEL)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -521,6 +539,16 @@ class Settings(BaseSettings):
         # `SEGMENT_DURATION_MINUTES=` in .env means "not set", not a startup error.
         env_ignore_empty=True,
     )
+
+    @field_validator("local_fill_model")
+    @classmethod
+    def _a_local_model(cls, value: str) -> str:
+        """Refuse a ``LOCAL_FILL_MODEL`` that is not a local model's name."""
+        if value not in LOCAL_MODELS:
+            raise ValueError(
+                f"LOCAL_FILL_MODEL must be one of {', '.join(LOCAL_MODELS)}"
+            )
+        return value
 
     def model_post_init(self, __context: Any) -> None:
         """Create the working directories as soon as settings are loaded."""

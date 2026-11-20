@@ -52,8 +52,9 @@ The answer is one JSON object on standard output; progress goes to standard erro
    Never pass `--yes` or `--max-cost` on your own.
 3. **Transcribe.** `transcribe "<recording>" 2><a file for standard error>`, with the default
    model and no other options unless the user asked for them. Fifteen minutes of recording
-   take about 40 seconds, an hour about two and a half minutes; start anything longer than
-   half an hour in the background and report when it ends. Options, when they are asked for:
+   take about 40 seconds, an hour about two and a half minutes, plus about 0.7× the length
+   of any part that local Whisper fills (step 4; its first use downloads `medium`, ~1.5 GB);
+   start anything longer than half an hour in the background and report when it ends. Options, when they are asked for:
    `--from` and `--to` for a part of the recording, `--screens` when what was on the screen
    matters (it costs more, `estimate` says how much), `--srt` for subtitles (`whisper-1` or
    the local engine), `--engine local` for a run with no key and no internet.
@@ -62,23 +63,33 @@ The answer is one JSON object on standard output; progress goes to standard erro
    (silence is measured and left out, so a quiet stretch is not flagged), sends a thin part
    again in two halves, and does the same with a part whose answer repeats itself (a loop:
    one sentence over and over where the rest should be; `looped (N% of it repeats)` in the
-   part's line), and writes what it could not repair into `notices`. Look at the
+   part's line). A part still thin or looped after that is then transcribed by local Whisper
+   on this computer — that part only, `medium` by default, free — and the words the OpenAI
+   answer lacked are added where they were spoken: paragraphs marked `🧩`, and the part's
+   line marked `🔍` instead of `⚠️`. This happens by itself when the offline backend is
+   installed (README, "Parts still incomplete"); `notices` says what was filled ("Local
+   Whisper (medium) filled 2 of 2 part(s) …"). Look at the
    `Part 00N … words/min of speech; sound: … s speech, … s silence …` lines in the standard
    error file and at `notices`; a `Part 00N is thin … its answer: "…"` warning quotes what
    OpenAI first returned for a part it sent again (kept in full as `first_answer` in the
-   run's saved parts). Two cases are left to you:
-   - `notices` says "Speech may be missing…" (a half came back thin or looped the second
-     time too);
+   run's saved parts). Tell the user which parts were filled. Three cases are left to you:
+   - `notices` still says "Speech may be missing…": with "local Whisper (…) heard N words
+     there, nothing more", the local model heard no more than OpenAI did (often a stretch
+     with little speech: say so, the user can listen to it); without it, the local check
+     could not run (a warning says why) or the backend is not installed;
    - the recording is shorter than five minutes, so it is one part with nothing to compare
-     it with, and the words are few for its length.
+     it with, and the words are few for its length;
+   - a part's words per minute are well below the others' (two thirds or less) without
+     being flagged: the guard only flags half or less, and on 2026-11-20 such a part
+     (108 against about 155) had lost 197 words that only a check of the whole recording
+     found.
 
    Then say so, and offer to repeat with `--verify medium --overwrite`: a local Whisper
-   pass over the same recording adds what the OpenAI answer lacks (paragraphs marked `🧩`)
-   and gives the paragraphs their real times. It costs no money, only time (`medium` on a CPU
-   took about eleven minutes for a fifteen-minute recording), so it goes in the background,
-   and it needs the offline backend installed (README, "Offline mode"). The repeated run adds
-   another row to the app's History; the old row stays. The same option is worth offering
-   up front when the user says the meeting matters.
+   pass over the whole recording adds what the OpenAI answer lacks anywhere (paragraphs
+   marked `🧩`) and gives the paragraphs their real times. It costs no money, only time
+   (`medium` on a CPU took about eleven minutes for a fifteen-minute recording), so it goes
+   in the background. The repeated run adds another row to the app's History; the old row
+   stays. The same option is worth offering up front when the user says the meeting matters.
 5. **Read the transcript and report.** What the conversation was about in three to five
    sentences, what was agreed, and the next steps (who, what, by when, if it was said). Do
    not fill in what the transcript does not say. End with where the transcript is and what
