@@ -2092,7 +2092,8 @@ audio (with the test suite running beside it), one info notice, no warning. Seen
 left as it is: the 🧩 text of a looped part sits among the loop's repeats, which keep their
 estimated times. Gate: 522 tests pass (also without ffmpeg), ruff clean; three mutations
 (a filled part keeping its `⚠️`, the warning naming a filled part, the loop branch removed)
-each failed the new tests. Not committed (the owner says when). Open: the owner's personal
+each failed the new tests. Committed and pushed to `main` the same day on the owner's word
+("Da, commit i push", relayed by the session that started this one). Open: the owner's personal
 skill, in another repo, still says to rerun with `--verify medium` when speech is missing.
 
 ### 2026-11-19 — Looped answers are sent again; two more OpenAI models
