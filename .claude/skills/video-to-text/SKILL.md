@@ -60,12 +60,15 @@ The answer is one JSON object on standard output; progress goes to standard erro
 4. **Check that no speech was lost.** OpenAI sometimes returns a part with most of its
    speech missing and no error. The app measures words per minute of speech for every part
    (silence is measured and left out, so a quiet stretch is not flagged), sends a thin part
-   again in two halves, and writes what it could not repair into `notices`. Look at the
+   again in two halves, and does the same with a part whose answer repeats itself (a loop:
+   one sentence over and over where the rest should be; `looped (N% of it repeats)` in the
+   part's line), and writes what it could not repair into `notices`. Look at the
    `Part 00N … words/min of speech; sound: … s speech, … s silence …` lines in the standard
    error file and at `notices`; a `Part 00N is thin … its answer: "…"` warning quotes what
    OpenAI first returned for a part it sent again (kept in full as `first_answer` in the
    run's saved parts). Two cases are left to you:
-   - `notices` says "Speech may be missing…" (a half came back thin the second time too);
+   - `notices` says "Speech may be missing…" (a half came back thin or looped the second
+     time too);
    - the recording is shorter than five minutes, so it is one part with nothing to compare
      it with, and the words are few for its length.
 

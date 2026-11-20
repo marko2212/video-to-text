@@ -137,9 +137,41 @@ transcript is copied beside the recording as `transcript_<its name>.txt`.
 - **`gpt-4o-transcribe` is the default** — measurably more accurate than `whisper-1` in a
   real side-by-side run on the same file ("Microsoft **Stack**" vs "Microsoft's **back**";
   "based in **Serbia**" vs "Croatia, Serbia"). **But it returns no timestamps** — the API
-  does not support `verbose_json` for it.
+  does not support `verbose_json` for it. *Asked 2026-11-15, after it dropped the
+  first 4:50 of a meeting: should the strongest Whisper replace it? No.* It is the
+  more accurate of the two OpenAI models in the comparison above; the local
+  `large-v3` has not been compared on the owner's recordings and is slow here (local
+  `medium` took 11 minutes for a 15:26 recording that day, against 37 seconds through
+  the API); Whisper has losses of its own (text invented in silence, repeated
+  lines); and the loss that prompted the question is now caught for every chunk.
+  The recommendation given: keep it, and for a meeting that matters add **Verify
+  with local Whisper**, which fills what the answer lacks and gives exact times.
+  Open (§5 P5): one real meeting through both, to have a number.
 - **`whisper-1` is selected only when timestamps/SRT are wanted** — it is the only OpenAI
   model that returns segments. The trade-off is lower accuracy.
+- **A looped answer is sent again in halves, like a thin one** *(2026-11-19)*. The
+  model can repeat one stretch instead of transcribing what follows (a 19-minute call:
+  one sentence ten times from 8:10 to 10:00; the local verify pass brought the lost
+  part back). The thin-part guard cannot see it, because a loop has as many words as
+  usual or more (219 words/min against 123–156 in the other parts). Measure: the share
+  of eight-word windows that already appeared in the same answer (`LOOP_REPEAT_SHARE`
+  0.12, from 50 words). Over 298 saved parts the median and the 90th percentile were 0,
+  all seven parts at 0.15–0.36 were loops, and the highest real speech was 0.09. The
+  same audio sent again the same morning came back without a loop, so a fresh request
+  is the repair. Research of the same day (Reddit, OpenAI forum, GitHub;
+  `docs/petlje-ponavljanja-istrazivanje-2026-11-19.md`): `whisper-1` and local
+  Whisper loop too, so switching models is no fix; detect-and-resend is the most cited
+  one. A speaker who really reads a long passage twice is flagged as well (seen live on
+  a synthetic recording): one request more, and the halves come back right.
+- **`gpt-transcribe` and `gpt-4o-mini-transcribe` are offered, not the default**
+  *(2026-11-19, the owner asked for the mini model in the dropdown)*. `gpt-transcribe`
+  is the successor OpenAI names for 2027-02-26, so it can be tried on real meetings
+  before the migration (§5); the mini model is the cheap one. Both answered a synthetic
+  recording correctly the same day; neither has been compared with the default on the
+  owner's speech. Other models the account lists and the app does not offer:
+  `gpt-4o-transcribe-diarize` (speaker labels, retired on the same date) and the
+  real-time models (`gpt-live-transcribe`, `gpt-realtime-whisper`), which are for live
+  audio, not files.
 - **Segments are always requested when the model supports them** (not only when SRT is
   requested) — they drive the readable transcript. The SRT *file* is still written only on
   request.
@@ -1781,10 +1813,9 @@ pušuj"). Gate: 210 tests pass, ruff clean.
       field for names and jargon. Chunk length stays 5 min until its output cap is known;
       the `(~M:SS)` placement already works without timestamps. Decide what replaces
       whisper-1 timestamps/SRT (local engine). The diarize model is retired too: dropped.
-- [ ] **Repetition loops** (R15, S). A pure `detect_repetition()` calibrated on history
-      (same word > 30× in a row; periodic runs) that warns per chunk; 3 saved transcripts
-      contain loops. The cap guard now marks an answer that loops to the cap, but not a
-      shorter loop.
+- [x] **Repetition loops** (R15, S) — done 2026-11-19: `repeat_share()` / `is_looped()`
+      in `transcribe.py`, calibrated on 298 saved parts; a looped answer is sent again in
+      halves like a thin one, and a half still looped is marked (§3, journal 2026-11-19).
 
 ### P2 — responsiveness and UI
 - [x] **A visible Stop button next to the progress** — done 2026-09-30 (the owner's
@@ -1884,11 +1915,16 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 - [x] **A Claude skill on top of the command line** — written 2026-11-15, outside this repo
       (`C:\Work\claude\skills\video-to-text\`; §3 Command line, last bullet). Its listing
       and estimate steps were run on the real folders, its pair-moving helper on a made-up
-      pair. Still to come: a real meeting through the whole flow, on the owner's word.
+      pair, and a real stand-up went through the whole flow the same day (journal
+      2026-11-15 part 5).
 - [x] **A first real OpenAI run through the command line** — done 2026-11-15 on synthetic
       recordings, `--screens`, `--verify`, `--srt`, the title and a killed-and-resumed run
-      included (§3 Command line, "Checked live against the real OpenAI API"). Still to
-      come: a real meeting through it.
+      included (§3 Command line, "Checked live against the real OpenAI API"). A real
+      meeting followed the same day and exposed the first-chunk loss (§5 P1).
+- [ ] **Compare local `large-v3` with `gpt-4o-transcribe` on one real meeting** (offered
+      2026-11-15, not asked for yet). Free but slow, and `large-v3` is a 3 GB download;
+      it would turn the model decision in §3 from one side-by-side with `whisper-1`
+      into a measurement on the owner's own speech (English with accents, Serbian).
 - [ ] **An MCP or HTTP wrapper over `runs.run`** — only when a caller cannot run a command on
       this computer (§3 Command line).
 - [ ] **Show the OpenAI credit left** (asked 2026-11-03). The owner chose a read-only
@@ -1928,6 +1964,32 @@ pušuj"). Gate: 210 tests pass, ruff clean.
 ---
 
 ## 6. Journal
+
+### 2026-11-19 — Looped answers are sent again; two more OpenAI models
+
+A 19-minute call came back from `gpt-4o-transcribe` with one sentence ten times
+(8:10–10:00) and no notice: the part had 219 words/min, so the thin guard saw nothing.
+The owner's personal skill then reran it with `--verify medium`, which brought the lost
+stretch back. The owner asked whether Whisper avoids this; research through ChatGPT
+(Reddit, OpenAI forum, GitHub; saved as `docs/petlje-ponavljanja-istrazivanje-2026-11-19.md`)
+says no: `whisper-1` and local Whisper loop too, and the most cited fix is to detect a
+looped answer and send it again.
+
+Built: `repeat_share()` and `is_looped()` (share of eight-word windows seen earlier in
+the answer, from 50 words), the `looped` and `repeat_share` fields in every part's
+record, the `looped (N% of it repeats)` log flag, the split and resend in halves like a
+thin part, a `⚠️` line and a warning for a half that still loops. Calibrated read-only
+on the 298 saved parts of 51 runs (§3). Also offered in the dropdown and `--model`:
+`gpt-transcribe` and `gpt-4o-mini-transcribe` (the owner asked for the mini model; the
+account also lists `gpt-4o-mini-transcribe-2025-12-15`, the diarize model and real-time
+models).
+
+Checked live, scratch folders, $0.033 in all: a synthetic 1:36 recording with its text
+read twice, through `gpt-transcribe` ($0.015) and `gpt-4o-mini-transcribe` ($0.005):
+both answers were judged looped (48 %), split, and the halves came back with 118 words
+each and no marker. The call's 4:58–10:00 stretch sent again through
+`gpt-4o-transcribe` came back without a loop (570 words, 147 words/min). Gate: 503
+tests pass, ruff clean. Committed and pushed on 2026-11-20, on the owner's word.
 
 ### 2026-11-17 — History follows a recording's new name
 
@@ -2032,7 +2094,7 @@ also without ffmpeg. Live on the stand-up's first ten minutes: both halves came 
 full. The owner asked why OpenAI had not returned that stretch: no error and no cap —
 the model ended its answer after the first sentence of the 4:50 chunk, and transcribed
 the same audio in full when it came as two halves. Open: the earlier transcripts that
-lost their start (§5 P1). Not committed.
+lost their start (§5 P1). Committed as `04d8768` and pushed the same day; CI green.
 
 ### 2026-11-15 (part 5) — The Claude skill; no nightly run
 
@@ -2051,7 +2113,7 @@ is) and a 15:26 stand-up, moved with its transcript to its project's `Meeting` f
 with 5 words and no notice, because the first part has no thin-chunk guard; a second
 run with `--verify medium` filled the 460 missing words. Three rows in the real History
 (221–223; 222 is the incomplete first run of the stand-up). The owner also asked for
-the best model always — the default already is. Not committed.
+the best model always — the default already is. Committed with part 6.
 
 ### 2026-11-15 (part 4) — The time left counts down on the page
 

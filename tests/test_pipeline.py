@@ -900,6 +900,101 @@ def test_an_only_chunk_cannot_be_thin_and_a_quiet_recording_never_is(pipeline):
     assert "⚠️" not in pipeline.output.read_text(encoding="utf-8")
 
 
+# --- a looped answer: the model repeats itself instead of transcribing -----------
+
+
+_LOOP = "So whenever you change any data please tell me in the chat. Correct? Yes."
+
+
+def _looped(words: int = 250, repeats: int = 10) -> str:
+    # The shape of the 2026-11-19 call: normal speech, then one sentence over
+    # and over where the rest of the part should have been.
+    return _speech(words) + " " + " ".join([_LOOP] * repeats)
+
+
+def test_ordinary_speech_does_not_repeat_and_a_loop_does():
+    assert transcribe.repeat_share(_speech(600)) == 0.0
+    assert not transcribe.is_looped(_speech(600))
+    # Real speech repeats short phrases ("yes, yes", a question asked twice).
+    chatty = (
+        _speech(300)
+        + " Yes, yes. Can you hear me? Can you hear me? "
+        + _speech(300, start=300)
+    )
+    assert transcribe.repeat_share(chatty) < config.LOOP_REPEAT_SHARE
+    assert not transcribe.is_looped(chatty)
+
+    assert transcribe.repeat_share(_looped()) > 0.2
+    assert transcribe.is_looped(_looped())
+    # One word a hundred times is a loop as well.
+    assert transcribe.is_looped(_speech(200) + " file" * 100)
+    # Case and punctuation do not hide a repeat.
+    assert transcribe.repeat_share("A b c d e f g h. a, B c D e f g h!") > 0
+
+
+def test_a_short_answer_is_never_judged_a_loop():
+    short = " ".join(["Thank you."] * 20)
+    assert len(short.split()) < config.LOOP_MIN_WORDS
+    assert not transcribe.is_looped(short)
+    assert transcribe.repeat_share("too short") == 0.0
+
+
+def _loop_answer(name, ms):
+    if name == "chunk_001":
+        return _text(_looped(), tokens=600)
+    if name.startswith("chunk_001"):
+        return _text(_speech(300, start=1_000), tokens=400)
+    return _text(_speech(600), tokens=800)
+
+
+def test_a_looped_answer_is_split_and_the_halves_replace_it(pipeline, caplog):
+    client = FakeClient(_loop_answer)
+    with caplog.at_level("WARNING"):
+        text = pipeline.run(_tone(15 * MINUTE), client)
+
+    assert [name for name, _ in client.calls] == [
+        "chunk_000",
+        "chunk_001",
+        "chunk_001a",
+        "chunk_001b",
+        "chunk_002",
+    ]
+    assert _LOOP not in text
+    assert "⚠️" not in text
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["part"] for r in records] == ["000", "001a", "001b", "002"]
+    assert not any(r["looped"] for r in records)
+    assert all(r["repeat_share"] == 0.0 for r in records)
+    assert transcribe.describe_flagged(records) is None
+    assert "Part 001 repeats itself" in caplog.text
+    # The looped answer was paid for and is counted with the halves.
+    assert pipeline.spent[-1]["requests"] == 5
+
+
+def test_a_half_that_still_loops_is_kept_and_marked(pipeline):
+    def still_looping(name, ms):
+        if name.startswith("chunk_001"):
+            return _text(_looped(), tokens=600)
+        return _text(_speech(600), tokens=800)
+
+    client = FakeClient(still_looping)
+    text = pipeline.run(_tone(15 * MINUTE), client)
+
+    # Split once, never again: both halves are kept with a line each.
+    assert [name for name, _ in client.calls][1:4] == [
+        "chunk_001",
+        "chunk_001a",
+        "chunk_001b",
+    ]
+    assert len(client.calls) == 5
+    assert text.count("The model repeated itself here") == 2
+    records = pipeline.spent[-1]["chunks"]
+    assert [r["looped"] for r in records] == [False, True, True, False]
+    warning = transcribe.describe_flagged(records)
+    assert warning.startswith("Speech may be missing in 2 part(s) — ")
+    assert warning.count("repeated text") == 2
+
+
 def test_a_thin_split_is_resumed_without_paying_for_the_thin_answer_again(pipeline):
     audio = _tone(15 * MINUTE)
 

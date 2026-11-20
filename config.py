@@ -74,16 +74,29 @@ RECORDING_PROBE_LIMIT: int = 200
 
 # Transcription models. The first entry is the default shown in the UI.
 DEFAULT_MODEL: str = "gpt-4o-transcribe"
-TRANSCRIPTION_MODELS: list[str] = [DEFAULT_MODEL, "whisper-1"]
+TRANSCRIPTION_MODELS: list[str] = [
+    DEFAULT_MODEL,
+    "gpt-transcribe",
+    "gpt-4o-mini-transcribe",
+    "whisper-1",
+]
 # A short hint per model for the UI dropdown: release year, strength, price.
 # At most ~360 px of text (about 55 characters) shows in the dropdown on a
 # 1860 px wide window before it is cut off. gpt-4o-transcribe is billed per
 # token: $0.0027-0.0033 per minute was recorded on the owner's first 4 runs
 # (2026-09-29), and dense Serbian speech (more output tokens) works out near
-# $0.0045 — hence ~$0.004. whisper-1's figure is its per-minute price below; a
-# test keeps the two in step.
+# $0.0045 — hence ~$0.004. whisper-1's and gpt-transcribe's figures are their
+# per-minute prices below; a test keeps them in step. gpt-4o-mini-transcribe
+# costs half of gpt-4o-transcribe per token, hence ~$0.002. gpt-transcribe and
+# the mini model were added on 2026-11-19 at the owner's request, after a loop
+# in a gpt-4o-transcribe answer: gpt-transcribe replaces all the others when
+# OpenAI retires them on 2027-02-26 (§3), and the mini model is the cheap one
+# (OpenAI reported fewer invented words for its 2025-12-15 snapshot). Neither
+# has been compared with the default on the owner's recordings yet.
 TRANSCRIPTION_MODEL_NOTES: dict[str, str] = {
     "gpt-4o-transcribe": "2025, more accurate · ~$0.004/min",
+    "gpt-transcribe": "2026, successor of all · $0.0045/min",
+    "gpt-4o-mini-transcribe": "2025, cheaper, less accurate · ~$0.002/min",
     "whisper-1": "2023, exact timestamps & .srt · $0.006/min",
 }
 # Models that can return per-segment timestamps (verbose_json) for SRT export.
@@ -97,7 +110,11 @@ MAX_SEGMENT_SIZE_MB: float = 25.0
 # their last minute or so (measured 2026-09-25). Five minutes stays well under
 # the cap; whisper-1 has no such cap. The price follows the audio length either
 # way (per minute, or audio tokens), so chunk length does not change it.
-SEGMENT_MINUTES_BY_MODEL: dict[str, int] = {"gpt-4o-transcribe": 5, "whisper-1": 10}
+SEGMENT_MINUTES_BY_MODEL: dict[str, int] = {
+    "gpt-4o-transcribe": 5,
+    "gpt-4o-mini-transcribe": 5,
+    "whisper-1": 10,
+}
 # Used for any model not listed above, until its output cap is known.
 DEFAULT_SEGMENT_MINUTES: int = 5
 # A response this long is treated as cut off by the output cap: the chunk is
@@ -137,6 +154,20 @@ THIN_RECHECK_LOUD_DB: float = 20.0
 # half of its first part (0:00–2:30) came back with 8 words and was marked
 # "Speech may be missing", yet 143 of its 150 seconds were silence.
 THIN_MIN_SPEECH_SECONDS: float = 30.0
+# A looped answer: the model repeats a stretch of text instead of transcribing
+# what follows, so the answer has as many words as usual (or more) and the
+# thin-part guard cannot see it. Measured as the share of LOOP_NGRAM_WORDS-word
+# windows that already appeared earlier in the same answer. On 2026-11-19, over
+# 298 saved parts of 51 runs with 50 words or more: the median share was 0 and
+# the 90th percentile 0; seven parts reached 0.15–0.36, and every one was a loop
+# (one sentence ten times in a 19-minute call, "file" 103 times, a passage
+# repeated four times), while the next highest real part was 0.09 (three
+# genuine repeats of a request on a call). A looped answer is handled like a
+# thin one: its halves are sent again, and a half still looped is kept and
+# marked. Answers shorter than LOOP_MIN_WORDS are never judged.
+LOOP_NGRAM_WORDS: int = 8
+LOOP_REPEAT_SHARE: float = 0.12
+LOOP_MIN_WORDS: int = 50
 # Silence within a part is measured on quarter-second windows, like ffmpeg's
 # silencedetect: a window is silent when it is SILENCE_BELOW_PEAK_DB quieter
 # than the part's loudest window, with that line kept between

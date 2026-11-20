@@ -36,6 +36,9 @@ from config import (
     DEFAULT_MODEL,
     DEFAULT_SEGMENT_MINUTES,
     LOCAL_BATCH_SIZE,
+    LOOP_MIN_WORDS,
+    LOOP_NGRAM_WORDS,
+    LOOP_REPEAT_SHARE,
     MAX_SEGMENT_SIZE_MB,
     MIN_SPLIT_SECONDS,
     MIN_TAIL_SECONDS,
@@ -187,6 +190,24 @@ def format_thin_marker(
     )
 
 
+def format_looped_marker(start: float, end: float, share: float) -> str:
+    """Render the line that marks a part whose answer kept repeating itself.
+
+    Args:
+        start: Where the part begins (seconds).
+        end: Where it ends (seconds).
+        share: The answer's :func:`repeat_share`.
+
+    Returns:
+        A line that cannot be mistaken for speech.
+    """
+    return (
+        f"{_MISSING_MARKER} ({_format_clock(start)}–{_format_clock(end)}) The "
+        f"model repeated itself here ({share:.0%} of this part repeats earlier "
+        "text), so speech here may be missing."
+    )
+
+
 def format_capped_marker(end: float) -> str:
     """Render the line that marks a part whose answer ended at the output cap.
 
@@ -223,6 +244,13 @@ def _flag_lines(piece: dict[str, Any]) -> list[str]:
                 end,
                 record.get("words_per_min", 0.0),
                 record.get("typical_words_per_min"),
+            )
+        )
+    if piece.get("looped"):
+        record = piece.get("record") or {}
+        lines.append(
+            format_looped_marker(
+                piece["start"], end, record.get("repeat_share", LOOP_REPEAT_SHARE)
             )
         )
     return lines
@@ -969,6 +997,61 @@ def words_per_minute(text: str, seconds: float) -> float:
     return len(text.split()) / (seconds / 60)
 
 
+# Words for the loop measure: letters, digits and apostrophes, in any script.
+_LOOP_WORD = re.compile(r"[\w']+")
+
+
+def repeat_share(text: str, size: int = LOOP_NGRAM_WORDS) -> float:
+    """Return the share of a text's word windows that already appeared in it.
+
+    A model caught in a loop writes the same stretch again and again instead of
+    what was said, so many of its ``size``-word windows repeat an earlier one;
+    ordinary speech, even with "yes, yes" and a repeated question, almost never
+    repeats eight words in a row (``LOOP_REPEAT_SHARE`` has the measurement).
+    Case and punctuation are ignored.
+
+    Args:
+        text: The transcribed text.
+        size: Words per window.
+
+    Returns:
+        A share from 0 (nothing repeats) towards 1; 0 for a text shorter than
+        one window.
+    """
+    words = [word.lower() for word in _LOOP_WORD.findall(text)]
+    windows = [tuple(words[at : at + size]) for at in range(len(words) - size + 1)]
+    if not windows:
+        return 0.0
+    return 1 - len(set(windows)) / len(windows)
+
+
+def is_looped(text: str) -> bool:
+    """Tell whether an answer repeats itself too much to be a transcript.
+
+    Args:
+        text: The transcribed text.
+
+    Returns:
+        True for an answer of at least ``LOOP_MIN_WORDS`` words whose
+        :func:`repeat_share` reaches ``LOOP_REPEAT_SHARE``.
+    """
+    if len(text.split()) < LOOP_MIN_WORDS:
+        return False
+    return repeat_share(text) >= LOOP_REPEAT_SHARE
+
+
+def _incomplete(record: dict[str, Any]) -> bool:
+    """Tell whether an answer's record says speech may be missing from it.
+
+    Args:
+        record: A record from :func:`_chunk_record`.
+
+    Returns:
+        True when it is capped, thin or looped.
+    """
+    return bool(record.get("capped") or record.get("thin") or record.get("looped"))
+
+
 def _thin_floor(pieces: list[dict[str, Any]]) -> float | None:
     """Return the words-per-minute rate below which the next answer counts as thin.
 
@@ -1027,9 +1110,10 @@ def _chunk_record(
         ``mp3_bytes``, ``seconds``, ``output_tokens``, ``chars``, ``words``,
         ``words_per_min`` (over the seconds of speech), ``speech_seconds``,
         ``silence_seconds``, ``mean_dbfs``, ``request``, ``request_id``,
-        ``thin`` and ``capped``, plus ``typical_words_per_min`` when a floor
-        was in force. A part with less than ``THIN_MIN_SPEECH_SECONDS`` of
-        speech is never thin.
+        ``thin``, ``capped``, ``repeat_share`` and ``looped`` (see
+        :func:`is_looped`), plus ``typical_words_per_min`` when a floor was in
+        force. A part with less than ``THIN_MIN_SPEECH_SECONDS`` of speech is
+        never thin.
     """
     start_ms, end_ms = span
     text = str(result.text)
@@ -1060,6 +1144,8 @@ def _chunk_record(
             and rate < thin_floor
         ),
         "capped": tokens is not None and tokens >= OUTPUT_TOKEN_CAP_GUARD,
+        "repeat_share": round(repeat_share(text), 3),
+        "looped": is_looped(text),
     }
     if thin_floor is not None:
         record["typical_words_per_min"] = round(thin_floor / THIN_CHUNK_SHARE)
@@ -1077,6 +1163,8 @@ def _log_record(record: dict[str, Any]) -> None:
         flags += ", capped"
     if record["thin"]:
         flags += f", thin (typical {record['typical_words_per_min']} words/min)"
+    if record.get("looped"):
+        flags += f", looped ({record['repeat_share']:.0%} of it repeats)"
     tokens = record["output_tokens"]
     mean = record.get("mean_dbfs")
     sent = ", ".join(
@@ -1135,6 +1223,7 @@ def chunk_records(pieces: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "request_id": None,
                 "thin": bool(piece.get("thin")),
                 "capped": bool(piece.get("capped")),
+                "looped": bool(piece.get("looped")),
             }
         part = record.get("part") or ""
         digits = part[:3] if part[:3].isdigit() else ""
@@ -1153,7 +1242,7 @@ def describe_flagged(chunks: list[dict[str, Any]]) -> str | None:
     """
     phrases = []
     for record in chunks:
-        if not (record.get("thin") or record.get("capped")):
+        if not _incomplete(record):
             continue
         where = f"{_format_clock(record['start'])}–{_format_clock(record['end'])}"
         why = []
@@ -1163,6 +1252,8 @@ def describe_flagged(chunks: list[dict[str, Any]]) -> str | None:
             why.append(f"{record.get('words_per_min', 0):.0f} words/min{against}")
         if record.get("capped"):
             why.append("stopped at the output cap")
+        if record.get("looped"):
+            why.append(f"{record.get('repeat_share', 0):.0%} repeated text")
         phrases.append(f"{where} ({', '.join(why)})")
     if not phrases:
         return None
@@ -1233,14 +1324,22 @@ def _transcribe_span(
         tokens = record["output_tokens"]
         span_ms = end_ms - start_ms
         spent = [spent_one]
-        capped, thin = record["capped"], record["thin"]
+        capped, thin, looped = record["capped"], record["thin"], record["looped"]
         splittable = may_split and span_ms >= 2 * MIN_SPLIT_SECONDS * 1000
-        if not ((capped or thin) and splittable):
+        if not ((capped or thin or looped) and splittable):
             if capped:
                 logger.warning(
                     "Part %s still hit the output cap (%d tokens); its answer: %s",
                     name,
                     tokens,
+                    _excerpt(str(result.text)),
+                )
+            if looped:
+                logger.warning(
+                    "Part %s still repeats itself (%.0f%% of it); kept and marked; "
+                    "its answer: %s",
+                    name,
+                    100 * record["repeat_share"],
                     _excerpt(str(result.text)),
                 )
             if thin:
@@ -1252,7 +1351,9 @@ def _transcribe_span(
                     thin_floor,
                     _excerpt(str(result.text)),
                 )
-            piece = _piece(result, start_ms, end_ms, want_segments, capped, thin)
+            piece = _piece(
+                result, start_ms, end_ms, want_segments, capped, thin, looped
+            )
             piece["usage"] = spent
             piece["record"] = record
             checkpoints.save(
@@ -1261,15 +1362,23 @@ def _transcribe_span(
             return [piece]
 
         # The answer stopped at the output cap, so the end of this stretch is
-        # missing from it — or it has far too few words, so some of the
-        # stretch is missing from it. Transcribe the two halves instead.
-        reason = "capped" if capped else "thin"
+        # missing from it — or it has far too few words, or it repeats one
+        # stretch instead of what followed, so some of the stretch is missing
+        # from it. Transcribe the two halves instead.
+        reason = "capped" if capped else "looped" if looped else "thin"
         first_answer = _first_answer(reason, str(result.text), record)
         if capped:
             logger.warning(
                 "Part %s hit the output cap (%d tokens); splitting it; its answer: %s",
                 name,
                 tokens,
+                _excerpt(str(result.text)),
+            )
+        elif looped:
+            logger.warning(
+                "Part %s repeats itself (%.0f%% of it); splitting it; its answer: %s",
+                name,
+                100 * record["repeat_share"],
                 _excerpt(str(result.text)),
             )
         else:
@@ -1295,7 +1404,7 @@ def _transcribe_span(
             if again is not None:
                 result_again, record_again, spent_again = again
                 spent.append(spent_again)
-                if not (record_again["thin"] or record_again["capped"]):
+                if not _incomplete(record_again):
                     piece = _piece(result_again, start_ms, end_ms, want_segments, False)
                     piece.update(
                         usage=spent, record=record_again, first_answer=first_answer
@@ -1361,7 +1470,7 @@ def _first_answer(reason: str, text: str, record: dict[str, Any]) -> dict[str, A
     """Keep an answer that is replaced by its halves, for the saved parts.
 
     Args:
-        reason: ``"thin"`` or ``"capped"``.
+        reason: ``"thin"``, ``"capped"`` or ``"looped"``.
         text: The answer's text.
         record: Its record (see :func:`_chunk_record`).
 
@@ -1482,7 +1591,7 @@ def _auto_chunking_retry(
             exc,
         )
         return None
-    better = not (record["thin"] or record["capped"])
+    better = not _incomplete(record)
     logger.warning(
         "Part %s sent again whole with chunking_strategy=auto: %d → %d words "
         "(%.0f → %.0f words/min of speech); %s; its answer: %s",
@@ -1504,6 +1613,7 @@ def _piece(
     want_segments: bool,
     capped: bool,
     thin: bool = False,
+    looped: bool = False,
 ) -> dict[str, Any]:
     """Turn one API answer into a piece placed on the recording's timeline.
 
@@ -1514,6 +1624,7 @@ def _piece(
         want_segments: Whether the response carries timed segments.
         capped: Whether the answer ended at the output cap.
         thin: Whether the answer had far too few words for its length.
+        looped: Whether the answer kept repeating itself (:func:`is_looped`).
 
     Returns:
         A JSON-serialisable piece (it is checkpointed as is).
@@ -1528,6 +1639,8 @@ def _piece(
         piece["capped"] = True
     if thin:
         piece["thin"] = True
+    if looped:
+        piece["looped"] = True
     if want_segments:
         # Offset each segment by the chunk's position in the original audio so
         # the timeline stays continuous across chunks.
@@ -1889,7 +2002,7 @@ def _judge_unjudged(
         piece = group[0]
         record = piece.get("record")
         judged = record is None or "typical_words_per_min" in record
-        if judged or piece.get("thin") or piece.get("capped"):
+        if judged or _incomplete(piece):
             continue
         others = [
             (at, other) for at, other in enumerate(groups) if at != index and other
@@ -2022,7 +2135,7 @@ def _send_again_in_halves(
         if again is not None:
             result_again, record_again, spent_again = again
             spent.append(spent_again)
-            if not (record_again["thin"] or record_again["capped"]):
+            if not _incomplete(record_again):
                 kept = _piece(result_again, start_ms, end_ms, want_segments, False)
                 kept.update(usage=spent, record=record_again, first_answer=first_answer)
                 checkpoints.save(
