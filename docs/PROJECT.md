@@ -2093,7 +2093,10 @@ left as it is: the 🧩 text of a looped part sits among the loop's repeats, whi
 estimated times. Gate: 522 tests pass (also without ffmpeg), ruff clean; three mutations
 (a filled part keeping its `⚠️`, the warning naming a filled part, the loop branch removed)
 each failed the new tests. Committed and pushed to `main` the same day on the owner's word
-("Da, commit i push", relayed by the session that started this one). Open: the owner's personal
+("Da, commit i push", relayed by the session that started this one). CI then failed one
+test on Linux: it expected ", in M:SS" in the notice, but the fake local pass there took
+under 0.05 s, which rounds to no time, and the notice then names none (as `--verify`'s
+does). The test was wrong, not the code; fixed the same day. Open: the owner's personal
 skill, in another repo, still says to rerun with `--verify medium` when speech is missing.
 
 ### 2026-11-19 — Looped answers are sent again; two more OpenAI models

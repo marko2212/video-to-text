@@ -421,6 +421,11 @@ def test_the_notices_say_what_local_whisper_filled_and_what_still_lacks_speech()
             "from OpenAI, in 3:12: 20:00–22:29 (312 words), marked 🧩.",
         ),
     ]
+    # A check that took no measurable time says no time (as for --verify).
+    assert runs.describe_filled({**filled, "seconds": 0.0}, chunks) == (
+        "Local Whisper (medium) filled 1 of 2 part(s) that came back incomplete "
+        "from OpenAI: 20:00–22:29 (312 words), marked 🧩."
+    )
     cost = runs.run_cost(config.PROVIDER_OPENAI, {**_SPENT, "filled": filled}, [])
     assert "2 incomplete part(s) checked with local Whisper (medium, free)" in (
         runs.describe_cost(cost)

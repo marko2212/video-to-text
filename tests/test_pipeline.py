@@ -1787,9 +1787,11 @@ def test_a_run_keeps_what_the_local_check_did_with_its_history_entry(
     ]
     [(level, note)] = results.notices
     assert level == "info"
+    # Not ", in M:SS": the fake pass can take under a twentieth of a second,
+    # which rounds to no time at all (as on the CI runner, 2026-11-20).
     assert note.startswith(
         "Local Whisper (medium) filled 2 of 2 part(s) that came back incomplete "
-        "from OpenAI, in "
+        "from OpenAI"
     )
     assert note.endswith("(32 words), marked 🧩.")
 
